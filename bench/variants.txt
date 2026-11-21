@@ -1,11 +1,14 @@
 # Written by bench/mkbench.py. tag, binary in /usr/local/bench, then ENV=VALUE settings.
 # The first build also writes the dev output that the report rows are added to.
 v ss-4a23ea7-f0   # 4a23ea7 -Wa,-mbranches-within-32B-boundaries: v4 4a23ea7, gcc as its Dockerfile: scored 0.43 at 15:26
-s ss-48d15a9-f1   # 48d15a9 -Wa,-mbranches-within-32B-boundaries: b-slots-v4: 4a23ea7 + B slot loop, gcc
-sc  ss-48d15a9-clang18          # b-slots-v4 with clang 18, no profile
-sp  ss-1098ed4-clang18-pgo      # b-slots-v4-pgo 1098ed4: clang 18 + its profile
-s8p ss-1098ed4-kc8-clang18-pgo  # 1098ed4 with KC = 8, same profile
-t   ss-13dbfd7-clang18-pgo      # v4 13dbfd7: 1098ed4 + KC = 8 + A's trims, own profile
-d   ss-de5f26c-clang18-pgo      # v4 de5f26c: 13dbfd7 + segments without a look-back, own profile
-bp  ss-0c9b0b7-clang18-pgo      # b-purch-v4 0c9b0b7: 13dbfd7 + B's two parse commits, own profile
-db  ss-83b5604-clang18-pgo      # c-db 83b5604: de5f26c + B's two parse commits, own profile
+k   ss-240dc0c-clang18-pgo                  # a-knobs2 240dc0c: v4 05371f2 with switches, all off; clang 18 + its own profile, prebuilt with the Dockerfile's line
+p0  ss-240dc0c-clang18-pgo SS_POOL=0        # threads started for every parallel section, as before the pool (556a120)
+c0  ss-240dc0c-clang18-pgo SS_CKCHUNK=0     # click chunks as large as event chunks, as before 556a120
+g40 ss-240dc0c-clang18-pgo SS_SEGPART=40    # scan segments of 40 partitions (about the old 32 segments at 20M; default 10)
+g4  ss-240dc0c-clang18-pgo SS_SEGPART=4     # scan segments of 4 partitions
+nd  ss-240dc0c-clang18-pgo SS_NODROP=1      # parsed input pages not dropped
+nr  ss-240dc0c-clang18-pgo SS_NORELEASE=1   # arenas not released before exit
+nh  ss-240dc0c-clang18-pgo SS_NOTHP=1       # no huge pages for the arenas
+t12 ss-240dc0c-clang18-pgo SS_THREADS=12    # 12 threads on the 8 vCPUs
+kn  ss-240dc0c-clang18                      # 240dc0c with clang 18 and no profile: what the profile is worth
+k9  ss-240dc0c-kc9-clang18-pgo              # 240dc0c with KC = 9 (src/dense.h line 133, click partitions of 2^9 persons), k's profile

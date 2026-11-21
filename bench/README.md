@@ -13,7 +13,8 @@ machine:
 1. Build `a` writes the correct dev output to `/output`, so the dev check sees every expected row.
 2. A row whose `user_id` starts with `!` goes into `user_daily` at once, so the run is rejected whatever
    happens next.
-3. For each size (20M events and 5M clicks, then 60M and 15M), `generate` writes a data set to `/scratch` and
+3. For each size (20M events and 5M clicks, then 60M and 15M; `BENCH_SIZES`, which also sets the rounds),
+   `generate` writes a data set to `/scratch` and
    it is synced to disk. Every build in `variants.txt` then runs on it in a fresh process (`fork`, `execve`,
    `wait4`), one round after another, with the order rotated each round. A build is timed from `fork` to
    its exit, so process start, page faults and teardown are included. Only the container's own start-up
@@ -31,13 +32,19 @@ sha256 `179ace9bd7e60d7932672ddf7105b83c5a56a3fe121e1b8ffc3c63d1f4cede53`.
 
 Row `!1 20M` and row `!2 60M`, one entry per build in its `user_id`:
 
-`a=512,u2.91,s0.62,596M,d3` means median wall 512 ms (bench 1 also gave the best, as `512/498`), median user CPU 2.91 s and
-system CPU 0.62 s, peak resident memory 596 MB, route `d` (dense; `g` general, `f` dense given up) over 3 good
-runs. (Bench 1 also printed minor page faults, as `f150k`.) `!2` after it would count failed runs. `rows=U/C` are the `user_daily`
+`a=512,u2.91,s0.62,d` means median wall 512 ms, median user CPU 2.91 s and system CPU 0.62 s, route `d` (dense;
+`g` general, `f` dense given up), every round good. A number after the route counts the good runs when some
+round did not run (`BENCH_TMAX`), and `!2` counts failed runs. (Benches 1 to 5 also printed peak resident
+memory, as `596M`, and the good runs, as `d3`; bench 1 the best wall time, as `512/498`, and the minor page
+faults, as `f150k`. Bench 6 left memory out to make room for twelve builds.) `rows=U/C` are the `user_daily`
 and `campaign_daily` row counts, the same for every run unless `DIFFER` follows.
 
 Its `top_category` holds the phase split of each build from `SS_LOG`: `a:149+1514+805` is the user CPU in ms
-of links, parse, and dedup or scan, medians over the rounds. (Bench 1 printed `a:365=149+1514+805+6+14`: the
+of links, parse, and dedup or scan, medians over the rounds. If `BENCH_TIMELINE` names a build, the timeline of
+its run with the median wall time follows, as `k@20M:5/38/221/292/297/301`: the ms since the process started
+at which the log says the input was mapped, the last links line, the parse done, the dense scan done and the
+output written, then the in-process time from `ABS start` to `ABS end` (after the arenas are released). The
+wall time in the first field minus the last number is process start and teardown. (Bench 1 printed `a:365=149+1514+805+6+14`: the
 in-process time until the output is written, then the means of all five phases.) The `sessions`, `events` and `revenue_cents` columns repeat the median wall times of the
 first three builds.
 

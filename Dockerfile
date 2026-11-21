@@ -10,9 +10,8 @@ COPY bench/ ./bench/
 RUN set -e; mkdir -p /out; \
     F="-std=c++17 -O2 -fno-tree-vectorize -march=cascadelake -mtune=cascadelake -static -pthread"; \
     g++ $F -Wa,-mbranches-within-32B-boundaries -o /out/ss-4a23ea7-f0 bench/variants/4a23ea7/src/main.cpp & p0=$!; \
-    g++ $F -Wa,-mbranches-within-32B-boundaries -o /out/ss-48d15a9-f1 bench/variants/48d15a9/src/main.cpp & p1=$!; \
     g++ -std=c++17 -O2 -march=cascadelake -static -pthread -o /out/bench bench/driver.cpp & pd=$!; \
-    for p in $p0 $p1 $pd; do wait $p; done; \
+    for p in $p0 $pd; do wait $p; done; \
     strip /out/*; \
     cp bench/generate bench/variants.txt /out/; \
     if [ -d bench/prebuilt ]; then cp bench/prebuilt/* /out/; fi; \
@@ -22,4 +21,6 @@ FROM debian:bookworm-slim
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
 COPY --from=build /out/ /usr/local/bench/
 ENV DATA_DIR=/data OUTPUT_DIR=/output SCRATCH_DIR=/scratch
+# bench 6: more rounds (12 builds still end inside BENCH_TMAX), and the phase timeline of build k
+ENV BENCH_SIZES=20:5:5,60:15:4 BENCH_TIMELINE=k
 CMD ["/usr/local/bench/bench"]

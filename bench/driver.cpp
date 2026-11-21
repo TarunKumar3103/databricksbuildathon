@@ -24,6 +24,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <cstdarg>
 #include <cstdio>
@@ -303,13 +304,32 @@ struct Variant {
 };
 struct Run {
   double wall = 0, user = 0, sys = 0, inproc = -1, ph[5] = {-1, -1, -1, -1, -1}, psys = -1;
+  double tl[6] = {-1, -1, -1, -1, -1, -1};  // ms: files mapped, links, parse, scan, output written, end of run
   long rss_mb = 0, minflt = 0;
   long long ud = -1, cd = -1;
   int status = 0;
   char route = '?';
   bool ok = false;
 };
+// ms of the log line "[ seconds] <key>...": the first such line, or the last one
+static double log_at(const std::string& e, const char* key, bool last) {
+  const std::string k = std::string("] ") + key;
+  size_t p = last ? e.rfind(k) : e.find(k);
+  if (p == std::string::npos) return -1;
+  size_t b = e.rfind('[', p);
+  return b == std::string::npos ? -1 : atof(e.c_str() + b + 1) * 1000.0;
+}
 static void parse_log(const std::string& e, Run& r) {
+  r.tl[0] = log_at(e, "mapped", false);
+  r.tl[1] = log_at(e, "links", true);
+  r.tl[2] = log_at(e, "parsed", false);
+  r.tl[3] = log_at(e, "dense scan done", false);
+  r.tl[4] = log_at(e, "output written", false);
+  {
+    size_t a = e.find("ABS start "), z = e.find("ABS end ");
+    if (a != std::string::npos && z != std::string::npos)
+      r.tl[5] = (atof(e.c_str() + z + 8) - atof(e.c_str() + a + 10)) * 1000.0;
+  }
   if (e.find("parsed (dense)") != std::string::npos)
     r.route = 'd';
   else if (e.find("parsed:") != std::string::npos)
@@ -375,6 +395,7 @@ struct Row {
   long long a = 0, b = 0, c = 0;
 };
 static int32_t g_day = 0;
+static std::string tl_tag;
 static bool write_report(const std::string& out, std::vector<Row> rows) {
   const std::string dir = out + "/user_daily";
   mkdir(dir.c_str(), 0777);
@@ -438,6 +459,7 @@ int main() {
   const std::string scratch = env_or("SCRATCH_DIR", "/scratch"), dir = env_or("BENCH_DIR", "/usr/local/bench");
   const double tmax = atof(env_or("BENCH_TMAX", "150").c_str());
   const std::string seed = env_or("BENCH_SEED", "20261122");
+  tl_tag = env_or("BENCH_TIMELINE", "");  // the build whose phase timeline the report gives
   g_day = day_of(slurp(data + "/manifest.json"));
   std::vector<Variant> vs = load_variants(dir);
   std::string notes;
@@ -556,7 +578,7 @@ int main() {
     rm_rf(gdir);
 
     // summary of this size: two text fields and the three medians of the first builds
-    std::string a = fmt("!%d %.0fM", sizeno, z.ev_m), b;
+    std::string a = fmt("!%d %.0fM", sizeno, z.ev_m), b, tlines;
     long long med3[3] = {0, 0, 0};
     long long ud0 = -2, cd0 = -2;
     bool agree = true;
@@ -593,13 +615,23 @@ int main() {
       const double mw = median(w), mn = w.empty() ? -1 : *std::min_element(w.begin(), w.end());
       if (vi < 3) med3[vi] = (long long)mw;
       (void)mn;  // (bench 1 printed the best wall time too: a=512/498,...)
-      a += fmt(" %s=%.0f,u%.2f,s%.2f,%ldM,%c%zu%s", vs[vi].tag.c_str(), mw, median(us), median(ss), rss, route, w.size(),
-               bad ? fmt("!%d", bad).c_str() : "");
+      (void)rss;  // (benches 1 to 5 printed the peak memory too, as 626M)
+      a += fmt(" %s=%.0f,u%.2f,s%.2f,%c%s", vs[vi].tag.c_str(), mw, median(us), median(ss), route,
+               bad ? fmt("!%d", bad).c_str() : (w.size() == (size_t)z.rounds ? "" : fmt("%zu", w.size()).c_str()));
       if (!ph[0].empty())  // CPU ms of links, parse, dedup or scan (the person phase and the output are a few ms)
         b += fmt("%s%s:%.0f+%.0f+%.0f", b.empty() ? "" : " ", vs[vi].tag.c_str(), median(ph[0]) * 1000,
                  median(ph[1]) * 1000, median(ph[2]) * 1000);
+      if (vs[vi].tag == tl_tag && !w.empty()) {  // the timeline of the run with the median wall time
+        const Run* best = nullptr;
+        for (auto& u : res[vi])
+          if (u.ok && (!best || std::fabs(u.wall - mw) < std::fabs(best->wall - mw))) best = &u;
+        if (best)
+          tlines += fmt(" %s@%.0fM:%.0f/%.0f/%.0f/%.0f/%.0f/%.0f", vs[vi].tag.c_str(), z.ev_m, best->tl[0], best->tl[1],
+                        best->tl[2], best->tl[3], best->tl[4], best->tl[5]);
+      }
     }
     a += fmt(" rows=%lld/%lld%s", ud0, cd0, agree ? "" : ",DIFFER");
+    b += tlines;
     rows.push_back(Row{a, b.empty() ? "-" : b, med3[0], med3[1], med3[2]});
   }
   rows.push_back(Row{fmt("!%d %s%s tot=%.0fs", sizeno + 1, env_s.c_str(), notes.c_str(), el()), gen_s.empty() ? "-" : gen_s.substr(1),
