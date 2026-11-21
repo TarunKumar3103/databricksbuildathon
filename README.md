@@ -19,9 +19,10 @@ One static C++17 binary (no engine, no runtime dependencies) that reads `/data` 
    all separator offsets into one array, and splits each well-shaped line into its fields with a few
    vector operations. Event lines are then processed 64 at a time in three plain loops: keys and hashes;
    timestamps, grouped by the form of `ts` so each group runs one kernel; validation and the scatter.
-   Click lines are handled the same way. F1 timestamps in the years the window touches take a fast path
-   (one vector compare, one table lookup); everything else goes through the general parsers. All of
-   them are checked against scalar references in `--selftest`. IDs up to 9 bytes are packed into
+   Click lines are handled the same way. Timestamps in the years the window touches take a fast path
+   (one vector compare, one table lookup), both the `...Z` form and the form with a UTC offset (whose
+   six offset bytes are checked and converted in one 64-bit word); everything else goes through the
+   general parsers. All of them are checked against scalar references in `--selftest`. IDs up to 9 bytes are packed into
    order-preserving 64-bit keys; longer or non-ASCII IDs are interned. A key is hashed with a single
    multiplication by an odd constant: a bijection, so the hash can stand in for the key everywhere (and
    is turned back into the key for the output), with every partition and table index cut from its high

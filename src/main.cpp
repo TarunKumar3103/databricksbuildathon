@@ -725,8 +725,10 @@ static void init_fast_years(i64 lo_ms, i64 hi_ms) {
 }
 
 // Two F1 timestamps at once. True iff both are valid F1 in a candidate year; then ta / tb are their values.
-// Needs 20 readable bytes at a and at b.
-static FORCE_INLINE bool f1_pair(const u8* a, const u8* b, i64& ta, i64& tb) {
+// Needs 20 readable bytes at a and at b. OKM: the positions (bytes 4..19 of a, then of b) that are checked;
+// leaving out bit 15 accepts any byte in place of a's 'Z'.
+template <u32 OKM>
+static FORCE_INLINE bool f1_pair_m(const u8* a, const u8* b, i64& ta, i64& tb) {
   // bytes 4..19 of both: "-MM-DDTHH:MM:SSZ"
   const __m256i v = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128((const __m128i*)(a + 4))),
                                             _mm_loadu_si128((const __m128i*)(b + 4)), 1);
@@ -744,7 +746,7 @@ static FORCE_INLINE bool f1_pair(const u8* a, const u8* b, i64& ta, i64& tb) {
                           0, 0, 0, 0));  // month, day, hour, minute, second
   // upper bounds (they also keep month * 32 + day inside the table); month 0 / day 0 are not in the table
   const __m256i bad = _mm256_cmpgt_epi16(p, _mm256_setr_epi16(12, 31, 23, 59, 59, 0, 0, 0, 12, 31, 23, 59, 59, 0, 0, 0));
-  if ((okm != 0xFFFFFFFFu) | !_mm256_testz_si256(bad, bad)) return false;
+  if (((okm & OKM) != OKM) | !_mm256_testz_si256(bad, bad)) return false;
   const __m256i q = _mm256_madd_epi16(p, _mm256_setr_epi16(32, 1, 60, 1, 1, 0, 0, 0, 32, 1, 60, 1, 1, 0, 0, 0));
   alignas(32) u32 Lbuf[8];  // month * 32 + day, hour * 60 + minute, second, 0
   _mm256_store_si256((__m256i*)Lbuf, q);
@@ -762,8 +764,13 @@ static FORCE_INLINE bool f1_pair(const u8* a, const u8* b, i64& ta, i64& tb) {
   return true;
 }
 
-// One F1 timestamp. Needs 20 readable bytes at a.
-static FORCE_INLINE bool f1_one(const u8* a, i64& ta) {
+static FORCE_INLINE bool f1_pair(const u8* a, const u8* b, i64& ta, i64& tb) {
+  return f1_pair_m<0xFFFFFFFFu>(a, b, ta, tb);
+}
+
+// One F1 timestamp. Needs 20 readable bytes at a. OKM as above (16 bits).
+template <u32 OKM>
+static FORCE_INLINE bool f1_one_m(const u8* a, i64& ta) {
   const __m128i v = _mm_loadu_si128((const __m128i*)(a + 4));
   const __m128i d = _mm_sub_epi8(v, _mm_set1_epi8('0'));
   const __m128i isdig = _mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d);
@@ -773,7 +780,7 @@ static FORCE_INLINE bool f1_one(const u8* a, i64& ta) {
   const __m128i g = _mm_shuffle_epi8(d, _mm_setr_epi8(1, 2, 4, 5, 7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1));
   const __m128i p = _mm_maddubs_epi16(g, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0));
   const __m128i bad = _mm_cmpgt_epi16(p, _mm_setr_epi16(12, 31, 23, 59, 59, 0, 0, 0));
-  if ((okm != 0xFFFFu) | !_mm_testz_si128(bad, bad)) return false;
+  if (((okm & OKM) != OKM) | !_mm_testz_si128(bad, bad)) return false;
   const __m128i q = _mm_madd_epi16(p, _mm_setr_epi16(32, 1, 60, 1, 1, 0, 0, 0));
   alignas(16) u32 Lbuf[4];
   _mm_store_si128((__m128i*)Lbuf, q);
@@ -786,6 +793,42 @@ static FORCE_INLINE bool f1_one(const u8* a, i64& ta) {
   const i64 da = g_dayms[ka][L[0]];
   if (da == DAYMS_NONE) return false;
   ta = da + (i64)(L[1] * 60 + L[2]) * 1000;
+  return true;
+}
+static FORCE_INLINE bool f1_one(const u8* a, i64& ta) { return f1_one_m<0xFFFFu>(a, ta); }
+
+// The UTC offset of a 25-byte timestamp "YYYY-MM-DDTHH:MM:SS+HH:MM" at a (bytes 19..24: a sign, then HH:MM
+// with HH <= 23 and MM <= 59), as the milliseconds to add to its civil time: negative for '+'. False if
+// those six bytes are anything else.
+static FORCE_INLINE bool f3_offset(const u8* a, i64& add_ms) {
+  u64 x;
+  memcpy(&x, a + 17, 8);  // S S sign H H : M M
+  const u32 sg = (u32)(x >> 16) & 0xFF;
+  const u64 t = (x >> 24) ^ 0x30303A3030ULL;  // the digits as values, the colon as 0
+  // a digit byte is fine iff it is <= 9, the colon byte iff it is 0: adding 0x76 / 0x7F sets the top bit of
+  // any other value below 0x80, and a value from 0x80 has its top bit set to begin with
+  const u64 bad = ((t + 0x76767F7676ULL) | t) & 0x8080808080ULL;
+  const u64 u = t * 0x0A01;  // byte 1: HH, byte 4: MM
+  const u32 oh = (u32)(u >> 8) & 0xFF, om = (u32)(u >> 32) & 0xFF;
+  if ((bad != 0) | (((sg - 0x2B) & ~2u) != 0) | (oh > 23) | (om > 59)) return false;  // sign: '+' 0x2B or '-' 0x2D
+  add_ms = (i64)((i32)sg - 0x2C) * (i64)((oh * 60 + om) * 60000u);
+  return true;
+}
+
+// A 25-byte timestamp with a UTC offset (a) and an F1 timestamp (b) at once: true iff both are valid and
+// their civil years are candidate years. Needs 25 readable bytes at a and 20 at b.
+static FORCE_INLINE bool f3f1_pair(const u8* a, const u8* b, i64& ta, i64& tb) {
+  i64 add;
+  if (!f3_offset(a, add) || !f1_pair_m<0xFFFF7FFFu>(a, b, ta, tb)) return false;
+  ta += add;
+  return true;
+}
+
+// One 25-byte timestamp with a UTC offset. Needs 25 readable bytes at a.
+static FORCE_INLINE bool f3_one(const u8* a, i64& ta) {
+  i64 add;
+  if (!f3_offset(a, add) || !f1_one_m<0x7FFFu>(a, ta)) return false;
+  ta += add;
   return true;
 }
 
@@ -1566,7 +1609,17 @@ static NOINLINE void process_events(EvBatch& B, const u32 n, const u8* const bas
       ts_exact(B, i, base);
     }
   }
-  for (u32 j = 0; j < cnt[2]; j++) ts_exact(B, B.idx[2][j], base);
+  for (u32 j = 0; j < cnt[2]; j++) {  // ts with a UTC offset
+    const u32 i = B.idx[2][j];
+    const u32* off = B.off[i];
+    i64 ta, tb;
+    if (__builtin_expect(B.len[i][3] == 20 && f3f1_pair(base + off[2], base + off[3], ta, tb), 1)) {
+      B.ts[i] = ta;
+      B.ing[i] = tb;
+    } else {
+      ts_exact(B, i, base);
+    }
+  }
   for (u32 j = 0; j < cnt[3]; j++) ts_exact(B, B.idx[3][j], base);
   // ---- validation, records, scatter
   auto cur = cur_out;
@@ -1675,7 +1728,14 @@ static NOINLINE void process_clicks(CkBatch& B, const u32 n, const u8* const bas
     else
       ck_ts_exact(B, i, base);
   }
-  for (u32 j = 0; j < cnt[2]; j++) ck_ts_exact(B, B.idx[2][j], base);
+  for (u32 j = 0; j < cnt[2]; j++) {  // with a UTC offset
+    const u32 i = B.idx[2][j];
+    i64 t;
+    if (__builtin_expect(f3_one(base + B.off[i][3], t), 1))
+      B.ts[i] = t;
+    else
+      ck_ts_exact(B, i, base);
+  }
   for (u32 j = 0; j < cnt[3]; j++) ck_ts_exact(B, B.idx[3][j], base);
   // ---- keys and campaign; every line is handed to the router, which keeps the valid ones
   const u64 wlen = (u64)(we - cws);
@@ -2687,6 +2747,70 @@ static int selftest() {
   }
   fprintf(stderr, "selftest F1 kernels: %ld cases, %ld mismatches; accepted %ld of %ld valid in-year values\n", n2, bad2,
           accepted, in_year);
+  // ---- kernels for timestamps with a UTC offset: the same two requirements, against parse_ts_ref
+  long n5 = 0, bad5 = 0, in_year5 = 0, accepted5 = 0;
+  for (const auto& ys : year_sets) {
+    init_fast_years(days_from_civil(ys[0], 12, 20) * DAY, days_from_civil(ys[1], 1, 15) * DAY);
+    for (long it = 0; it < 3000000; it++) {
+      auto gen = [&](u8* dst, bool offset) {
+        char t[64];
+        int yr = (next() % 16 == 0) ? ys[0] + (int)(next() % 5) - 2 : ys[next() & 1];
+        int mo = 1 + (int)(next() % 12), dd = 1 + (int)(next() % 31), hh = (int)(next() % 24), mi = (int)(next() % 60),
+            se = (int)(next() % 60), oh = (int)(next() % 24), om = (int)(next() % 60);
+        if (next() % 40 == 0) mo = (int)(next() % 20);
+        if (next() % 40 == 0) dd = (int)(next() % 40);
+        if (next() % 40 == 0) hh = (int)(next() % 30);
+        if (next() % 40 == 0) mi = (int)(next() % 70);
+        if (next() % 40 == 0) se = (int)(next() % 70);
+        if (next() % 20 == 0) oh = (int)(next() % 100);
+        if (next() % 20 == 0) om = (int)(next() % 100);
+        int len = snprintf(t, sizeof t, "%04d-%02d-%02dT%02d:%02d:%02d", yr, mo, dd, hh, mi, se);
+        if (offset)
+          len += snprintf(t + len, sizeof t - len, "%c%02d:%02d", "+-+-+-+-+-+-+-Z,"[next() % 16], oh, om);
+        else
+          len += snprintf(t + len, sizeof t - len, "Z");
+        if (next() % 5 == 0) {
+          int pos = (int)(next() % len);
+          t[pos] = alphabet[next() % strlen(alphabet)];
+        }
+        if (next() % 16 == 0) {
+          int pos = 17 + (int)(next() % (len - 17));
+          t[pos] = (char)(next() % 256);
+        }
+        for (int k = 0; k < 64; k++) dst[k] = (u8)("0123456789,\"Z:+-T"[next() % 17]);
+        memcpy(dst, t, len);
+      };
+      gen(pa.data(), true);
+      gen(pb.data(), false);
+      i64 ra = 0, rb = 0, fa = 0, fb = 0, f3 = 0;
+      const bool va = parse_ts_ref(pa.data(), 25, ra) && pa[4] == '-';  // the 25-byte form (not 25 digits)
+      const bool vb = pb[19] == 'Z' && civil19_scalar(pb.data(), rb);
+      const bool rp = f3f1_pair(pa.data(), pb.data(), fa, fb);
+      const bool r1 = f3_one(pa.data(), f3);
+      n5++;
+      bool wrong = false;
+      if (rp && (!va || !vb || fa != ra || fb != rb)) wrong = true;
+      if (r1 && (!va || f3 != ra)) wrong = true;
+      u32 ya, yb;
+      memcpy(&ya, pa.data(), 4);
+      memcpy(&yb, pb.data(), 4);
+      const bool ca = va && (ya == g_ytxt[0] || ya == g_ytxt[1]), cb = vb && (yb == g_ytxt[0] || yb == g_ytxt[1]);
+      if (ca) {
+        in_year5++;
+        accepted5 += r1;
+        if (!r1) wrong = true;
+      }
+      if (ca && cb && !rp) wrong = true;
+      if (wrong) {
+        if (bad5 < 10)
+          fprintf(stderr, "OFFSET KERNEL MISMATCH a='%.25s' b='%.20s' pair=%d one=%d ref=%d,%d\n", (const char*)pa.data(),
+                  (const char*)pb.data(), rp, r1, va, vb);
+        bad5++;
+      }
+    }
+  }
+  fprintf(stderr, "selftest offset kernels: %ld cases, %ld mismatches; accepted %ld of %ld valid in-year values\n", n5,
+          bad5, accepted5, in_year5);
   // ---- digits_le8 and camp_fast against the loops
   long n3 = 0, bad3 = 0;
   {
@@ -2770,7 +2894,7 @@ static int selftest() {
     }
   }
   fprintf(stderr, "selftest keys: %ld cases (%ld fast), %ld mismatches\n", n4, nfast, bad4);
-  return (bad || bad2 || bad3 || bad4) ? 1 : 0;
+  return (bad || bad2 || bad3 || bad4 || bad5) ? 1 : 0;
 }
 
 // ------------------------------------------------------------------------------------------
