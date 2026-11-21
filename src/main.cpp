@@ -246,21 +246,19 @@ struct WCScatter {
   QEnt* qe = nullptr;
   T** beg = nullptr;
   std::vector<std::vector<std::pair<T*, u32>>> blocks;
-  // The working state comes from the thread's arena: it is touched at random for every record, and there it
-  // sits on a huge page next to the blocks instead of on dozens of small pages of its own.
-  void init(u32 parts, Arena& a) {
+  // (The working state is set up by the side thread that also reads the lookups. It comes from the heap, not
+  // from the thread's arena: touching the arena would fault in a 2 MB page per thread on that one side thread,
+  // which is slower than the links phase it runs beside when memory is cold.)
+  void init(u32 parts) {
     P = parts;
-    hot = (Hot*)a.alloc((size_t)P * sizeof(Hot));
-    memset((void*)hot, 0, (size_t)P * sizeof(Hot));
-    lines = (u8*)a.alloc((size_t)64 * (P + QCAP));
-    sp = (T**)a.alloc((size_t)P * sizeof(T*));
+    hot = (Hot*)calloc(P, sizeof(Hot));
+    lines = (u8*)aligned_alloc(64, (size_t)64 * (P + QCAP));
+    sp = (T**)malloc((size_t)P * sizeof(T*));
     for (u32 p = 0; p < P; p++) sp[p] = (T*)(lines + (size_t)64 * p);
-    q = (QEnt*)a.alloc(QCAP * sizeof(QEnt));
-    memset((void*)q, 0, QCAP * sizeof(QEnt));
+    q = (QEnt*)calloc(QCAP, sizeof(QEnt));
     for (u32 i = 0; i < QCAP; i++) q[i].spare = lines + (size_t)64 * (P + i);
     qe = q;
-    beg = (T**)a.alloc((size_t)P * sizeof(T*));
-    memset((void*)beg, 0, (size_t)P * sizeof(T*));
+    beg = (T**)calloc(P, sizeof(T*));
     blocks.assign(P, {});
   }
   void grow(u32 p, Arena& a) {
@@ -3071,9 +3069,9 @@ int main(int argc, char** argv) {
     load_lookups(data);
     g_tl.resize(NT);
     for (auto& t : g_tl) {
-      t.r1.init(1u << g_P1bits, t.arena);
-      t.r2.init(1u << g_P2bits, t.arena);
-      t.r2c.init(1u << g_P2bits, t.arena);
+      t.r1.init(1u << g_P1bits);
+      t.r2.init(1u << g_P2bits);
+      t.r2c.init(1u << g_P2bits);
     }
   });
   g_phase = 1;
@@ -3140,9 +3138,9 @@ static int bench_parse(const char* data, const char* file, int reps) {
     t = TL();
     t.arena.cur = mem;
     t.arena.end = mem + slab;
-    t.r1.init(1u << g_P1bits, t.arena);
-    t.r2.init(1u << g_P2bits, t.arena);
-    t.r2c.init(1u << g_P2bits, t.arena);
+    t.r1.init(1u << g_P1bits);
+    t.r2.init(1u << g_P2bits);
+    t.r2c.init(1u << g_P2bits);
     u64 c0 = __rdtsc();
     parse_events_clicks(ev, ck);
     u64 c1 = __rdtsc();
