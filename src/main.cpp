@@ -3142,7 +3142,7 @@ int main(int argc, char** argv) {
     if (v > 0) NT = v;
   }
   NT = std::max(1, std::min(NT, 256));
-  if (sched_getaffinity(0, sizeof g_all_cpus, &g_all_cpus) == 0 && !getenv("SS_NOPIN")) {
+  if (getenv("SS_PIN") && sched_getaffinity(0, sizeof g_all_cpus, &g_all_cpus) == 0) {
     int n = 0;
     for (int c = 0; c < CPU_SETSIZE && n < 256; c++)
       if (CPU_ISSET(c, &g_all_cpus)) g_pin_cpu[n++] = c;

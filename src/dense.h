@@ -1008,7 +1008,8 @@ static void parse(std::vector<MFile>& ev, std::vector<MFile>& ck) {
   size_t ev_bytes = 0, ck_bytes = 0;
   for (auto& f : ev) ev_bytes += f.size;
   for (auto& f : ck) ck_bytes += f.size;
-  size_t chunk = std::max<size_t>(1 << 18, std::min<size_t>(8 << 20, (ev_bytes + ck_bytes) / (NT * 24 + 1)));
+  const size_t cmax = getenv("SS_CHUNK_KB") ? (size_t)std::max(64, atoi(getenv("SS_CHUNK_KB"))) << 10 : (size_t)8 << 20;  // (bench knob)
+  size_t chunk = std::max<size_t>(1 << 18, std::min<size_t>(cmax, (ev_bytes + ck_bytes) / (NT * 24 + 1)));
   std::vector<Chunk> ce, cc;
   make_chunks(ev, chunk, ce);
   make_chunks(ck, chunk, cc);
@@ -1725,7 +1726,8 @@ static void scan_all() {
     total += cnt[j];
     if (cnt[j]) used = j + 1;
   }
-  const u32 nseg = std::max<u32>(1, std::min<u32>(used, (u32)NT * 4));
+  const u32 segmul = getenv("SS_SEGMUL") ? (u32)std::max(1, atoi(getenv("SS_SEGMUL"))) : 4;  // (bench knob)
+  const u32 nseg = std::max<u32>(1, std::min<u32>(used, (u32)NT * segmul));
   std::vector<u32> sb(nseg + 1, used);
   {
     u64 run = 0;
