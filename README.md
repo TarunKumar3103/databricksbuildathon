@@ -99,3 +99,9 @@ make dev run-dev check-dev    # 1M-event dev set (needs `generate`) against dev-
 
 `SS_LOG=1` prints phase timings to stderr (and which route ran). `tests/reference.py` is a slow, plain Python
 implementation of the rules used as an oracle for differential tests on other seeds.
+
+`tools/` holds the whole gate a change has to pass (`verify.sh`: fixtures, dev answer, 21 reference seeds, 20M and
+40M sets at several thread counts; `mut/`: data damaged on purpose, so that every assumption of the dense route is
+broken at least once and the output must still equal the general route's; `ctest.sh`: the binary in a container
+with the scorer's flags) and the measuring tools (a cachegrind cost model, per-function and per-line profiles,
+interleaved timing). `tools/README.md` has the setup and the commands.
