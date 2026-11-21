@@ -310,6 +310,7 @@ struct Run {
   int status = 0;
   char route = '?';
   bool ok = false;
+  std::string stg, pf, sol;  // a probe build's STAGES, PERF and SOL lines (bench 8)
 };
 // ms of the log line "[ seconds] <key>...": the first such line, or the last one
 static double log_at(const std::string& e, const char* key, bool last) {
@@ -335,6 +336,18 @@ static void parse_log(const std::string& e, Run& r) {
   else if (e.find("parsed:") != std::string::npos)
     r.route = 'g';
   if (e.find("given up") != std::string::npos) r.route = 'f';
+  // a probe build's own report lines, without their key
+  auto line_of = [&](const char* key) -> std::string {
+    const std::string k = std::string("\n") + key;
+    size_t q = e.compare(0, strlen(key), key) == 0 ? 0 : e.find(k);
+    if (q == std::string::npos) return "";
+    if (q) q++;
+    const size_t z = e.find('\n', q);
+    return e.substr(q + strlen(key), (z == std::string::npos ? e.size() : z) - q - strlen(key));
+  };
+  r.stg = line_of("STAGES ");
+  r.pf = line_of("PERF ");
+  r.sol = line_of("SOL ");
   size_t p = e.find("] output written");
   if (p != std::string::npos) {
     size_t b = e.rfind('[', p);
@@ -460,6 +473,8 @@ int main() {
   const double tmax = atof(env_or("BENCH_TMAX", "150").c_str());
   const std::string seed = env_or("BENCH_SEED", "20261122");
   tl_tag = env_or("BENCH_TIMELINE", "");  // the build whose phase timeline the report gives
+  const std::string stg_tag = env_or("BENCH_STAGES", ""), sol_tag = env_or("BENCH_SOL", "");  // probe builds (bench 8)
+  std::vector<Row> srows;  // their rows, one per size
   g_day = day_of(slurp(data + "/manifest.json"));
   std::vector<Variant> vs = load_variants(dir);
   std::string notes;
@@ -606,6 +621,7 @@ int main() {
         route = u.route;
         if (u.ph[0] >= 0)
           for (int i = 0; i < 5; i++) ph[i].push_back(u.ph[i]);
+        if (u.ud < 0) continue;  // (a probe run that writes no tables does not take part)
         if (ud0 == -2) {
           ud0 = u.ud;
           cd0 = u.cd;
@@ -633,7 +649,33 @@ int main() {
     a += fmt(" rows=%lld/%lld%s", ud0, cd0, agree ? "" : ",DIFFER");
     b += tlines;
     rows.push_back(Row{a, b.empty() ? "-" : b, med3[0], med3[1], med3[2]});
+    // the probe builds' lines, from their runs with the median wall time
+    {
+      auto median_run = [&](const std::string& tag) -> const Run* {
+        for (size_t vi = 0; vi < vs.size(); vi++) {
+          if (vs[vi].tag != tag) continue;
+          std::vector<double> w;
+          for (auto& u : res[vi])
+            if (u.ok) w.push_back(u.wall);
+          if (w.empty()) return nullptr;
+          const double mw = median(w);
+          const Run* best = nullptr;
+          for (auto& u : res[vi])
+            if (u.ok && (!best || std::fabs(u.wall - mw) < std::fabs(best->wall - mw))) best = &u;
+          return best;
+        }
+        return nullptr;
+      };
+      const Run* rs = stg_tag.empty() ? nullptr : median_run(stg_tag);
+      const Run* rf = sol_tag.empty() ? nullptr : median_run(sol_tag);
+      if (rs || rf)
+        srows.push_back(Row{fmt("!s%d %.0fM %s", sizeno, z.ev_m, rs && !rs->stg.empty() ? rs->stg.c_str() : "no-STAGES"),
+                            fmt("PERF %s | SOL %s", rs && !rs->pf.empty() ? rs->pf.c_str() : "-",
+                                rf && !rf->sol.empty() ? rf->sol.c_str() : "-"),
+                            0, 0, 0});
+    }
   }
+  for (auto& r : srows) rows.push_back(r);
   rows.push_back(Row{fmt("!%d %s%s tot=%.0fs", sizeno + 1, env_s.c_str(), notes.c_str(), el()), gen_s.empty() ? "-" : gen_s.substr(1),
                      (long long)dev_ms, ncpu, (long long)el()});
   if (!write_report(out, rows)) fprintf(stderr, "bench: report not written\n");

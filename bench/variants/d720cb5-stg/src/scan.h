@@ -69,6 +69,38 @@ static inline __attribute__((always_inline)) u32 tz64(u64 x) {
   return (u32)r;
 }
 
+// Appends cnt bits (nb to the stream N, qb to Q) at bit ns. Both streams keep every bit from ns on at 0,
+// for at least 64 bits past the byte that holds bit ns. Up to 56 bits go in as one unaligned 64-bit word at
+// byte ns / 8 (the bits start at ns % 8 <= 7 in it), with the 8 bytes after it cleared; more than that (64
+// bytes nearly all separators) the word-wise way, with one more word cleared.
+static inline __attribute__((always_inline)) void append_bits(u64* N, u64* Q, const u32 ns, const u32 cnt, const u64 nb,
+                                                              const u64 qb) {
+  if (__builtin_expect(cnt <= 56, 1)) {
+    u8* const n8 = (u8*)N + (ns >> 3);
+    u8* const q8 = (u8*)Q + (ns >> 3);
+    const u32 sh = ns & 7;
+    u64 x, y;
+    memcpy(&x, n8, 8);
+    memcpy(&y, q8, 8);
+    x |= nb << sh;
+    y |= qb << sh;
+    memcpy(n8, &x, 8);
+    memcpy(q8, &y, 8);
+    const u64 z = 0;
+    memcpy(n8 + 8, &z, 8);
+    memcpy(q8 + 8, &z, 8);
+  } else {
+    const size_t wi = ns >> 6;
+    const u32 lsh = ns & 63, rsh = ~ns & 63;  // rsh = 63 - lsh
+    N[wi] |= nb << lsh;
+    N[wi + 1] = (nb >> 1) >> rsh;
+    N[wi + 2] = 0;
+    Q[wi] |= qb << lsh;
+    Q[wi + 1] = (qb >> 1) >> rsh;
+    Q[wi + 2] = 0;
+  }
+}
+
 // index of the first set bit at or after `from` and below `limit` in the bit stream w; `limit` if none.
 // Bits at and above `limit` in the last word are zero.
 static inline u32 next_bit(const u64* w, u32 from, u32 limit) {
@@ -185,15 +217,7 @@ static inline __attribute__((always_inline)) void scan_lines(const u8* begin, co
     }
     // append the separators of this block: newline bits, quote-after bits, offsets
     const u32 cnt = (u32)__builtin_popcountll(sep);
-    const u64 nb = _pext_u64(mn, sep), qb = _pext_u64(qn, sep);
-    {
-      const size_t wi = ns >> 6;
-      const u32 lsh = ns & 63, rsh = ~ns & 63;  // rsh = 63 - lsh
-      Nw[wi] |= nb << lsh;
-      Nw[wi + 1] = (nb >> 1) >> rsh;
-      Qw[wi] |= qb << lsh;
-      Qw[wi + 1] = (qb >> 1) >> rsh;
-    }
+    append_bits(Nw, Qw, ns, cnt, _pext_u64(mn, sep), _pext_u64(qn, sep));
     {
       u64 m = sep;
       u32* o = Spos + (size_t)ns;
@@ -215,7 +239,9 @@ static inline __attribute__((always_inline)) void scan_lines(const u8* begin, co
     // ---------------- stage 1
     u32 off = w;
     for (const u32 fend = wend < fast_end ? wend : fast_end; off < fend; off += 64) {
-      _mm_prefetch((const char*)(p + off + 2048), _MM_HINT_T0);
+      // (written out, so that the address is formed from the registers the loads use, instead of from a
+      // hoisted p + 2048 that the compiler then keeps on the stack and loads again every block)
+      __asm__ volatile("prefetcht0 2048(%0,%1)" : : "r"(p), "r"((u64)off));
       u64 nsep, nmn, nmq;
       block_masks((size_t)off + 64, nsep, nmn, nmq);
       finish_block(off, (mq >> 1) | (nmq << 63), (sep >> 2) | (nsep << 62));
@@ -468,15 +494,7 @@ static inline __attribute__((always_inline)) void scan_cols(const u8* begin, con
     }
     // append the separators of this block: newline bits, quote-after bits, offsets
     const u32 cnt = (u32)__builtin_popcountll(sep);
-    const u64 nb = _pext_u64(mn, sep), qb = _pext_u64(qn, sep);
-    {
-      const size_t wi = ns >> 6;
-      const u32 lsh = ns & 63, rsh = ~ns & 63;  // rsh = 63 - lsh
-      Nw[wi] |= nb << lsh;
-      Nw[wi + 1] = (nb >> 1) >> rsh;
-      Qw[wi] |= qb << lsh;
-      Qw[wi + 1] = (qb >> 1) >> rsh;
-    }
+    append_bits(Nw, Qw, ns, cnt, _pext_u64(mn, sep), _pext_u64(qn, sep));
     {
       u64 m = sep;
       u32* o = Spos + (size_t)ns;
@@ -492,13 +510,33 @@ static inline __attribute__((always_inline)) void scan_cols(const u8* begin, con
     ns += cnt;
   };
   const u32 fast_end = total >= 128 ? total - 127 : 0;  // blocks below it are followed by 64 more bytes
+#ifdef STAGES
+  // (probe builds: stage 1 per window, and stage 2 less the batches it hands on)
+  constexpr bool kI = NF == 7 || NF == 4;
+  constexpr int K1 = NF == 7 ? STG_E_S1 : STG_C_S1;
+  uint64_t s2t_ = 0, s2p_ = 0;
+  bool s2o_ = false;
+  auto s2close = [&](uint64_t now) {
+    if (kI && s2o_) tl_stgp[K1 + 1] += (now - s2t_) - (tl_stgp[K1 + 2] - s2p_);
+    s2o_ = false;
+  };
+#endif
   for (; w < total; w += WB * 64) {
+#ifdef STAGES
+    {
+      const uint64_t n_ = __rdtsc();
+      s2close(n_);
+      s2t_ = n_;
+    }
+#endif
     const u32 wend = (total - w < WB * 64) ? total : w + WB * 64;
     badw = 0;
     // ---------------- stage 1
     u32 off = w;
     for (const u32 fend = wend < fast_end ? wend : fast_end; off < fend; off += 64) {
-      _mm_prefetch((const char*)(p + off + 2048), _MM_HINT_T0);
+      // (written out, so that the address is formed from the registers the loads use, instead of from a
+      // hoisted p + 2048 that the compiler then keeps on the stack and loads again every block)
+      __asm__ volatile("prefetcht0 2048(%0,%1)" : : "r"(p), "r"((u64)off));
       u64 nsep, nmn, nmq;
       block_masks((size_t)off + 64, nsep, nmn, nmq);
       finish_block(off, (mq >> 1) | (nmq << 63), (sep >> 2) | (nsep << 62));
@@ -529,6 +567,15 @@ static inline __attribute__((always_inline)) void scan_cols(const u8* begin, con
       mq = nmq;
     }
     // ---------------- stage 2
+#ifdef STAGES
+    if (kI) {
+      const uint64_t n_ = __rdtsc();
+      tl_stgp[K1] += n_ - s2t_;
+      s2t_ = n_;
+      s2p_ = tl_stgp[K1 + 2];
+      s2o_ = true;
+    }
+#endif
     u32 si = 0;  // entry of the newline before the current line
     if (skip_open) {
       const u32 k = next_bit(Nw, 0, ns);
@@ -691,6 +738,9 @@ static inline __attribute__((always_inline)) void scan_cols(const u8* begin, con
       Qw[1] = 0;
     }
   }
+#ifdef STAGES
+  s2close(__rdtsc());
+#endif
   // last line without a newline
   if (!skip_open) {
     const u32 lstart = Spos[0] + 1;

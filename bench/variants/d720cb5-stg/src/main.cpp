@@ -37,6 +37,7 @@
 #include <vector>
 
 #include "parquet.h"
+#include "stages.h"
 #include "scan.h"
 
 using u8 = uint8_t;
@@ -112,6 +113,44 @@ static inline void futex_wait(std::atomic<u32>* a, u32 seen) {
 }
 static inline void futex_wake_all(std::atomic<u32>* a) { syscall(SYS_futex, (u32*)a, FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0); }
 
+#ifdef STAGES
+#include <linux/perf_event.h>
+// perf counters of the calling thread as one group (cycles, instructions, branch misses, cache misses), user
+// space only; -1 if the container does not allow them (the errno of the first failure is kept).
+static thread_local int tl_pf = -2;
+static std::atomic<int> g_pf_errno{0};
+static int pf_open_thread() {
+  int lead = -1;
+  const u64 cfg[4] = {PERF_COUNT_HW_CPU_CYCLES, PERF_COUNT_HW_INSTRUCTIONS, PERF_COUNT_HW_BRANCH_MISSES, PERF_COUNT_HW_CACHE_MISSES};
+  for (int i = 0; i < 4; i++) {
+    perf_event_attr a;
+    memset(&a, 0, sizeof a);
+    a.type = PERF_TYPE_HARDWARE;
+    a.size = sizeof a;
+    a.config = cfg[i];
+    a.exclude_kernel = 1;
+    a.exclude_hv = 1;
+    a.read_format = PERF_FORMAT_GROUP;
+    const int fd = (int)syscall(SYS_perf_event_open, &a, 0, -1, lead, 0);
+    if (fd < 0) {
+      int z = 0;
+      g_pf_errno.compare_exchange_strong(z, errno);
+      if (lead >= 0) close(lead);
+      return -1;
+    }
+    if (i == 0) lead = fd;
+  }
+  return lead;
+}
+static inline bool pf_read(u64 v[4]) {
+  if (tl_pf == -2) tl_pf = pf_open_thread();
+  if (tl_pf < 0) return false;
+  u64 b[5];
+  if (read(tl_pf, b, sizeof b) != (ssize_t)sizeof b || b[0] != 4) return false;
+  for (int i = 0; i < 4; i++) v[i] = b[1 + i];
+  return true;
+}
+#endif
 // Tasks of job j until none is left.
 static void pool_take(PoolJob* j, int tid) {
   u64 u0 = 0, s0 = 0, u1, s1;
@@ -122,7 +161,17 @@ static void pool_take(PoolJob* j, int tid) {
     if (t >= j->ntasks) break;
     if (!any && g_log) thread_times(u0, s0);
     any = true;
+#ifdef STAGES
+    u64 pf0[4], pf1[4];
+    const bool pfa = pf_read(pf0);
+    STG_T(tt_);
+#endif
     j->run(j->ctx, t, tid);
+#ifdef STAGES
+    tl_stgp[STG_BUSY0 + (j->phase & 7)] += __rdtsc() - tt_;
+    if (pfa && pf_read(pf1))
+      for (int i = 0; i < 4; i++) tl_stgp[STG_PF0 + 4 * (j->phase & 7) + i] += pf1[i] - pf0[i];
+#endif
     if (g_log) {  // (task by task, so that the times are in before the job counts as done)
       thread_times(u1, s1);
       g_phase_cycles[j->phase] += u1 - u0;
@@ -134,6 +183,7 @@ static void pool_take(PoolJob* j, int tid) {
   }
 }
 static void pool_worker(int tid) {
+  STG_ONLY(tl_stgp = g_stg_all[tid & 255].c;)
   u32 seen = 0;
   for (;;) {
     u32 s;
@@ -753,6 +803,12 @@ static FORCE_INLINE u32 year_row(u32 y) {
   k = y == g_ytxt[1] ? 1 : k;
   return k;
 }
+// The year of the middle of the range init_fast_years was given (0: none), and copies of its rows of g_dayms
+// and g_daycode at fixed addresses: when every year a kernel looks at is this one, it reads these without
+// year_row (no row number to multiply, no row to select).
+static u32 g_ymain = 0;
+static i64 g_day_m[2][416];  // [0]: g_dayms, [1]: g_daycode (one table, so one base address for both)
+static u32 g_ymain_row = 2;
 
 static void civil_from_days(i64 days, i64& y, i64& m, i64& d) {
   i64 z = days + 719468;
@@ -787,7 +843,35 @@ static void init_fast_years(i64 lo_ms, i64 hi_ms) {
       for (int dd = 1; dd <= dim; dd++) g_dayms[k][mo * 32 + dd] = days_from_civil(ys[k], mo, dd) * DAY;
     }
   }
+  // the main year: that of the middle of the range, as its row (year_row's answer for it)
+  i64 ym;
+  civil_from_days(fdiv(lo_ms + (hi_ms - lo_ms) / 2, DAY), ym, m, d);
+  g_ymain_row = ym == ys[1] && g_ytxt[1] ? 1 : (ym == ys[0] && g_ytxt[0] ? 0 : 2);
+  g_ymain = g_ymain_row < 2 ? g_ytxt[g_ymain_row] : 0;
+  if (g_ymain && year_row(g_ymain) != g_ymain_row) g_ymain_row = year_row(g_ymain);  // (equal years: row 1)
+  memcpy(g_day_m[0], g_dayms[g_ymain_row], sizeof g_day_m[0]);
+  memcpy(g_day_m[1], g_daycode[g_ymain_row], sizeof g_day_m[1]);
 }
+
+// The digit and separator check of the F1 kernels as one compare: each of the 16 bytes "-MM-DDTHH:MM:SSZ" (bytes
+// 4..19 of a timestamp) less what it should be ('0' for a digit, the separator itself) may be at most 9 for a
+// digit, 0 for a separator, and anything (255) where OKM leaves a byte out. Lanes of 16 bytes, n of them.
+static constexpr bool f1_is_sep(int j) { return j == 0 || j == 3 || j == 6 || j == 9 || j == 12 || j == 15; }
+template <u32 OKM, int N>
+struct F1Lim {
+  alignas(32) u8 lim[16 * N];
+  alignas(32) u8 base[16 * N];
+  constexpr F1Lim() : lim(), base() {
+    const char sepc[16] = {'-', 0, 0, '-', 0, 0, 'T', 0, 0, ':', 0, 0, ':', 0, 0, 'Z'};
+    for (int i = 0; i < 16 * N; i++) {
+      const int j = i & 15;
+      base[i] = f1_is_sep(j) ? (u8)sepc[j] : (u8)'0';
+      lim[i] = ((OKM >> i) & 1) ? (f1_is_sep(j) ? 0 : 9) : 255;
+    }
+  }
+};
+template <u32 OKM, int N>
+alignas(32) static constexpr F1Lim<OKM, N> k_f1lim{};
 
 // Two F1 timestamps at once. True iff both are valid F1 in a candidate year; then ta / tb are their values.
 // Needs 20 readable bytes at a and at b. OKM: the positions (bytes 4..19 of a, then of b) that are checked;
@@ -798,21 +882,18 @@ static FORCE_INLINE bool f1_pair_mc(const u8* a, const u8* b, i64& ta, i64& tb, 
   // bytes 4..19 of both: "-MM-DDTHH:MM:SSZ"
   const __m256i v = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128((const __m128i*)(a + 4))),
                                             _mm_loadu_si128((const __m128i*)(b + 4)), 1);
-  const __m256i d = _mm256_sub_epi8(v, _mm256_set1_epi8('0'));
-  const __m256i isdig = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
-  const __m256i sepval = _mm256_setr_epi8('-', 0, 0, '-', 0, 0, 'T', 0, 0, ':', 0, 0, ':', 0, 0, 'Z', '-', 0, 0, '-',
-                                          0, 0, 'T', 0, 0, ':', 0, 0, ':', 0, 0, 'Z');
-  const __m256i sepm = _mm256_setr_epi8(-1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, -1, 0, 0, -1, 0, 0, -1, 0,
-                                        0, -1, 0, 0, -1, 0, 0, -1);
-  const u32 okm = (u32)_mm256_movemask_epi8(_mm256_blendv_epi8(isdig, _mm256_cmpeq_epi8(v, sepval), sepm));
+  const F1Lim<OKM, 2>& K = k_f1lim<OKM, 2>;
+  const __m256i d = _mm256_sub_epi8(v, _mm256_load_si256((const __m256i*)K.base));  // the digits where they belong
+  const __m256i ok = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_load_si256((const __m256i*)K.lim)), d);
   const __m256i g = _mm256_shuffle_epi8(d, _mm256_setr_epi8(1, 2, 4, 5, 7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1, 1,
                                                             2, 4, 5, 7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1));
   const __m256i p = _mm256_maddubs_epi16(
       g, _mm256_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0,
                           0, 0, 0, 0));  // month, day, hour, minute, second
-  // upper bounds (they also keep month * 32 + day inside the table); month 0 / day 0 are not in the table
+  // upper bounds (they also keep month * 32 + day inside the table); month 0 / day 0 are not in the table. Both
+  // checks in one mask: every byte checked fine and no field too large.
   const __m256i bad = _mm256_cmpgt_epi16(p, _mm256_setr_epi16(12, 31, 23, 59, 59, 0, 0, 0, 12, 31, 23, 59, 59, 0, 0, 0));
-  if (((okm & OKM) != OKM) | !_mm256_testz_si256(bad, bad)) return false;
+  if ((u32)_mm256_movemask_epi8(_mm256_andnot_si256(bad, ok)) != 0xFFFFFFFFu) return false;
   const __m256i q = _mm256_madd_epi16(p, _mm256_setr_epi16(32, 1, 60, 1, 1, 0, 0, 0, 32, 1, 60, 1, 1, 0, 0, 0));
   alignas(32) u32 Lbuf[8];  // month * 32 + day, hour * 60 + minute, second, 0
   _mm256_store_si256((__m256i*)Lbuf, q);
@@ -821,13 +902,23 @@ static FORCE_INLINE bool f1_pair_mc(const u8* a, const u8* b, i64& ta, i64& tb, 
   u32 ya, yb;
   memcpy(&ya, a, 4);
   memcpy(&yb, b, 4);
-  const u32 ka = year_row(ya), kb = year_row(yb);
-  const i64 da = g_dayms[ka][L[0]], db = g_dayms[kb][L[4]];
+  i64 da, db, cd;
+  if (__builtin_expect(((ya ^ g_ymain) | (yb ^ g_ymain)) == 0, 1)) {
+    da = g_day_m[0][L[0]];
+    db = g_day_m[0][L[4]];
+    cd = g_day_m[1][L[4]];
+    __asm__("" : "+r"(da), "+r"(db), "+r"(cd));  // (loaded here: merged with the other branch as addresses, they cost three LEAs)
+  } else {
+    const u32 ka = year_row(ya), kb = year_row(yb);
+    da = g_dayms[ka][L[0]];
+    db = g_dayms[kb][L[4]];
+    cd = g_daycode[kb][L[4]];
+  }
   if ((da == DAYMS_NONE) | (db == DAYMS_NONE)) return false;
   ta = da + (i64)(L[1] * 60 + L[2]) * 1000;
   const u32 sb = L[5] * 60 + L[6];
   tb = db + (i64)sb * 1000;
-  cb = g_daycode[kb][L[4]] + (i64)sb;
+  cb = cd + (i64)sb;
   return true;
 }
 template <u32 OKM>
@@ -844,15 +935,13 @@ static FORCE_INLINE bool f1_pair(const u8* a, const u8* b, i64& ta, i64& tb) {
 template <u32 OKM>
 static FORCE_INLINE bool f1_one_mc(const u8* a, i64& ta, i64& ca) {
   const __m128i v = _mm_loadu_si128((const __m128i*)(a + 4));
-  const __m128i d = _mm_sub_epi8(v, _mm_set1_epi8('0'));
-  const __m128i isdig = _mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d);
-  const __m128i sepval = _mm_setr_epi8('-', 0, 0, '-', 0, 0, 'T', 0, 0, ':', 0, 0, ':', 0, 0, 'Z');
-  const __m128i sepm = _mm_setr_epi8(-1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1);
-  const u32 okm = (u32)_mm_movemask_epi8(_mm_blendv_epi8(isdig, _mm_cmpeq_epi8(v, sepval), sepm));
+  const F1Lim<OKM, 1>& K = k_f1lim<OKM, 1>;
+  const __m128i d = _mm_sub_epi8(v, _mm_load_si128((const __m128i*)K.base));
+  const __m128i ok = _mm_cmpeq_epi8(_mm_min_epu8(d, _mm_load_si128((const __m128i*)K.lim)), d);
   const __m128i g = _mm_shuffle_epi8(d, _mm_setr_epi8(1, 2, 4, 5, 7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1));
   const __m128i p = _mm_maddubs_epi16(g, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0));
   const __m128i bad = _mm_cmpgt_epi16(p, _mm_setr_epi16(12, 31, 23, 59, 59, 0, 0, 0));
-  if (((okm & OKM) != OKM) | !_mm_testz_si128(bad, bad)) return false;
+  if ((u32)_mm_movemask_epi8(_mm_andnot_si128(bad, ok)) != 0xFFFFu) return false;
   const __m128i q = _mm_madd_epi16(p, _mm_setr_epi16(32, 1, 60, 1, 1, 0, 0, 0));
   alignas(16) u32 Lbuf[4];
   _mm_store_si128((__m128i*)Lbuf, q);
@@ -860,12 +949,20 @@ static FORCE_INLINE bool f1_one_mc(const u8* a, i64& ta, i64& ca) {
   __asm__("" : "+r"(L));
   u32 ya;
   memcpy(&ya, a, 4);
-  const u32 ka = year_row(ya);
-  const i64 da = g_dayms[ka][L[0]];
+  i64 da, cd;
+  if (__builtin_expect(ya == g_ymain, 1)) {
+    da = g_day_m[0][L[0]];
+    cd = g_day_m[1][L[0]];
+    __asm__("" : "+r"(da), "+r"(cd));
+  } else {
+    const u32 ka = year_row(ya);
+    da = g_dayms[ka][L[0]];
+    cd = g_daycode[ka][L[0]];
+  }
   if (da == DAYMS_NONE) return false;
   const u32 sa = L[1] * 60 + L[2];
   ta = da + (i64)sa * 1000;
-  ca = g_daycode[ka][L[0]] + (i64)sa;
+  ca = cd + (i64)sa;
   return true;
 }
 template <u32 OKM>
@@ -1224,7 +1321,8 @@ struct OutCols {
 struct D16 {  // event line, partitioned by event index
   u64 w0;  // bits 0..30: ts in ms since the window start, plus 1 (0: not a valid event); bit 31: bits 32..63
            // are not the user number but thread << 24 | index of a side entry (XEv); bits 32..63: user number
-  u64 w1;  // bits 0..23: ingest_ts code; bits 24..45: purchase, category << 17 | price; bits 46..59: slot
+  u64 w1;  // bits 0..23: 2^24 - ingest_ts code (so 0, an empty slot, is below every record and the
+           // earliest copy is the largest); bits 24..45: purchase, category << 17 | price; bits 46..59: slot
 };
 struct C16 {  // valid click, partitioned by person index
   u64 w0;  // bits 0..31: ts in ms since the window start - 7 days; bits 32..63: user number
@@ -3270,8 +3368,164 @@ static inline void exit_now() {
   _exit(0);
 }
 
+#ifdef STAGES
+// Speed-of-light floors for SS_SOL=1: what touching, reading and scanning every input byte costs with all
+// threads and no field work. One line, then the process ends (it writes no output).
+static int run_sol(std::vector<MFile>& ev, std::vector<MFile>& ck) {
+  std::vector<MFile> all = ev;
+  all.insert(all.end(), ck.begin(), ck.end());
+  size_t bytes = 0;
+  for (auto& f : all) bytes += f.size;
+  std::vector<Chunk> ch;
+  make_chunks(all, (size_t)1 << 20, ch);
+  const int n = (int)ch.size();
+  std::atomic<u64> sink{0};
+  double ms[6] = {0, 0, 0, 0, 0, 0};
+  auto timed = [&](int k, auto&& f) {
+    const double t0 = now_s();
+    parallel_for(n, f);
+    ms[k] = (now_s() - t0) * 1000.0;
+  };
+  // 1. one byte per page: the page faults and nothing else
+  auto touch = [&](int t, int) {
+    const Chunk& c = ch[t];
+    const u8* p = all[c.file].data;
+    u64 x = 0;
+    for (size_t o = c.nominal; o < c.nominal_end; o += 4096) x += p[o];
+    sink += x;
+  };
+  timed(0, touch);
+  // 2. every byte, 64 at a time (the pages are mapped now)
+  timed(1, [&](int t, int) {
+    const Chunk& c = ch[t];
+    const u8* p = all[c.file].data;
+    __m256i a = _mm256_setzero_si256(), b = a;
+    size_t o = c.nominal;
+    for (; o + 64 <= c.nominal_end; o += 64) {
+      a = _mm256_xor_si256(a, _mm256_loadu_si256((const __m256i*)(p + o)));
+      b = _mm256_xor_si256(b, _mm256_loadu_si256((const __m256i*)(p + o + 32)));
+    }
+    sink += (u64)_mm256_extract_epi64(_mm256_xor_si256(a, b), 0) + o;
+  });
+  // 3. the scanner's three masks per 64 bytes and a count of the separators
+  timed(2, [&](int t, int) {
+    const Chunk& c = ch[t];
+    const u8* p = all[c.file].data;
+    const __m256i vc = _mm256_set1_epi8(','), vn = _mm256_set1_epi8('\n'), vq = _mm256_set1_epi8('"');
+    u64 x = 0;
+    for (size_t o = c.nominal; o + 64 <= c.nominal_end; o += 64) {
+      const __m256i a = _mm256_loadu_si256((const __m256i*)(p + o)), b = _mm256_loadu_si256((const __m256i*)(p + o + 32));
+#if defined(__AVX512BW__) && defined(__AVX512VL__)
+      const u64 mc = _cvtmask64_u64(_mm512_kunpackd(_mm256_cmpeq_epi8_mask(b, vc), _mm256_cmpeq_epi8_mask(a, vc)));
+      const u64 mn = _cvtmask64_u64(_mm512_kunpackd(_mm256_cmpeq_epi8_mask(b, vn), _mm256_cmpeq_epi8_mask(a, vn)));
+      const u64 mq = _cvtmask64_u64(_mm512_kunpackd(_mm256_cmpeq_epi8_mask(b, vq), _mm256_cmpeq_epi8_mask(a, vq)));
+#else
+      const u64 mc = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, vc)) | ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, vc)) << 32);
+      const u64 mn = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, vn)) | ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, vn)) << 32);
+      const u64 mq = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, vq)) | ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, vq)) << 32);
+#endif
+      x += (u64)_mm_popcnt_u64(mc | mn) + (mq & 1);
+    }
+    sink += x;
+  });
+  // 4. the event files through the column scanner (both stages) with batches that are only summed
+  {
+    std::vector<Chunk> ce;
+    make_chunks(ev, (size_t)8 << 20, ce);
+    const double t0 = now_s();
+    parallel_for((int)ce.size(), [&](int t, int) {
+      const Chunk& c = ce[t];
+      const MFile& f = ev[c.file];
+      const size_t b = line_start_at_or_after(f, c.nominal), e = line_start_at_or_after(f, c.nominal_end);
+      if (b >= e) return;
+      __m256i acc = _mm256_setzero_si256();
+      u64 rows = 0;
+      scan::scan_cols<7>(
+          f.data + b, f.data + e, b == 0,
+          [&](const u8*, const __m256i* C, const u32* q) __attribute__((always_inline)) {
+            __m256i x = C[0];
+            u32 qq = q[0];
+            for (int k = 1; k < 8; k++) x = _mm256_xor_si256(x, C[k]);
+            for (int k = 1; k < 7; k++) qq ^= q[k];
+            acc = _mm256_xor_si256(acc, x);
+            rows += 8 + (qq & 1);
+          },
+          [&](const u8*, __m256i st, __m256i ln) __attribute__((always_inline)) {
+            acc = _mm256_xor_si256(acc, _mm256_xor_si256(st, ln));
+            rows++;
+          });
+      sink += rows + (u64)_mm256_extract_epi64(acc, 0);
+    });
+    ms[3] = (now_s() - t0) * 1000.0;
+  }
+  // 5. the faults again, after the pages are dropped
+  parallel_for(n, [&](int t, int) {
+    const Chunk& c = ch[t];
+    size_t a = (c.nominal + 4095) & ~(size_t)4095, z = c.nominal_end & ~(size_t)4095;
+    if (z > a) madvise((void*)(all[c.file].data + a), z - a, MADV_DONTNEED);
+  });
+  timed(4, touch);
+  fprintf(stderr, "SOL touch=%.1f read=%.1f masks=%.1f cols=%.1f retouch=%.1f bytes=%zu chunks=%d sink=%llu\n", ms[0], ms[1],
+          ms[2], ms[3], ms[4], bytes, n, (unsigned long long)(sink.load() & 1));
+  return 0;
+}
+#endif
+
+#ifdef STAGES
+static u64 g_stg_tsc0 = 0, g_stg_mark[8] = {0, 0, 0, 0, 0, 0, 0, 0};  // marks: mapped, links, parse, scan, output
+static void stg_mark(int i) { g_stg_mark[i] = __rdtsc(); }
+// One line for the bench driver: thread-ms per counter (all threads added), phase walls in ms.
+static void stg_report() {
+  const u64 tsc1 = __rdtsc();
+  const double hz = (double)(tsc1 - g_stg_tsc0) / std::max(1e-6, now_s() - g_t0);
+  std::vector<double> t(STG_N, 0.0);
+  for (int k = 0; k < STG_N; k++) {
+    u64 v = g_stg_all[256].c[k];
+    for (int i = 0; i < NT && i < 256; i++) v += g_stg_all[i].c[k];
+    t[k] = (double)v / hz * 1000.0;
+  }
+  u64 ne = 0, nc = 0;
+  for (auto& x : g_tl) {
+    ne += x.n_event_lines;
+    nc += x.n_click_lines;
+  }
+  auto w = [&](int a, int b) { return g_stg_mark[a] && g_stg_mark[b] ? (double)(g_stg_mark[b] - g_stg_mark[a]) / hz * 1000.0 : -1.0; };
+  fprintf(stderr,
+          "STAGES mhz=%.0f ev=%llu ck=%llu e1=%.0f e2=%.0f pe=%.0f fe=%.0f id=%.0f li=%.0f ts=%.0f re=%.0f ma=%.0f sc=%.0f pu=%.0f"
+          " c1=%.0f c2=%.0f pc=%.0f cfe=%.0f cid=%.0f cli=%.0f cts=%.0f cam=%.0f cre=%.0f csc=%.0f te=%.0f tc=%.0f dr=%.0f tl=%.0f"
+          " seg=%.0f pla=%.0f slo=%.0f clo=%.0f lck=%.0f srt=%.0f mem=%.0f ahd=%.0f"
+          " busy=%.0f/%.0f/%.0f/%.0f wall=%.1f/%.1f/%.1f/%.1f\n",
+          hz / 1e6, (unsigned long long)ne, (unsigned long long)nc, t[STG_E_S1], t[STG_E_S2], t[STG_E_PE], t[STG_PE_FETCH],
+          t[STG_PE_IDS], t[STG_PE_LISTS], t[STG_PE_TS], t[STG_PE_REC], t[STG_PE_MASK], t[STG_PE_SCAT], t[STG_PE_PUR], t[STG_C_S1],
+          t[STG_C_S2], t[STG_C_PC], t[STG_PC_FETCH], t[STG_PC_IDS], t[STG_PC_LISTS], t[STG_PC_TS], t[STG_PC_CAMP], t[STG_PC_REC],
+          t[STG_PC_SCAT], t[STG_TASK_E], t[STG_TASK_C], t[STG_DROP], t[STG_TASK_L], t[STG_SEG], t[STG_PLACE], t[STG_SLOTS],
+          t[STG_CLOSE], t[STG_LCLK], t[STG_SORT], t[STG_MEMSET], t[STG_AHEAD], t[STG_BUSY0 + 1], t[STG_BUSY0 + 2],
+          t[STG_BUSY0 + 3], t[STG_BUSY0 + 5], w(0, 1), w(1, 2), w(2, 3), w(3, 4));
+  // perf counters by phase (1 links, 2 parse, 3 scan), summed over threads
+  if (g_pf_errno.load()) {
+    fprintf(stderr, "PERF err=%d\n", g_pf_errno.load());
+  } else {
+    std::string o = "PERF";
+    for (int ph = 1; ph <= 3; ph++) {
+      double c[4] = {0, 0, 0, 0};
+      for (int i = 0; i < 4; i++) {
+        u64 v = 0;
+        for (int k = 0; k < NT && k < 256; k++) v += g_stg_all[k].c[STG_PF0 + 4 * ph + i];
+        c[i] = (double)v;
+      }
+      char b[160];
+      snprintf(b, sizeof b, " %s:cy=%.0fM,in=%.0fM,ipc=%.2f,bm=%.2fM,cm=%.2fM", g_phase_names[ph], c[0] / 1e6, c[1] / 1e6,
+               c[0] > 0 ? c[1] / c[0] : 0.0, c[2] / 1e6, c[3] / 1e6);
+      o += b;
+    }
+    fprintf(stderr, "%s\n", o.c_str());
+  }
+}
+#endif
+
 int main(int argc, char** argv) {
   g_t0 = now_s();
+  STG_ONLY(g_stg_tsc0 = __rdtsc(); tl_stgp = g_stg_all[0].c;)
   if (argc >= 2 && strcmp(argv[1], "--selftest") == 0) return selftest();
   if (argc >= 4 && strcmp(argv[1], "--bench-parse") == 0) return bench_parse(argv[2], argv[3], argc >= 5 ? atoi(argv[4]) : 5);
   const char* lg = getenv("SS_LOG");
@@ -3331,12 +3585,17 @@ int main(int argc, char** argv) {
   LOG("mapped %zu event files (%zu bytes), %zu click files, %zu link files; P1=%u P2=%u threads=%d dense=%d ukey=%llx",
       ev.size(), ev_bytes, ck.size(), lk.size(), 1u << g_P1bits, 1u << g_P2bits, NT, (int)dn::g_on,
       (unsigned long long)dn::g_ukey);
+#ifdef STAGES
+  stg_mark(0);
+  if (getenv("SS_SOL")) return run_sol(ev, ck);
+#endif
   // The lookups and the per-thread state are not needed for the links: set them up on the side meanwhile.
   std::thread setup([&] {
     load_lookups(data);
     if (dn::g_on && !dn::recover_event_key(samp)) dn::fail("no key for the event ids");
     if (dn::g_on && (u64)(g_we - g_ws) > 0x7FFFFFF0ULL) dn::fail("window too long");
     if (dn::g_on && g_cats.size() > 255) dn::fail("too many categories");
+    if (dn::g_on && g_ncamp > dn::CK_CAMP) dn::fail("too many campaigns");
     if (dn::g_on && g_ndays > 16) dn::fail("more than 16 days in the window");
     if (dn::g_on) {
       dn::g_ing_base = g_ws - 30 * DAY;
@@ -3364,8 +3623,10 @@ int main(int argc, char** argv) {
       g_cats.size(), g_ncamp, g_ndays);
 
   if (dn::g_on && !dn::g_fail.load()) {
+    STG_ONLY(stg_mark(1);)
     g_phase = 2;
     dn::parse(ev, ck);
+    STG_ONLY(stg_mark(2);)
     {
       u64 a = 0, b = 0;
       for (auto& t : g_tl) {
@@ -3385,12 +3646,14 @@ int main(int argc, char** argv) {
     }
     if (!dn::g_fail.load()) {
       LOG("dense scan done");
+      STG_ONLY(stg_mark(3);)
       g_phase = 4;
       person_phase(true);
       LOG("general person phase done");
       g_phase = 5;
       write_outputs(out);
       LOG("output written");
+      STG_ONLY(stg_mark(4); stg_report();)
       if (g_log) {
         double tot = 0, tots = 0;
         for (int i = 0; i < 6; i++) {

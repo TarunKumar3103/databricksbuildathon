@@ -72,3 +72,28 @@ DATA_DIR=data/dev1 OUTPUT_DIR=/tmp/out SCRATCH_DIR=/tmp/scr BENCH_DIR=<folder wi
 ```
 
 `BENCH_SIZES` is `events M : clicks M : rounds` per size.
+
+## Bench 8 (B, branch b-probe): where the cycles go, and the floors
+
+Four builds: `v` (v4 cf4f788, scored 0.38), `b` (b-v4n d720cb5), `s` (d720cb5 built with `-DSTAGES` and a
+profile of its own, source in `bench/variants/d720cb5-stg`) and `f` (`s` with `SS_SOL=1`). `BENCH_STAGES=s`
+and `BENCH_SOL=f` add one row per size, `!s1 20M ...` and `!s2 60M ...`, from the runs with the median wall
+time. `s` against `b` is what the counters cost (about 2% locally).
+
+The `user_id` of an `!s` row is build s's `STAGES` line, in thread-ms summed over all threads (time stamp
+counter, so page faults inside a stage count to it): `mhz` the counter's rate, `ev`/`ck` the lines; `e1`
+scanner stage 1 of the event files (masks, bit streams, separator list; the input's page faults land here),
+`e2` stage 2 (columns, slow lines) without the batches, `pe` the event batches, and their parts `fe` bytes
+fetched, `id` IDs, `li` lists by timestamp form, `ts` timestamp kernels, `re` records and checks, `ma` plain
+and purchase masks, `sc` the scatter, `pu` purchases and slow lines; `c1 c2 pc cfe cid cli cts cam cre csc`
+the same for clicks (`cam` campaign lookup); `te`/`tc` whole event and click tasks, `dr` dropping parsed pages,
+`tl` link tasks; `seg` scan segments as a whole, `pla` place(), `slo` the slot loop without closing persons,
+`clo` closing persons (with `lck` loading click partitions and `srt` sorting a person's clicks), `mem` clearing
+the slot table, `ahd` segment ends; `busy` time inside tasks for links/parse/scan/output, `wall` ms from the
+files mapped to the links done, the parse, the scan and the output.
+
+Its `top_category` is `PERF` (cycles, instructions, IPC, branch and cache misses per phase, user space, all
+threads; `err=` errno if the container forbids perf events) then `SOL`, build f's floors in wall ms with all
+threads: `touch` one byte per page (the page faults alone), `read` every byte once the pages are mapped,
+`masks` the scanner's three masks per 64 bytes, `cols` the event files through the column scanner with no
+field work, `retouch` the faults again after the pages are dropped.
