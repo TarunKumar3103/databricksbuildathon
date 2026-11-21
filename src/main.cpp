@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -1117,14 +1118,18 @@ struct CStat {
 // The columns of user_daily, appended row by row in the form they have in the file (Parquet PLAIN), in
 // blocks that are handed to the writer as they are.
 struct OutCols {
-  Stream<u8> ids;  // user_id: 4-byte length, then the bytes
-  Stream<i32> day;
-  Stream<u32> sess, evs;
+  Stream<u8> ids;   // the user_id of each person that has rows, once: 4-byte length, then the bytes
+  Stream<u8> runs;  // ... and how many rows that person has
+  Stream<u8> day;   // day of the window
+  Stream<u8> sess;  // (a day has room for at most 48 sessions: their starts are more than 30 minutes apart)
+  Stream<u32> evs;
   Stream<i64> rev;
   Stream<u8> top;  // category, 0xFF: none
-  u64 nrows = 0;
+  u64 nrows = 0, npersons = 0;
+  u32 max_sess = 0, max_evs = 0;
   void finish() {
     ids.finish();
+    runs.finish();
     day.finish();
     sess.finish();
     evs.finish();
@@ -2468,30 +2473,32 @@ static void person_phase() {
       }
       // purchases -> category sums per day of their session
       for (const Purch& q : S.purch) catsum[(size_t)bday[q.bucket] * NCAT + q.cat] += q.price;
-      // one output row per day with a session
+      // one output row per day with a session; the user_id is written once, with the number of rows
       const u64 pkey = unhash_id(S.hs[lid]);
       const u32 nd = (u32)S.days.size();
-      if (__builtin_expect(!is_slow(pkey), 1)) {
-        u8 kb[16];  // the user_id as it stands in the file: length, bytes
-        const u32 klen = fast_key_bytes(pkey, kb + 4);
-        memcpy(kb, &klen, 4);
-        u8* ip = out.ids.reserve(nd * 13 + 16, tl.arena);
-        for (u32 di = 0; di < nd; di++, ip += 4 + klen) memcpy(ip, kb, 16);
-        out.ids.cur = ip;
-      } else {
-        std::string name;
-        key_str(pkey, name);
-        const u32 klen = (u32)name.size();
-        for (u32 di = 0; di < nd; di++) {
+      if (nd) {
+        if (__builtin_expect(!is_slow(pkey), 1)) {
+          u8 kb[16];  // the user_id as it stands in the file: length, bytes
+          const u32 klen = fast_key_bytes(pkey, kb + 4);
+          memcpy(kb, &klen, 4);
+          u8* ip = out.ids.reserve(16, tl.arena);
+          memcpy(ip, kb, 16);
+          out.ids.cur = ip + 4 + klen;
+        } else {
+          std::string name;
+          key_str(pkey, name);
+          const u32 klen = (u32)name.size();
           const bool fits = 4 + (size_t)klen <= Stream<u8>::BLK;
           u8* ip = fits ? out.ids.reserve(4 + klen, tl.arena) : out.ids.big(4 + (size_t)klen, tl.arena);
           memcpy(ip, &klen, 4);
           memcpy(ip + 4, name.data(), klen);
           if (fits) out.ids.cur = ip + 4 + klen;
         }
+        *out.runs.slot(tl.arena) = (u8)nd;
+        out.npersons++;
       }
-      i32* const dayp = out.day.reserve(nd, tl.arena);
-      u32* const sessp = out.sess.reserve(nd, tl.arena);
+      u8* const dayp = out.day.reserve(nd, tl.arena);
+      u8* const sessp = out.sess.reserve(nd, tl.arena);
       u32* const evsp = out.evs.reserve(nd, tl.arena);
       i64* const revp = out.rev.reserve(nd, tl.arena);
       u8* const topp = out.top.reserve(nd, tl.arena);
@@ -2512,9 +2519,11 @@ static void person_phase() {
           for (const Purch& q : S.purch)
             if (bday[q.bucket] == d) cs[q.cat] = 0;
         }
-        dayp[di] = (i32)(day0 + d);
-        sessp[di] = dsess[d];
+        dayp[di] = (u8)d;
+        sessp[di] = (u8)dsess[d];
         evsp[di] = dev[d];
+        out.max_sess = std::max(out.max_sess, dsess[d]);
+        out.max_evs = std::max(out.max_evs, dev[d]);
         revp[di] = drev[d];
         topp[di] = (u8)top;  // categories are below 255, so "none" becomes 0xFF
         dsess[d] = 0;
@@ -2626,11 +2635,63 @@ static void write_outputs(const std::string& out) {
     cols[5].use_dict = true;
     for (auto& c : g_cats) pq::put_str(cols[5].dict_values, c.data(), (u32)c.size());
     cols[5].dict_count = (int)g_cats.size();
-    // the plain columns are written straight from their blocks
-    for (auto& b : oc.ids.blocks) cols[0].body.push_back({b.first, b.second});
-    for (auto& b : oc.day.blocks) cols[1].body.push_back({b.first, (size_t)b.second * 4});
-    for (auto& b : oc.sess.blocks) cols[2].body.push_back({b.first, (size_t)b.second * 4});
-    for (auto& b : oc.evs.blocks) cols[3].body.push_back({b.first, (size_t)b.second * 4});
+    // user_id: the persons are the dictionary, and each person's rows are one run of its index
+    cols[0].use_dict = true;
+    cols[0].dict_count = (int)oc.npersons;
+    for (auto& b : oc.ids.blocks) cols[0].dict_body.push_back({b.first, b.second});
+    {
+      const int bw = std::max(1, pq::bit_width(oc.npersons ? (u32)(oc.npersons - 1) : 0));
+      cols[0].pre.u8((u8)bw);
+      u32 first = 0;
+      for (auto& b : oc.runs.blocks) {
+        pq::encode_runs(cols[0].pre, b.first, b.second, first, bw);
+        first += b.second;
+      }
+    }
+    // day, sessions, events: small numbers. The dictionary is 0 .. max (for day: the days of the window), so a
+    // value is its own index, and the indices are bit-packed eight at a time.
+    std::unique_ptr<u8[]> tmp(new u8[2 * n + 64]);  // (not initialised: every use fills what it reads)
+    auto small = [&](pq::Column& c, u32 maxv, i32 base, auto&& gather) {
+      c.use_dict = true;
+      c.dict_count = (int)maxv + 1;
+      for (u32 v = 0; v <= maxv; v++) c.dict_values.le32((u32)(base + (i32)v));
+      gather(tmp.get());
+      memset(tmp.get() + n, 0, 16);
+      const int bw = std::max(1, pq::bit_width(maxv));
+      c.pre.u8((u8)bw);
+      pq::encode_packed8(c.pre, tmp.get(), n, bw);
+    };
+    auto bytes_of = [](Stream<u8>& st) {
+      return [&st](u8* o) {
+        for (auto& b : st.blocks) {
+          memcpy(o, b.first, b.second);
+          o += b.second;
+        }
+      };
+    };
+    small(cols[1], (u32)std::max(g_ndays, 1) - 1, (i32)g_day0, bytes_of(oc.day));
+    small(cols[2], oc.max_sess, 0, bytes_of(oc.sess));
+    if (oc.max_evs <= 255) {
+      small(cols[3], oc.max_evs, 0, [&](u8* o) {
+        for (auto& b : oc.evs.blocks)
+          for (u32 j = 0; j < b.second; j++) *o++ = (u8)b.first[j];
+      });
+    } else if (oc.max_evs <= 65535) {
+      pq::Column& c = cols[3];
+      c.use_dict = true;
+      c.dict_count = (int)oc.max_evs + 1;
+      for (u32 v = 0; v <= oc.max_evs; v++) c.dict_values.le32(v);
+      u16* const t16 = (u16*)tmp.get();
+      size_t k = 0;
+      for (auto& b : oc.evs.blocks)
+        for (u32 j = 0; j < b.second; j++) t16[k++] = (u16)b.first[j];
+      memset(t16 + n, 0, 32);
+      const int bw = pq::bit_width(oc.max_evs);
+      c.pre.u8((u8)bw);
+      pq::encode_packed16(c.pre, t16, n, bw);
+    } else {
+      for (auto& b : oc.evs.blocks) cols[3].body.push_back({b.first, (size_t)b.second * 4});
+    }
     for (auto& b : oc.rev.blocks) cols[4].body.push_back({b.first, (size_t)b.second * 8});
     // top_category: definition levels, then the dictionary indices of the rows that have one
     {

@@ -125,7 +125,8 @@ struct Column {
   Buf pre;
   std::vector<Piece> body;
   bool use_dict = false;
-  Buf dict_values;  // PLAIN dictionary values
+  Buf dict_values;               // PLAIN dictionary values ...
+  std::vector<Piece> dict_body;  // ... followed by these
   int dict_count = 0;
 };
 
@@ -160,6 +161,65 @@ inline void encode_levels(Buf& out, const uint8_t* v01, size_t n) {
   }
 }
 // Width bw (1..8), from one byte per value: dictionary indices.
+// Dictionary indices of at most 8 bits each, one per byte at `vals`, as a single bit-packed run. Eight values
+// are packed per step. At least 8 * ceil(n / 8) bytes must be readable at `vals` (the padding must be 0).
+inline void encode_packed8(Buf& out, const uint8_t* vals, size_t n, int bw) {
+  const size_t groups = (n + 7) / 8;
+  out.varint((uint64_t(groups) << 1) | 1);
+  out.need(groups * (size_t)bw + 16);
+  const uint64_t mask = 0x0101010101010101ULL * ((1u << bw) - 1);
+  uint8_t* o = out.d.data() + out.n;
+  for (size_t g = 0; g < groups; g++) {
+    uint64_t x;
+    memcpy(&x, vals + 8 * g, 8);
+    x = _pext_u64(x, mask);
+    memcpy(o, &x, 8);
+    o += bw;
+  }
+  out.n += groups * (size_t)bw;
+}
+
+// The same for indices of at most 16 bits each, one per 16-bit word; 8 * ceil(n / 8) words must be readable.
+inline void encode_packed16(Buf& out, const uint16_t* vals, size_t n, int bw) {
+  const size_t groups = (n + 7) / 8;
+  out.varint((uint64_t(groups) << 1) | 1);
+  out.need(groups * (size_t)bw + 32);
+  const uint64_t mask = 0x0001000100010001ULL * ((1u << bw) - 1);
+  const int s = 4 * bw;  // bits of half a group (4 .. 64)
+  uint8_t* o = out.d.data() + out.n;
+  for (size_t g = 0; g < groups; g++) {
+    uint64_t a, b;
+    memcpy(&a, vals + 8 * g, 8);
+    memcpy(&b, vals + 8 * g + 4, 8);
+    a = _pext_u64(a, mask);
+    b = _pext_u64(b, mask);
+    const uint64_t w0 = s < 64 ? a | (b << s) : a;
+    const uint64_t w1 = s < 64 ? b >> (64 - s) : b;
+    memcpy(o, &w0, 8);
+    memcpy(o + 8, &w1, 8);
+    o += bw;
+  }
+  out.n += groups * (size_t)bw;
+}
+
+// Dictionary indices first, first + 1, ... each repeated counts[i] times (1 .. 255), as one RLE run per index.
+// bw is the bit width of the largest index.
+inline void encode_runs(Buf& out, const uint8_t* counts, size_t n, uint32_t first, int bw) {
+  const size_t vb = (size_t)(bw + 7) / 8;
+  out.need(n * (vb + 2) + 16);
+  uint8_t* o = out.d.data() + out.n;
+  for (size_t i = 0; i < n; i++) {
+    const uint32_t h = (uint32_t)counts[i] << 1, v = first + (uint32_t)i;
+    const uint32_t two = h >= 0x80;  // the run header is a varint of one or two bytes
+    o[0] = (uint8_t)(h | (two << 7));
+    o[1] = (uint8_t)(h >> 7);
+    o += 1 + two;
+    memcpy(o, &v, 4);  // (room for the whole word was reserved)
+    o += vb;
+  }
+  out.n = (size_t)(o - out.d.data());
+}
+
 inline void encode_indices(Buf& out, const uint8_t* vals, size_t n, int bw) {
   out.need((n * bw + 7) / 8 + n / 504 + 16);
   size_t i = 0;
@@ -233,10 +293,13 @@ inline bool write_file(const std::string& path, std::vector<Column>& cols, int64
     const int64_t start = pos;
     if (c.use_dict) {
       Buf& h = heads[nheads++];
-      page_header(h, 2, (int32_t)c.dict_values.size(), (int32_t)c.dict_values.size(), c.dict_count, ENC_PLAIN, true);
+      size_t dsz = c.dict_values.size();
+      for (const Piece& pc : c.dict_body) dsz += pc.n;
+      page_header(h, 2, (int32_t)dsz, (int32_t)dsz, c.dict_count, ENC_PLAIN, true);
       m.dict_page_offset = pos;
       add(h.data(), h.size());
       add(c.dict_values.data(), c.dict_values.size());
+      for (const Piece& pc : c.dict_body) add(pc.p, pc.n);
     }
     size_t body = c.pre.size();
     for (const Piece& pc : c.body) body += pc.n;
