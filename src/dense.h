@@ -130,7 +130,7 @@ static NOINLINE void fail(const char* why) {
 static u64 g_ukey = 0, g_ekey = 0;
 static u64 g_ne_cap = 0;  // regular event indexes are below this
 static u32 g_nu_cap = 0;  // regular person indexes are below this (at most 2^23, so a user number fits 32 bits)
-static constexpr u32 KE = 14, KC = 9;  // event indexes per event partition, person indexes per click partition
+static constexpr u32 KE = 12, KC = 9;  // event indexes per event partition, person indexes per click partition
 static constexpr u32 ESLOTS = 1u << KE, ELOM = ESLOTS - 1;
 static u32 g_PE = 0, g_PC = 0;
 static i64 g_ing_base = 0;  // ingest_ts is kept as whole seconds since this, plus 1, in 24 bits
