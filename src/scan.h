@@ -65,7 +65,7 @@ static void scan_chunk(const u8* begin, const u8* end, bool skip_header, F&& on_
   }
   if (p >= end) return;
   const u32 total = (u32)(end - p);
-  constexpr u32 WB = 64;  // blocks per window (one bit each in `badw`)
+  constexpr u32 WB = 16;  // blocks per window (one bit each in `badw`)
   constexpr u32 CAP = WB * 64 + 64;
   u32 Cpos[CAP + NF + 16];  // comma offsets (relative to p)
   u32 Npos[CAP + 16];       // newline offsets

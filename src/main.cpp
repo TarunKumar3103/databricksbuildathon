@@ -13,6 +13,7 @@
 #include <fcntl.h>
 #include <immintrin.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -68,15 +69,40 @@ static double now_s() {
 
 static int NT = 8;
 
+static thread_local int tl_serial_tid = -1;  // >= 0: parallel_for runs inline on this thread
+// per-phase CPU accounting (sum of task time over threads), reported with SS_LOG
+static std::atomic<u64> g_phase_cycles[16];  // user microseconds
+static std::atomic<u64> g_phase_sys[16];     // system microseconds
+static inline void thread_times(u64& user_us, u64& sys_us) {
+  struct rusage ru;
+  getrusage(RUSAGE_THREAD, &ru);
+  user_us = (u64)ru.ru_utime.tv_sec * 1000000 + ru.ru_utime.tv_usec;
+  sys_us = (u64)ru.ru_stime.tv_sec * 1000000 + ru.ru_stime.tv_usec;
+}
+static int g_phase = 0;
+static const char* g_phase_names[16] = {"init", "links", "parse", "dedup", "person", "output"};
+
 template <class F>
 static void parallel_for(int ntasks, F&& f) {
   if (ntasks <= 0) return;
+  if (tl_serial_tid >= 0) {
+    for (int t = 0; t < ntasks; t++) f(t, tl_serial_tid);
+    return;
+  }
   std::atomic<int> next{0};
+  const int phase = g_phase;
   auto worker = [&](int tid) {
+    u64 u0 = 0, s0 = 0, u1, s1;
+    if (g_log) thread_times(u0, s0);
     for (;;) {
       int t = next.fetch_add(1, std::memory_order_relaxed);
       if (t >= ntasks) break;
       f(t, tid);
+    }
+    if (g_log) {
+      thread_times(u1, s1);
+      g_phase_cycles[phase] += u1 - u0;
+      g_phase_sys[phase] += s1 - s0;
     }
   };
   int n = std::min(NT, ntasks);
@@ -166,6 +192,94 @@ struct Stream {
   }
 };
 
+// Hash-partitioned output with software write-combining: records for a partition are staged in a
+// 64-byte line and written with non-temporal stores when the line is full.
+template <class T>
+struct WCScatter {
+  static_assert(sizeof(T) == 16 || sizeof(T) == 32, "record size");
+  static constexpr u32 PER = 64 / sizeof(T);
+  static constexpr u32 BLK = (u32)(BLOCK_BYTES / sizeof(T));
+  struct Hot {
+    T* cur;
+    T* lim;
+  };
+  u32 P = 0;
+  Hot* hot = nullptr;
+  u8* stage = nullptr;
+  u8* fill = nullptr;
+  T** beg = nullptr;
+  std::vector<std::vector<std::pair<T*, u32>>> blocks;
+  void init(u32 parts) {
+    P = parts;
+    hot = (Hot*)calloc(P, sizeof(Hot));
+    stage = (u8*)aligned_alloc(64, (size_t)64 * P);
+    fill = (u8*)calloc(P, 1);
+    beg = (T**)calloc(P, sizeof(T*));
+    blocks.assign(P, {});
+  }
+  void grow(u32 p, Arena& a) {
+    if (beg[p]) blocks[p].push_back({beg[p], (u32)(hot[p].cur - beg[p])});
+    beg[p] = hot[p].cur = (T*)a.block();
+    hot[p].lim = beg[p] + BLK;
+  }
+  inline void push32(u32 p, __m256i x, Arena& a) {
+    static_assert(sizeof(T) == 32, "push32");
+    u8* s = stage + (size_t)p * 64;
+    if (!fill[p]) {
+      _mm256_store_si256((__m256i*)s, x);
+      fill[p] = 1;
+      return;
+    }
+    Hot& h = hot[p];
+    if (__builtin_expect(h.cur == h.lim, 0)) grow(p, a);
+    _mm256_stream_si256((__m256i*)h.cur, _mm256_load_si256((const __m256i*)s));
+    _mm256_stream_si256((__m256i*)h.cur + 1, x);
+    h.cur += 2;
+    fill[p] = 0;
+  }
+  inline void push16(u32 p, __m128i x, Arena& a) {
+    static_assert(sizeof(T) == 16, "push16");
+    u8* s = stage + (size_t)p * 64;
+    u32 f = fill[p];
+    if (f < 3) {
+      _mm_store_si128((__m128i*)(s + 16 * f), x);
+      fill[p] = (u8)(f + 1);
+      return;
+    }
+    Hot& h = hot[p];
+    if (__builtin_expect(h.cur == h.lim, 0)) grow(p, a);
+    __m256i v0 = _mm256_set_m128i(_mm_load_si128((const __m128i*)(s + 16)), _mm_load_si128((const __m128i*)s));
+    __m256i v1 = _mm256_set_m128i(x, _mm_load_si128((const __m128i*)(s + 32)));
+    _mm256_stream_si256((__m256i*)h.cur, v0);
+    _mm256_stream_si256((__m256i*)h.cur + 1, v1);
+    h.cur += 4;
+    fill[p] = 0;
+  }
+  void finish(Arena& a) {
+    for (u32 p = 0; p < P; p++) {
+      for (u32 f = 0; f < fill[p]; f++) {
+        if (hot[p].cur == hot[p].lim) grow(p, a);
+        memcpy(hot[p].cur, stage + (size_t)p * 64 + f * sizeof(T), sizeof(T));
+        hot[p].cur++;
+      }
+      fill[p] = 0;
+      if (beg[p]) blocks[p].push_back({beg[p], (u32)(hot[p].cur - beg[p])});
+      beg[p] = nullptr;
+      hot[p].cur = hot[p].lim = nullptr;
+    }
+    _mm_sfence();
+  }
+  size_t size(u32 p) const {
+    size_t n = 0;
+    for (auto& b : blocks[p]) n += b.second;
+    return n;
+  }
+  void release(u32 p, Arena& a) {
+    for (auto& b : blocks[p]) a.free_blocks.push_back(b.first);
+    std::vector<std::pair<T*, u32>>().swap(blocks[p]);
+  }
+};
+
 static inline u64 mix64(u64 x) {
   x ^= x >> 31;
   x *= 0x7fb5d329728ea185ULL;
@@ -237,6 +351,7 @@ static inline bool is_slow(u64 k) { return (k >> 56) == 0; }
 
 static void key_str(u64 k, std::string& out) {
   if (is_slow(k)) {
+    std::lock_guard<std::mutex> lk(g_intern.mu);
     out = g_intern.strs[k - 1];
     return;
   }
@@ -619,6 +734,15 @@ struct HSlot {
 };
 static HSlot* g_H = nullptr;
 static u32 g_Hbits = 0, g_Hpbits = 0;
+// Blocked Bloom filter of the IDs whose person name differs from the ID itself (the only ones that
+// need H). Three bits per key in one 64-bit word.
+static u64* g_F = nullptr;
+static u64 g_Fmask = 0;
+static inline u64 f_bits(u64 h) { return (1ULL << ((h >> 40) & 63)) | (1ULL << ((h >> 46) & 63)) | (1ULL << ((h >> 52) & 63)); }
+static inline bool f_maybe(u64 h) {
+  const u64 b = f_bits(h);
+  return (g_F[h & g_Fmask] & b) == b;
+}
 
 static inline u64 h_slot_index(u64 h) { return h >> (64 - g_Hbits); }
 
@@ -694,7 +818,11 @@ static inline void uf_unite(u32 a, u32 b) {
 }
 
 // records
-struct R1 {  // event line, partitioned by event_id
+struct u64x2 {
+  u64 a, b;
+};
+
+struct R1 {  // event line, partitioned by event_id; eid = mix64(event_id key)
   u64 eid;
   i64 ingest;
   u64 uid;      // user_id key (valid lines only)
@@ -717,28 +845,38 @@ struct R2C {  // valid click, partitioned by person; h = mix64(person key)
   u64 click;
   u32 ts;
   u32 camp;
+  u64 pad;
 };
 
 static u32 g_P1bits, g_P2bits;
 
+struct CStat {
+  u32 sess, purch;
+  i64 rev;
+};
+
+struct ORow {
+  u64 key;
+  i64 rev;
+  i32 day;
+  u32 sess, evs;
+  u16 top;
+  u16 pad;
+};
 struct OutRows {
-  std::vector<u64> key;
-  std::vector<i32> day;
-  std::vector<u32> sess, evs;
-  std::vector<i64> rev;
-  std::vector<u16> top;
+  std::vector<ORow> rows;
 };
 
 struct TL {
   Arena arena;
-  std::vector<Stream<R1>> r1;
+  WCScatter<R1> r1;
   Stream<C0> c0;
-  std::vector<Stream<R2>> r2;
-  std::vector<Stream<R2C>> r2c;
+  WCScatter<R2> r2;
+  WCScatter<R2C> r2c;
   std::vector<std::pair<u64, u64>> links;
   OutRows out;
-  std::vector<u32> c_sess, c_purch, c_assist;  // (ncamp + 1) x ndays
-  std::vector<i64> c_rev;
+  std::vector<CStat> c_stat;   // (ncamp + 1) x ndays: credited sessions, purchasing sessions, revenue
+  std::vector<u32> c_assist;   // (ncamp + 1) x ndays
   u64 n_event_lines = 0, n_click_lines = 0;
 };
 static std::vector<TL> g_tl;
@@ -777,42 +915,70 @@ static void load_lookups(const std::string& data) {
     });
   };
   {
-    std::vector<std::pair<std::string, std::string>> rows;
-    read_pairs(data + "/products.csv", rows);
-    std::unordered_map<std::string, u32> catset;
-    for (auto& r : rows) catset.emplace(r.second, 0);
-    catset.emplace("unknown", 0);
-    std::vector<std::string> cats;
-    for (auto& kv : catset) cats.push_back(kv.first);
-    std::sort(cats.begin(), cats.end());
-    if (cats.size() > 255) die("more than 255 categories");
-    for (u32 i = 0; i < cats.size(); i++) catset[cats[i]] = i;
-    g_cats = cats;
-    g_cat_unknown = catset["unknown"];
+    // products: canonical "p<num>" ids go to a direct array; categories are few
+    std::string sbuf = read_small(data + "/products.csv");
+    size_t sn = sbuf.size();
+    sbuf.append(64, '\0');
+    std::vector<std::string> cat_names;  // first-seen order
+    std::vector<std::pair<u32, u32>> canon;  // (num, first-seen category index)
+    std::vector<std::pair<std::string, u32>> other;
+    std::unordered_map<std::string, u32> seen_other;
     u32 maxnum = 0;
-    std::vector<std::pair<u32, u32>> canon;
-    std::unordered_map<std::string, bool> seen;
-    for (auto& r : rows) {
-      if (!seen.emplace(r.first, true).second) continue;  // first wins
-      u32 cat = catset[r.second];
-      const std::string& id = r.first;
-      bool canonical = id.size() >= 2 && id.size() <= 9 && id[0] == 'p' && (id[1] != '0' || id.size() == 2);
+    u32 last_cat = UINT32_MAX;
+    scan_chunk<2>((const u8*)sbuf.data(), (const u8*)sbuf.data() + sn, true, [&](const u8* const* fs, const u32* fl) {
+      // category index (linear scan with a one-entry cache; there are only a few categories)
+      u32 ci = UINT32_MAX;
+      if (last_cat != UINT32_MAX && cat_names[last_cat].size() == fl[1] &&
+          memcmp(cat_names[last_cat].data(), fs[1], fl[1]) == 0)
+        ci = last_cat;
+      else {
+        for (u32 i = 0; i < cat_names.size(); i++)
+          if (cat_names[i].size() == fl[1] && memcmp(cat_names[i].data(), fs[1], fl[1]) == 0) {
+            ci = i;
+            break;
+          }
+        if (ci == UINT32_MAX) {
+          ci = (u32)cat_names.size();
+          cat_names.emplace_back((const char*)fs[1], fl[1]);
+          if (cat_names.size() > 4096) die("too many categories");
+        }
+        last_cat = ci;
+      }
+      const u8* id = fs[0];
+      u32 n = fl[0];
+      bool canonical = n >= 2 && n <= 9 && id[0] == 'p' && (id[1] != '0' || n == 2);
       u32 v = 0;
-      for (size_t i = 1; canonical && i < id.size(); i++) {
-        if (!is_dig((u8)id[i]))
+      for (u32 i = 1; canonical && i < n; i++) {
+        if (!is_dig(id[i]))
           canonical = false;
         else
           v = v * 10 + (id[i] - '0');
       }
       if (canonical && v < (1u << 24)) {
-        canon.push_back({v, cat});
+        canon.push_back({v, ci});
         maxnum = std::max(maxnum, v);
       } else {
-        g_cat_slow.emplace(id, cat);
+        std::string key((const char*)id, n);
+        if (seen_other.emplace(key, ci).second) other.push_back({key, ci});
       }
-    }
-    g_cat_by_num.assign(canon.empty() ? 0 : (size_t)maxnum + 1, (u8)g_cat_unknown);
-    for (auto& c : canon) g_cat_by_num[c.first] = (u8)c.second;
+    });
+    std::vector<std::string> cats = cat_names;
+    bool has_unknown = false;
+    for (auto& c : cats) has_unknown |= (c == "unknown");
+    if (!has_unknown) cats.push_back("unknown");
+    std::sort(cats.begin(), cats.end());
+    if (cats.size() > 255) die("more than 255 categories");
+    std::vector<u32> rank(cat_names.size());
+    for (u32 i = 0; i < cat_names.size(); i++)
+      rank[i] = (u32)(std::lower_bound(cats.begin(), cats.end(), cat_names[i]) - cats.begin());
+    g_cats = cats;
+    g_cat_unknown = (u32)(std::lower_bound(cats.begin(), cats.end(), std::string("unknown")) - cats.begin());
+    g_cat_by_num.assign(canon.empty() ? 0 : (size_t)maxnum + 1, 0xFF);
+    for (auto& c : canon)
+      if (g_cat_by_num[c.first] == 0xFF) g_cat_by_num[c.first] = (u8)rank[c.second];  // first wins
+    for (auto& x : g_cat_by_num)
+      if (x == 0xFF) x = (u8)g_cat_unknown;
+    for (auto& o : other) g_cat_slow.emplace(o.first, rank[o.second]);
   }
   {
     std::vector<std::pair<std::string, std::string>> rows;
@@ -963,12 +1129,32 @@ static void build_links(std::vector<MFile>& files) {
   // finalize: H value = name key of the root
   u64 nslots = 1ULL << g_Hbits;
   int ntask = 256;
+  std::vector<size_t> nremap(ntask, 0);
   parallel_for(ntask, [&](int t, int) {
     u64 a = nslots * t / ntask, b = nslots * (t + 1) / ntask;
+    size_t c = 0;
     for (u64 i = a; i < b; i++) {
-      if (g_H[i].key) g_H[i].val = g_nodes[uf_find((u32)g_H[i].val)].key;
+      if (g_H[i].key) {
+        g_H[i].val = g_nodes[uf_find((u32)g_H[i].val)].key;
+        c += g_H[i].val != g_H[i].key;
+      }
     }
+    nremap[t] = c;
   });
+  size_t remap = 0;
+  for (size_t c : nremap) remap += c;
+  u64 words = 64;
+  while (words * 8 < remap) words <<= 1;  // >= 8 bits per key
+  g_F = (u64*)vm_alloc(words * 8);
+  g_Fmask = words - 1;
+  for (u64 i = 0; i < nslots; i++) {
+    const HSlot& sl = g_H[i];
+    if (sl.key && sl.val != sl.key) {
+      const u64 h = mix64(sl.key);
+      g_F[h & g_Fmask] |= f_bits(h);
+    }
+  }
+  LOG("links: %zu ids remap to another name; filter %llu KB", remap, (unsigned long long)(words * 8 / 1024));
 }
 
 // ------------------------------------------------------------------------------------------
@@ -1006,7 +1192,9 @@ static inline bool parse_price(const u8* s, u32 n, u32& out) {
   return true;
 }
 
-static void parse_events_clicks(std::vector<MFile>& ev, std::vector<MFile>& ck) {
+static void build_links(std::vector<MFile>& files);
+
+static void parse_events_clicks(std::vector<MFile>& ev, std::vector<MFile>& ck, std::vector<MFile>& lk) {
   size_t ev_bytes = 0, ck_bytes = 0;
   for (auto& f : ev) ev_bytes += f.size;
   for (auto& f : ck) ck_bytes += f.size;
@@ -1017,7 +1205,8 @@ static void parse_events_clicks(std::vector<MFile>& ev, std::vector<MFile>& ck) 
   const u32 p1shift = 64 - g_P1bits;
   const i64 ws = g_ws, we = g_we, cws = g_ws - WEEK;
   int ntasks = (int)(ce.size() + cc.size());
-  parallel_for(ntasks, [&](int t, int tid) {
+  std::atomic<int> next{0};
+  auto task = [&](int t, int tid) {
     TL& tl = g_tl[tid];
     if (t < (int)ce.size()) {
       const Chunk& c = ce[t];
@@ -1025,7 +1214,7 @@ static void parse_events_clicks(std::vector<MFile>& ev, std::vector<MFile>& ck) 
       size_t b = line_start_at_or_after(f, c.nominal), e = line_start_at_or_after(f, c.nominal_end);
       if (b >= e) return;
       u64 nl = 0;
-      scan_chunk<7>(f.data + b, f.data + e, b == 0, [&](const u8* const* fs, const u32* fl) {
+      scan_chunk<7>(f.data + b, f.data + e, b == 0, [&](const u8* const* fs, const u32* fl) __attribute__((always_inline)) {
         if (fl[0] == 0) return;
         nl++;
         u64 eid = make_key(fs[0], fl[0]);
@@ -1058,9 +1247,11 @@ static void parse_events_clicks(std::vector<MFile>& ev, std::vector<MFile>& ck) 
             }
           }
         }
-        R1* d = tl.r1[mix64(eid) >> p1shift].slot(tl.arena);
-        _mm256_storeu_si256((__m256i*)d, _mm256_set_epi64x((long long)tspl, (long long)uid, (long long)ingest, (long long)eid));
+        const u64 eh = mix64(eid);
+        tl.r1.push32((u32)(eh >> p1shift),
+                     _mm256_set_epi64x((long long)tspl, (long long)uid, (long long)ingest, (long long)eh), tl.arena);
       });
+      _mm_sfence();
       tl.n_event_lines += nl;
     } else {
       const Chunk& c = cc[t - ce.size()];
@@ -1085,22 +1276,99 @@ static void parse_events_clicks(std::vector<MFile>& ev, std::vector<MFile>& ck) 
       });
       tl.n_click_lines += nl;
     }
+  };
+  parallel_threads([&](int tid) {
+    u64 u0 = 0, s0 = 0, u1 = 0, s1 = 0;
+    if (g_log) thread_times(u0, s0);
+    if (tid == 0) {
+      tl_serial_tid = 0;
+      build_links(lk);
+      tl_serial_tid = -1;
+      if (g_log) {
+        thread_times(u1, s1);
+        g_phase_cycles[1] += u1 - u0;
+        g_phase_sys[1] += s1 - s0;
+        u0 = u1;
+        s0 = s1;
+      }
+      LOG("links done (thread 0)");
+    }
+    for (;;) {
+      int t = next.fetch_add(1, std::memory_order_relaxed);
+      if (t >= ntasks) break;
+      task(t, tid);
+    }
+    if (g_log) {
+      thread_times(u1, s1);
+      g_phase_cycles[2] += u1 - u0;
+      g_phase_sys[2] += s1 - s0;
+    }
   });
   parallel_for(NT, [&](int t, int) {
-    for (auto& s : g_tl[t].r1) s.finish();
-    g_tl[t].c0.finish();
+    TL& tl = g_tl[t];
+    tl.r1.finish(tl.arena);
+    tl.c0.finish();
   });
 }
 
 // ------------------------------------------------------------------------------------------
 // dedup (per event_id partition) and person lookups; click person lookups
 
+// Streams items through two rings: first the filter word is prefetched; items the filter flags then
+// prefetch their H slot; done(person, item) is called in arrival order within each path.
+template <class Item, class Done>
+struct LookupRing {
+  static constexpr u32 DA = 16, DB = 16;
+  struct E {
+    u64 key, h;
+    Item item;
+  };
+  E ra[DA], rb[DB];
+  u32 na = 0, nb = 0;
+  Done& done;
+  explicit LookupRing(Done& d) : done(d) {}
+  inline void to_b(const E& e) {
+    if (!f_maybe(e.h)) {
+      done(e.key, e.item);
+      return;
+    }
+    _mm_prefetch((const char*)&g_H[h_slot_index(e.h)], _MM_HINT_T0);
+    E& b = rb[nb & (DB - 1)];
+    if (nb >= DB) done(person_of_h(b.key, b.h), b.item);
+    b = e;
+    nb++;
+  }
+  inline void push(u64 key, const Item& it) {
+    if (!g_H) {
+      done(key, it);
+      return;
+    }
+    const u64 h = mix64(key);
+    _mm_prefetch((const char*)&g_F[h & g_Fmask], _MM_HINT_T0);
+    E& a = ra[na & (DA - 1)];
+    if (na >= DA) to_b(a);
+    a.key = key;
+    a.h = h;
+    a.item = it;
+    na++;
+  }
+  inline void drain() {
+    for (u32 k = na > DA ? na - DA : 0; k < na; k++) to_b(ra[k & (DA - 1)]);
+    na = 0;
+    for (u32 k = nb > DB ? nb - DB : 0; k < nb; k++) {
+      E& b = rb[k & (DB - 1)];
+      done(person_of_h(b.key, b.h), b.item);
+    }
+    nb = 0;
+  }
+};
+
 static void dedup_and_route() {
   u32 P1 = 1u << g_P1bits;
   const u32 p2shift = 64 - g_P2bits;
   std::vector<size_t> sizes(P1, 0);
   for (u32 p = 0; p < P1; p++)
-    for (int t = 0; t < NT; t++) sizes[p] += g_tl[t].r1[p].size();
+    for (int t = 0; t < NT; t++) sizes[p] += g_tl[t].r1.size(p);
   std::vector<int> order(P1);
   for (u32 p = 0; p < P1; p++) order[p] = (int)p;
   std::sort(order.begin(), order.end(), [&](int a, int b) { return sizes[a] > sizes[b]; });
@@ -1118,30 +1386,27 @@ static void dedup_and_route() {
     u64 eid;
     R1* ptr;
   };
-  struct Scratch {
-    std::vector<Slot> tab;
-    std::vector<R1*> surv;
-  };
-  std::vector<Scratch> scr(NT);
+  std::vector<std::vector<Slot>> tabs(NT);
   int ntasks = (int)(P1 + ctasks.size());
   parallel_for(ntasks, [&](int oi, int tid) {
     TL& tl = g_tl[tid];
     if (oi >= (int)P1) {
       const CTask& ct = ctasks[oi - P1];
       auto& blocks = g_tl[ct.t].c0.blocks;
+      auto done = [&](u64 person, const u64x2& v) __attribute__((always_inline)) {
+        const u64 ph = mix64(person);
+        tl.r2c.push32((u32)(ph >> p2shift), _mm256_set_epi64x(0, (long long)v.b, (long long)v.a, (long long)ph),
+                      tl.arena);
+      };
+      LookupRing<u64x2, decltype(done)> ring(done);
       for (size_t b = ct.b0; b < ct.b1; b++) {
         const C0* r = blocks[b].first;
-        lookup_pipeline(
-            blocks[b].second, [&](size_t i) { return r[i].uid; },
-            [&](size_t i, u64 person) {
-              u64 h = mix64(person);
-              R2C* d = tl.r2c[h >> p2shift].slot(tl.arena);
-              d->h = h;
-              d->click = r[i].click;
-              u64 tc;
-              memcpy(&tc, &r[i].ts, 8);
-              memcpy(&d->ts, &tc, 8);
-            });
+        for (u32 j = 0; j < blocks[b].second; j++) {
+          u64 tc;
+          memcpy(&tc, &r[j].ts, 8);
+          ring.push(r[j].uid, u64x2{r[j].click, tc});
+        }
+        ring.drain();
         tl.arena.free_blocks.push_back(blocks[b].first);
       }
       return;
@@ -1149,19 +1414,19 @@ static void dedup_and_route() {
     int p = order[oi];
     size_t n = sizes[p];
     if (n == 0) return;
-    Scratch& S = scr[tid];
+    std::vector<Slot>& T = tabs[tid];
     u32 bits = ceil_log2(n * 2 + 16);
     size_t tsz = (size_t)1 << bits;
-    if (S.tab.size() < tsz) S.tab.resize(tsz);
-    memset(S.tab.data(), 0, tsz * sizeof(Slot));
+    if (T.size() < tsz) T.resize(tsz);
+    memset(T.data(), 0, tsz * sizeof(Slot));
     u64 mask = tsz - 1;
-    Slot* tab = S.tab.data();
+    Slot* tab = T.data();
     for (int t = 0; t < NT; t++)
-      for (auto& b : g_tl[t].r1[p].blocks) {
+      for (auto& b : g_tl[t].r1.blocks[p]) {
         R1* rec = b.first;
         for (u32 j = 0; j < b.second; j++) {
           R1* r = &rec[j];
-          u64 h = (mix64(r->eid) << g_P1bits) >> (64 - bits);
+          u64 h = (r->eid << g_P1bits) >> (64 - bits);
           for (;;) {
             Slot& s = tab[h];
             if (s.ptr == nullptr) {
@@ -1182,28 +1447,28 @@ static void dedup_and_route() {
           }
         }
       }
-    S.surv.clear();
+    auto done = [&](u64 person, const u64& tp) __attribute__((always_inline)) {
+      const u64 ph = mix64(person);
+      tl.r2.push16((u32)(ph >> p2shift), _mm_set_epi64x((long long)tp, (long long)ph), tl.arena);
+    };
+    LookupRing<u64, decltype(done)> ring(done);
     for (int t = 0; t < NT; t++)
-      for (auto& b : g_tl[t].r1[p].blocks) {
-        R1* rec = b.first;
-        for (u32 j = 0; j < b.second; j++)
-          if (rec[j].ts != TS_INVALID) S.surv.push_back(&rec[j]);
-      }
-    R1** sv = S.surv.data();
-    lookup_pipeline(
-        S.surv.size(), [&](size_t i) { return sv[i]->uid; },
-        [&](size_t i, u64 person) {
+      for (auto& b : g_tl[t].r1.blocks[p]) {
+        const R1* rec = b.first;
+        for (u32 j = 0; j < b.second; j++) {
+          if (rec[j].ts == TS_INVALID) continue;
           u64 tp;
-          memcpy(&tp, &sv[i]->ts, 8);
-          u64 h = mix64(person);
-          R2* d = tl.r2[h >> p2shift].slot(tl.arena);
-          _mm_storeu_si128((__m128i*)d, _mm_set_epi64x((long long)tp, (long long)h));
-        });
-    for (int t = 0; t < NT; t++) g_tl[t].r1[p].release(tl.arena);
+          memcpy(&tp, &rec[j].ts, 8);
+          ring.push(rec[j].uid, tp);
+        }
+      }
+    ring.drain();
+    for (int t = 0; t < NT; t++) g_tl[t].r1.release(p, tl.arena);
   });
   parallel_for(NT, [&](int t, int) {
-    for (auto& s : g_tl[t].r2) s.finish();
-    for (auto& s : g_tl[t].r2c) s.finish();
+    TL& tl = g_tl[t];
+    tl.r2.finish(tl.arena);
+    tl.r2c.finish(tl.arena);
   });
 }
 
@@ -1236,7 +1501,11 @@ static inline bool click_less(u64 a, u64 b) {  // byte-wise order of click ids
 
 static void sort_clicks(CRec* a, size_t n, std::vector<CRec>& tmp) {
   if (n < 2) return;
-  if (n <= 32) {
+  if (n > 12 && n <= 1024) {
+    std::sort(a, a + n, [](const CRec& x, const CRec& y) { return x.ts < y.ts; });
+    return;
+  }
+  if (n <= 12) {
     for (size_t i = 1; i < n; i++) {
       CRec x = a[i];
       size_t j = i;
@@ -1274,36 +1543,49 @@ static void person_phase() {
   std::vector<size_t> ne(P2, 0), nc(P2, 0);
   for (u32 p = 0; p < P2; p++)
     for (int t = 0; t < NT; t++) {
-      ne[p] += g_tl[t].r2[p].size();
-      nc[p] += g_tl[t].r2c[p].size();
+      ne[p] += g_tl[t].r2.size(p);
+      nc[p] += g_tl[t].r2c.size(p);
     }
   std::vector<int> order(P2);
   for (u32 p = 0; p < P2; p++) order[p] = (int)p;
   std::sort(order.begin(), order.end(), [&](int a, int b) { return ne[a] > ne[b]; });
   const u32 NC = g_ncamp, ND = (u32)g_ndays, ORG = NC;
   const u32 NB = (u32)(((u64)(g_we - g_ws - 1) >> BSHIFT) + 1);
+  const u32 NW = (NB + 63) / 64;
+  const u32 NCAT = (u32)g_cats.size();
   parallel_for(NT, [&](int t, int) {
     TL& tl = g_tl[t];
-    tl.c_sess.assign((size_t)(NC + 1) * ND, 0);
-    tl.c_purch.assign((size_t)(NC + 1) * ND, 0);
+    tl.c_stat.assign((size_t)(NC + 1) * ND, CStat{0, 0, 0});
     tl.c_assist.assign((size_t)(NC + 1) * ND, 0);
-    tl.c_rev.assign((size_t)(NC + 1) * ND, 0);
   });
   struct PSlot {
     u64 h;
     u32 lid;
     u32 used;
   };
+  struct BAgg {
+    u32 mn, mx, cnt, pad;
+    i64 rev;
+  };
+  struct Purch {
+    u32 bucket, cat, price;
+  };
   struct Scratch {
     std::vector<PSlot> tab;
     std::vector<u64> hs;
-    std::vector<u32> cntL, posL, cntB, cntC, offC;
-    std::vector<XRec> X, Y;
+    std::vector<u32> cntL, posL, cntC, offC;
+    std::vector<XRec> X;
+    std::vector<u64> E;
     std::vector<CRec> C, Ctmp;
     std::vector<u32> lidC;
     std::vector<u32> ccnt, cpos, active;
-    std::vector<i64> catsum;
-    std::vector<u32> touched;
+    std::vector<BAgg> agg;
+    std::vector<u64> bitmap;
+    std::vector<u16> bday;
+    std::vector<Purch> purch;
+    std::vector<u32> dsess, dev;
+    std::vector<i64> drev, catsum;
+    std::vector<u32> days;
   };
   std::vector<Scratch> scr(NT);
   const i64 ws = g_ws, day0 = g_day0;
@@ -1317,8 +1599,13 @@ static void person_phase() {
     if (S.ccnt.size() < NC + 1) {
       S.ccnt.assign(NC + 1, 0);
       S.cpos.assign(NC + 1, 0);
-      S.catsum.assign(256, 0);
-      S.cntB.assign(NB + 1, 0);
+      S.agg.assign(NB, BAgg{0, 0, 0, 0, 0});
+      S.bitmap.assign(NW, 0);
+      S.bday.assign(NB, 0);
+      S.dsess.assign(ND, 0);
+      S.dev.assign(ND, 0);
+      S.drev.assign(ND, 0);
+      S.catsum.assign((size_t)ND * NCAT, 0);
     }
     // ---- local person ids
     u32 bits = std::max<u32>(8, ceil_log2(n_e / 8 + 64));
@@ -1340,65 +1627,53 @@ static void person_phase() {
     };
     if (S.X.size() < n_e) {
       S.X.resize(n_e);
-      S.Y.resize(n_e);
+      S.E.resize(n_e);
     }
     XRec* X = S.X.data();
-    XRec* Y = S.Y.data();
-    u32* cntB = S.cntB.data();
-    memset(cntB, 0, sizeof(u32) * (NB + 1));
     size_t k = 0;
     for (int t = 0; t < NT; t++)
-      for (auto& b : g_tl[t].r2[p].blocks) {
+      for (auto& b : g_tl[t].r2.blocks[p]) {
         const R2* r = b.first;
         for (u32 j = 0; j < b.second; j++) {
           u64 h = r[j].h;
           u64 i = (h << P2bits) >> (64 - bits);
           u32 lid;
           for (;;) {
-            PSlot& s = S.tab[i];
-            if (!s.used) {
+            PSlot& sl = S.tab[i];
+            if (!sl.used) {
               lid = (u32)S.hs.size();
-              s = PSlot{h, lid, 1};
+              sl = PSlot{h, lid, 1};
               S.hs.push_back(h);
               S.cntL.push_back(0);
               if (S.hs.size() * 2 > tsz) rehash();
               break;
             }
-            if (s.h == h) {
-              lid = s.lid;
+            if (sl.h == h) {
+              lid = sl.lid;
               break;
             }
             i = (i + 1) & mask;
           }
-          u32 ts = r[j].ts;
           X[k].lid = lid;
-          X[k].ts = ts;
+          X[k].ts = r[j].ts;
           X[k].payload = r[j].payload;
           k++;
           S.cntL[lid]++;
-          cntB[ts >> BSHIFT]++;
         }
       }
     const u32 np = (u32)S.hs.size();
-    // ---- pass 1: by time bucket (stable); pass 2: by person (stable)
+    S.posL.resize(np + 1);
     {
-      u32 sum = 0;
-      for (u32 b = 0; b < NB; b++) {
-        u32 c = cntB[b];
-        cntB[b] = sum;
-        sum += c;
-      }
-      for (size_t i = 0; i < n_e; i++) Y[cntB[X[i].ts >> BSHIFT]++] = X[i];
-      S.posL.resize(np + 1);
       u32* posL = S.posL.data();
-      sum = 0;
+      u32 sum = 0;
       for (u32 l = 0; l < np; l++) {
         posL[l] = sum;
         sum += S.cntL[l];
       }
       posL[np] = sum;
-      for (size_t i = 0; i < n_e; i++) X[posL[Y[i].lid]++] = Y[i];
-      // posL[l] is now the end of person l; start = end - cnt
+      u64* E = S.E.data();
+      for (size_t i = 0; i < n_e; i++) E[posL[X[i].lid]++] = ((u64)X[i].ts << 32) | X[i].payload;
+      // posL[l] is now the end of person l
     }
     // ---- clicks of these persons, grouped by person
     S.cntC.assign(np + 1, 0);
@@ -1406,17 +1681,17 @@ static void person_phase() {
     {
       size_t kk = 0;
       for (int t = 0; t < NT; t++)
-        for (auto& b : g_tl[t].r2c[p].blocks) {
+        for (auto& b : g_tl[t].r2c.blocks[p]) {
           const R2C* r = b.first;
           for (u32 j = 0; j < b.second; j++) {
             u64 h = r[j].h;
             u64 i = (h << P2bits) >> (64 - bits);
             u32 lid = np;
             for (;;) {
-              const PSlot& s = S.tab[i];
-              if (!s.used) break;
-              if (s.h == h) {
-                lid = s.lid;
+              const PSlot& sl = S.tab[i];
+              if (!sl.used) break;
+              if (sl.h == h) {
+                lid = sl.lid;
                 break;
               }
               i = (i + 1) & mask;
@@ -1439,7 +1714,7 @@ static void person_phase() {
       for (u32 l = 0; l <= np; l++) pos[l] = S.offC[l];
       size_t kk = 0;
       for (int t = 0; t < NT; t++)
-        for (auto& b : g_tl[t].r2c[p].blocks) {
+        for (auto& b : g_tl[t].r2c.blocks[p]) {
           const R2C* r = b.first;
           for (u32 j = 0; j < b.second; j++) {
             u32 lid = S.lidC[kk++];
@@ -1450,50 +1725,59 @@ static void person_phase() {
     // ---- per person
     u32* ccnt = S.ccnt.data();
     u32* cpos = S.cpos.data();
-    i64* catsum = S.catsum.data();
-    u32* c_sess = tl.c_sess.data();
-    u32* c_purch = tl.c_purch.data();
+    CStat* c_stat = tl.c_stat.data();
     u32* c_assist = tl.c_assist.data();
-    i64* c_rev = tl.c_rev.data();
+    BAgg* agg = S.agg.data();
+    u64* bitmap = S.bitmap.data();
+    u16* bday = S.bday.data();
+    u32* dsess = S.dsess.data();
+    u32* dev = S.dev.data();
+    i64* drev = S.drev.data();
+    i64* catsum = S.catsum.data();
     OutRows& out = tl.out;
     const u32* posL = S.posL.data();
+    const u64* Eall = S.E.data();
     for (u32 lid = 0; lid < np; lid++) {
       const u32 eend = posL[lid], ebeg = eend - S.cntL[lid];
       CRec* C = S.C.data() + S.offC[lid];
-      size_t mc = S.offC[lid + 1] - S.offC[lid];
+      const size_t mc = S.offC[lid + 1] - S.offC[lid];
       sort_clicks(C, mc, S.Ctmp);
-      size_t lo = 0, hi = 0;
-      i64 cur_day = -1;
-      u32 d_sess = 0, d_ev = 0;
-      i64 d_rev = 0;
-      const u64 pkey = unmix64(S.hs[lid]);
-      auto flush = [&]() {
-        u16 top = 0xFFFF;
-        i64 best = -1;
-        for (u32 c : S.touched) {
-          i64 v = catsum[c];
-          if (v > best || (v == best && c < top)) {
-            best = v;
-            top = (u16)c;
-          }
-          catsum[c] = 0;
+      // bucket aggregates
+      S.purch.clear();
+      u32 wlo = NW, whi = 0;
+      for (u32 i = ebeg; i < eend; i++) {
+        const u64 e = Eall[i];
+        const u32 ts = (u32)(e >> 32), pl = (u32)e;
+        const u32 b = ts >> BSHIFT;
+        BAgg& a = agg[b];
+        const u64 bit = 1ULL << (b & 63);
+        u64& w = bitmap[b >> 6];
+        if (!(w & bit)) {
+          w |= bit;
+          a.mn = ts;
+          a.mx = ts;
+          a.cnt = 1;
+          a.rev = 0;
+          wlo = std::min(wlo, b >> 6);
+          whi = std::max(whi, b >> 6);
+        } else {
+          a.mn = ts < a.mn ? ts : a.mn;
+          a.mx = ts > a.mx ? ts : a.mx;
+          a.cnt++;
         }
-        S.touched.clear();
-        out.key.push_back(pkey);
-        out.day.push_back((i32)(day0 + cur_day));
-        out.sess.push_back(d_sess);
-        out.evs.push_back(d_ev);
-        out.rev.push_back(d_rev);
-        out.top.push_back(top);
-      };
-      // session state
+        if (pl) {
+          a.rev += pl & 0xFFFFFF;
+          S.purch.push_back(Purch{b, pl >> 24, pl & 0xFFFFFF});
+        }
+      }
+      // sessions over the buckets in time order
+      size_t lo = 0, hi = 0;
       bool open = false;
-      u32 s_start = 0, s_max = 0, s_nev = 0;
+      u32 s_start = 0, s_max = 0, s_nev = 0, s_day = 0;
       i64 s_rev = 0;
-      i64 s_day = 0;
+      S.days.clear();
       auto close_session = [&]() {
-        // attribution: clicks with s_start <= click.ts <= s_start + WEEK (click time is relative to ws - 7d)
-        u64 upper = (u64)s_start + (u64)WEEK;
+        const u64 upper = (u64)s_start + (u64)WEEK;
         while (hi < mc && (u64)C[hi].ts <= upper) {
           u32 c = C[hi].camp;
           if (ccnt[c]++ == 0) {
@@ -1523,66 +1807,72 @@ static void person_phase() {
           }
           credit = C[bi].camp;
         }
-        size_t ci = (size_t)credit * ND + (size_t)s_day;
-        c_sess[ci]++;
-        c_purch[ci] += (s_rev > 0);
-        c_rev[ci] += s_rev;
-        for (u32 c : S.active) c_assist[(size_t)c * ND + (size_t)s_day]++;
-        d_sess++;
-        d_ev += s_nev;
-        d_rev += s_rev;
+        CStat& cs = c_stat[(size_t)credit * ND + s_day];
+        cs.sess++;
+        cs.purch += (s_rev > 0);
+        cs.rev += s_rev;
+        for (u32 c : S.active) c_assist[(size_t)c * ND + s_day]++;
+        if (dsess[s_day]++ == 0) S.days.push_back(s_day);
+        dev[s_day] += s_nev;
+        drev[s_day] += s_rev;
       };
-      u32 i = ebeg;
-      while (i < eend) {
-        // one time bucket [i, j)
-        u32 b = X[i].ts >> BSHIFT;
-        u32 gmin = X[i].ts, gmax = gmin, gpay = X[i].payload;
-        u32 j = i + 1;
-        while (j < eend && (X[j].ts >> BSHIFT) == b) {
-          u32 t = X[j].ts;
-          gmin = t < gmin ? t : gmin;
-          gmax = t > gmax ? t : gmax;
-          gpay |= X[j].payload;
-          j++;
-        }
-        if (!open || gmin - s_max > (u32)MIN30) {
-          if (open) close_session();
-          open = true;
-          s_start = gmin;
-          s_nev = 0;
-          s_rev = 0;
-          s_day = (ws + (i64)gmin) / DAY - day0;
-          if (s_day != cur_day) {
-            if (cur_day >= 0) flush();
-            cur_day = s_day;
-            d_sess = 0;
-            d_ev = 0;
-            d_rev = 0;
+      for (u32 wi = wlo; wi <= whi && wi < NW; wi++) {
+        u64 w = bitmap[wi];
+        bitmap[wi] = 0;
+        while (w) {
+          const u32 b = wi * 64 + (u32)__builtin_ctzll(w);
+          w &= w - 1;
+          const BAgg& a = agg[b];
+          if (!open || a.mn - s_max > (u32)MIN30) {
+            if (open) close_session();
+            open = true;
+            s_start = a.mn;
+            s_nev = 0;
+            s_rev = 0;
+            s_day = (u32)((ws + (i64)a.mn) / DAY - day0);
           }
+          s_max = a.mx;
+          s_nev += a.cnt;
+          s_rev += a.rev;
+          bday[b] = (u16)s_day;
         }
-        s_max = gmax;
-        s_nev += j - i;
-        if (gpay) {
-          for (u32 q = i; q < j; q++) {
-            u32 pl = X[q].payload;
-            if (pl) {
-              u32 price = pl & 0xFFFFFF, cat = pl >> 24;
-              s_rev += price;
-              if (catsum[cat] == 0) S.touched.push_back(cat);
-              catsum[cat] += price;
-            }
-          }
-        }
-        i = j;
       }
       if (open) close_session();
-      if (cur_day >= 0) flush();
       for (u32 c : S.active) ccnt[c] = 0;
       S.active.clear();
+      // purchases -> category sums per day of their session
+      for (const Purch& q : S.purch) catsum[(size_t)bday[q.bucket] * NCAT + q.cat] += q.price;
+      const u64 pkey = unmix64(S.hs[lid]);
+      const size_t nd = S.days.size();
+      const size_t base = out.rows.size();
+      out.rows.resize(base + nd);
+      ORow* orow = out.rows.data() + base;
+      for (size_t di = 0; di < nd; di++) {
+        const u32 d = S.days[di];
+        u16 top = 0xFFFF;
+        if (drev[d] > 0) {
+          i64 best = -1;
+          i64* cs = catsum + (size_t)d * NCAT;
+          for (const Purch& q : S.purch) {
+            if (bday[q.bucket] != d) continue;
+            const i64 v = cs[q.cat];
+            if (v > best || (v == best && q.cat < top)) {
+              best = v;
+              top = (u16)q.cat;
+            }
+          }
+          for (const Purch& q : S.purch)
+            if (bday[q.bucket] == d) cs[q.cat] = 0;
+        }
+        orow[di] = ORow{pkey, drev[d], (i32)(day0 + d), dsess[d], dev[d], top, 0};
+        dsess[d] = 0;
+        dev[d] = 0;
+        drev[d] = 0;
+      }
     }
     for (int t = 0; t < NT; t++) {
-      g_tl[t].r2[p].release(tl.arena);
-      g_tl[t].r2c[p].release(tl.arena);
+      g_tl[t].r2.release(p, tl.arena);
+      g_tl[t].r2c.release(p, tl.arena);
     }
   });
 }
@@ -1592,7 +1882,8 @@ static void person_phase() {
 
 static inline void put_key(std::vector<u8>& buf, size_t& at, u64 k) {
   if (is_slow(k)) {
-    const std::string& s = g_intern.strs[k - 1];
+    std::string s;
+    key_str(k, s);
     if (buf.size() < at + 4 + s.size()) buf.resize((at + 4 + s.size()) * 2);
     u32 n = (u32)s.size();
     memcpy(&buf[at], &n, 4);
@@ -1619,7 +1910,7 @@ static void write_outputs(const std::string& out) {
   mkdir(cd.c_str(), 0777);
   std::atomic<bool> fail{false};
   size_t total_rows = 0;
-  for (auto& t : g_tl) total_rows += t.out.key.size();
+  for (auto& t : g_tl) total_rows += t.out.rows.size();
   parallel_for(NT + 1, [&](int t, int) {
     if (t == NT) {
       // campaign_daily
@@ -1628,12 +1919,12 @@ static void write_outputs(const std::string& out) {
       std::vector<u64> sess(sz, 0), purch(sz, 0), assist(sz, 0);
       std::vector<i64> rev(sz, 0);
       for (auto& tl : g_tl) {
-        if (tl.c_sess.empty()) continue;
+        if (tl.c_stat.empty()) continue;
         for (size_t i = 0; i < sz; i++) {
-          sess[i] += tl.c_sess[i];
-          purch[i] += tl.c_purch[i];
+          sess[i] += tl.c_stat[i].sess;
+          purch[i] += tl.c_stat[i].purch;
           assist[i] += tl.c_assist[i];
-          rev[i] += tl.c_rev[i];
+          rev[i] += tl.c_stat[i].rev;
         }
       }
       std::vector<pq::Column> cols(7);
@@ -1669,8 +1960,8 @@ static void write_outputs(const std::string& out) {
       if (!pq::write_file(cd + "/part-0.parquet", cols, n)) fail = true;
       return;
     }
-    OutRows& o = g_tl[t].out;
-    size_t n = o.key.size();
+    const std::vector<ORow>& o = g_tl[t].out.rows;
+    size_t n = o.size();
     if (n == 0 && !(t == 0 && total_rows == 0)) return;
     std::vector<pq::Column> cols(6);
     cols[0].name = "user_id";
@@ -1696,23 +1987,28 @@ static void write_outputs(const std::string& out) {
       std::vector<u8>& b = cols[0].values.d;
       b.resize(n * 14 + 64);
       size_t at = 0;
-      for (size_t i = 0; i < n; i++) put_key(b, at, o.key[i]);
+      for (size_t i = 0; i < n; i++) put_key(b, at, o[i].key);
       b.resize(at);
     }
-    auto raw = [](pq::Buf& b, const void* p, size_t bytes) {
-      b.d.resize(bytes);
-      if (bytes) memcpy(b.d.data(), p, bytes);
-    };
-    raw(cols[1].values, o.day.data(), n * 4);
-    raw(cols[2].values, o.sess.data(), n * 4);
-    raw(cols[3].values, o.evs.data(), n * 4);
-    raw(cols[4].values, o.rev.data(), n * 8);
+    cols[1].values.d.resize(n * 4);
+    cols[2].values.d.resize(n * 4);
+    cols[3].values.d.resize(n * 4);
+    cols[4].values.d.resize(n * 8);
+    i32* c1 = (i32*)cols[1].values.d.data();
+    u32* c2 = (u32*)cols[2].values.d.data();
+    u32* c3 = (u32*)cols[3].values.d.data();
+    i64* c4 = (i64*)cols[4].values.d.data();
     cols[5].defs.resize(n);
     cols[5].indices.reserve(n / 3 + 16);
     for (size_t i = 0; i < n; i++) {
-      if (o.top[i] != 0xFFFF) {
+      const ORow& r = o[i];
+      c1[i] = r.day;
+      c2[i] = r.sess;
+      c3[i] = r.evs;
+      c4[i] = r.rev;
+      if (r.top != 0xFFFF) {
         cols[5].defs[i] = 1;
-        cols[5].indices.push_back(o.top[i]);
+        cols[5].indices.push_back(r.top);
       } else {
         cols[5].defs[i] = 0;
         cols[5].num_nulls++;
@@ -1855,16 +2151,15 @@ int main(int argc, char** argv) {
   g_P2bits = std::min<u32>(12, std::max<u32>(4, ceil_log2(est_lines / 32768 + 1)));
   g_tl.resize(NT);
   for (auto& t : g_tl) {
-    t.r1.resize(1u << g_P1bits);
-    t.r2.resize(1u << g_P2bits);
-    t.r2c.resize(1u << g_P2bits);
+    t.r1.init(1u << g_P1bits);
+    t.r2.init(1u << g_P2bits);
+    t.r2c.init(1u << g_P2bits);
   }
   LOG("mapped %zu event files (%zu bytes), %zu click files, %zu link files; P1=%u P2=%u threads=%d", ev.size(),
       ev_bytes, ck.size(), lk.size(), 1u << g_P1bits, 1u << g_P2bits, NT);
 
-  build_links(lk);
-  LOG("links done");
-  parse_events_clicks(ev, ck);
+  g_phase = 2;
+  parse_events_clicks(ev, ck, lk);
   {
     u64 a = 0, b = 0;
     for (auto& t : g_tl) {
@@ -1874,12 +2169,25 @@ int main(int argc, char** argv) {
     LOG("parsed: %llu event lines, %llu click lines", (unsigned long long)a, (unsigned long long)b);
   }
   if (getenv("SS_STOP") && !strcmp(getenv("SS_STOP"), "parse")) return 0;
+  g_phase = 3;
   dedup_and_route();
   LOG("dedup + routing done");
   if (getenv("SS_STOP") && !strcmp(getenv("SS_STOP"), "dedup")) return 0;
+  g_phase = 4;
   person_phase();
   LOG("person phase done");
+  g_phase = 5;
   write_outputs(out);
   LOG("output written");
+  if (g_log) {
+    double tot = 0, tots = 0;
+    for (int i = 0; i < 6; i++) {
+      tot += g_phase_cycles[i].load() / 1e6;
+      tots += g_phase_sys[i].load() / 1e6;
+    }
+    fprintf(stderr, "user s:");
+    for (int i = 1; i < 6; i++) fprintf(stderr, " %s %.3f", g_phase_names[i], g_phase_cycles[i].load() / 1e6);
+    fprintf(stderr, " | total %.3f   sys s: total %.3f (parse %.3f)\n", tot, tots, g_phase_sys[2].load() / 1e6);
+  }
   return 0;
 }
