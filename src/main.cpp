@@ -740,9 +740,19 @@ static bool parse_ts_ref(const u8* s, u32 n, i64& out) {
 // kernels do not accept is decided by parse_ts / parse_f1, so they only have to be right when they say yes.
 
 static u32 g_ytxt[2];          // candidate years as their 4 ASCII digits (0: none)
-static i64 g_dayms[2][416];    // [candidate][month * 32 + day] -> ms at 00:00 UTC, DAYMS_NONE if no such date
+// [row][month * 32 + day] -> ms at 00:00 UTC, DAYMS_NONE if no such date. Rows 0 and 1 are the candidate
+// years; row 2, all DAYMS_NONE, is for any other year (see year_row).
+static i64 g_dayms[3][416];
 static constexpr i64 DAYMS_NONE = INT64_MIN;
-static i64 g_daycode[2][416];  // the same in whole seconds since a base chosen by the dense path, plus 1
+static i64 g_daycode[3][416];  // the same in whole seconds since a base chosen by the dense path, plus 1
+// The row of g_dayms for a year given as its 4 ASCII digits: 1 or 0 for a candidate year, else 2. Two
+// compares and two conditional moves; the day lookup then rejects the other years with the impossible dates.
+static FORCE_INLINE u32 year_row(u32 y) {
+  u32 k = 2;
+  k = y == g_ytxt[0] ? 0 : k;
+  k = y == g_ytxt[1] ? 1 : k;
+  return k;
+}
 
 static void civil_from_days(i64 days, i64& y, i64& m, i64& d) {
   i64 z = days + 719468;
@@ -764,6 +774,7 @@ static void init_fast_years(i64 lo_ms, i64 hi_ms) {
   i64 m, d;
   civil_from_days(fdiv(lo_ms, DAY), ys[0], m, d);
   civil_from_days(fdiv(hi_ms, DAY), ys[1], m, d);
+  for (int i = 0; i < 416; i++) g_dayms[2][i] = DAYMS_NONE;
   for (int k = 0; k < 2; k++) {
     g_ytxt[k] = 0;
     for (int i = 0; i < 416; i++) g_dayms[k][i] = DAYMS_NONE;
@@ -810,8 +821,7 @@ static FORCE_INLINE bool f1_pair_mc(const u8* a, const u8* b, i64& ta, i64& tb, 
   u32 ya, yb;
   memcpy(&ya, a, 4);
   memcpy(&yb, b, 4);
-  const u32 ka = ya == g_ytxt[1], kb = yb == g_ytxt[1];
-  if (!(((ya == g_ytxt[0]) | ka) & ((yb == g_ytxt[0]) | kb))) return false;
+  const u32 ka = year_row(ya), kb = year_row(yb);
   const i64 da = g_dayms[ka][L[0]], db = g_dayms[kb][L[4]];
   if ((da == DAYMS_NONE) | (db == DAYMS_NONE)) return false;
   ta = da + (i64)(L[1] * 60 + L[2]) * 1000;
@@ -850,8 +860,7 @@ static FORCE_INLINE bool f1_one_mc(const u8* a, i64& ta, i64& ca) {
   __asm__("" : "+r"(L));
   u32 ya;
   memcpy(&ya, a, 4);
-  const u32 ka = ya == g_ytxt[1];
-  if (!((ya == g_ytxt[0]) | ka)) return false;
+  const u32 ka = year_row(ya);
   const i64 da = g_dayms[ka][L[0]];
   if (da == DAYMS_NONE) return false;
   const u32 sa = L[1] * 60 + L[2];
