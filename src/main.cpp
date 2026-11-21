@@ -3016,6 +3016,10 @@ static int selftest() {
     g_camp_by_num.assign(5000, -1);
     for (u32 i = 0; i < 5000; i += 3) g_camp_by_num[i] = (i32)(i * 7 + 1);
     u8 t[40];
+    alignas(32) u64 q4raw[4];
+    alignas(16) u32 q4ln[4];
+    bool q4pre[4];
+    u8 q4s[4][40];
     for (long it = 0; it < 4000000; it++) {
       for (int k = 0; k < 40; k++) t[k] = (u8)("0123456789,\"c_ /:9a"[next() % 19]);
       const u32 nd = 1 + (u32)(next() % 8);
@@ -3048,6 +3052,32 @@ static int selftest() {
       if (camp_fast(t, (u32)len) != camp_of(t, (u32)len)) {
         if (bad3 < 10) fprintf(stderr, "CAMPAIGN MISMATCH '%.*s'\n", len, c);
         bad3++;
+      }
+      // the same through the four-lane decoder of the dense click parse and its table rule
+      {
+        const u32 j = (u32)(it & 3);
+        memcpy(&q4raw[j], t + 2, 8);
+        q4ln[j] = (u32)len;
+        q4pre[j] = t[0] == 'c' && t[1] == '_';
+        memcpy(q4s[j], t, sizeof t);
+        if (j == 3) {
+          __m256i val;
+          const u32 bad = dn::dec10x4(q4raw, q4ln, val);
+          alignas(32) u64 vv[4];
+          _mm256_store_si256((__m256i*)vv, val);
+          for (u32 k = 0; k < 4; k++) {
+            i32 got;
+            if (((bad >> k) & 1) || !q4pre[k])
+              got = camp_of(q4s[k], q4ln[k]);
+            else
+              got = vv[k] < g_camp_by_num.size() ? g_camp_by_num[vv[k]] : -1;
+            n3++;
+            if (got != camp_of(q4s[k], q4ln[k])) {
+              if (bad3 < 10) fprintf(stderr, "CAMPAIGN x4 MISMATCH '%.*s'\n", (int)q4ln[k], (const char*)q4s[k]);
+              bad3++;
+            }
+          }
+        }
       }
     }
     g_camp_by_num = saved_num;

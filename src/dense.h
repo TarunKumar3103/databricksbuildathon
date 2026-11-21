@@ -855,12 +855,37 @@ static NOINLINE u64 parse_event_chunk(const u8* begin, const u8* end, bool skip_
 // Click lines -> C16 records by person index.
 struct CkB : Cols<4, 64> {
   alignas(32) u64 kq[CAP + 8], uq[CAP + 8];  // the 8 bytes after the prefix of click_id / user_id
+  alignas(32) u64 cq[CAP + 8];               // the 8 bytes after the "c_" of campaign_id
   alignas(32) u8 pfx[CAP + 8];               // nonzero: a prefix byte is not the expected one
+  alignas(32) u8 cpx[CAP + 8];               // nonzero: campaign_id does not start with "c_"
   alignas(32) u64 kv[CAP + 8];   // number of the click_id
+  alignas(32) u64 cv[CAP + 8];   // number of the campaign_id (when it is canonical)
   alignas(32) u32 num[CAP + 8];  // user number
+  alignas(32) i32 camp[CAP + 8];  // campaign index, -1 if not a campaign
   alignas(32) i64 ts[CAP + 8];
+  alignas(32) C16 rec[CAP + 8];   // the record of a line
+  alignas(32) u32 part[CAP + 8];  // ... and its partition
   u32 lst[4][CAP + 8];
 };
+
+// Four campaign numbers: "c_" and then 1 to 8 decimal digits, no leading zero unless the number is 0 itself.
+// raw: the 8 bytes after "c_"; ln: the lengths of the whole IDs. Returns the lanes that are not of that form
+// (their value is unspecified); the form itself is what camp_of accepts on its fast path.
+static FORCE_INLINE u32 dec10x4(const u64* raw, const u32* ln, __m256i& val) {
+  // the digits go to the top bytes: the first one to byte 8 - nd, the bytes before it become '0'
+  const __m256i sh = _mm256_sub_epi64(_mm256_set1_epi64x(80), _mm256_slli_epi64(_mm256_cvtepu32_epi64(_mm_load_si128((const __m128i*)ln)), 3));
+  const __m256i x = _mm256_or_si256(_mm256_sllv_epi64(_mm256_load_si256((const __m256i*)raw), sh),
+                                    _mm256_andnot_si256(_mm256_sllv_epi64(_mm256_set1_epi64x(-1), sh), _mm256_set1_epi8('0')));
+  const __m256i d = _mm256_sub_epi8(x, _mm256_set1_epi8('0'));
+  const __m256i over = _mm256_subs_epu8(d, _mm256_set1_epi8(9));                              // a byte that is no digit
+  const __m256i lead = _mm256_and_si256(_mm256_srlv_epi64(d, sh), _mm256_set1_epi64x(0xFF));  // the first digit
+  const __m256i one = _mm256_set1_epi64x(56);  // the shift of a single digit
+  const u32 bad = nz64x4(over) | ((0xF ^ nz64x4(lead)) & nz64x4(_mm256_xor_si256(sh, one))) | gtu64x4(sh, one);
+  const __m256i m1 = _mm256_maddubs_epi16(d, _mm256_set1_epi16(0x010A));     // digit pairs: 10 * hi + lo
+  const __m256i m2 = _mm256_madd_epi16(m1, _mm256_set1_epi32(0x00010064));  // four digits: 100 * hi + lo
+  val = _mm256_add_epi64(_mm256_mul_epu32(m2, _mm256_set1_epi64x(10000)), _mm256_srli_epi64(m2, 32));
+  return bad;
+}
 
 static NOINLINE void ck_ts_exact(CkB& B, u32 i, const u8* base) {
   if (!parse_ts(base + B.st[3][i], B.ln[3][i], B.ts[i])) B.ts[i] = INT64_MIN;
@@ -891,25 +916,34 @@ static NOINLINE u32 process_clicks(CkB& B, const u8* const base, WCScatter<C16>:
   for (u32 i = 0; i < n; i++) {
     const u8* const s0 = base + B.st[0][i];
     const u8* const s1 = base + B.st[1][i];
+    const u8* const s2 = base + B.st[2][i];
     memcpy(&B.kq[i], s0 + 1, 8);
     memcpy(&B.uq[i], s1 + 1, 8);
+    memcpy(&B.cq[i], s2 + 2, 8);
+    u16 c2;
+    memcpy(&c2, s2, 2);
     B.pfx[i] = (u8)((s0[0] ^ 'k') | (s1[0] ^ 'u'));
+    B.cpx[i] = (u8)(c2 != 0x5F63);  // "c_"
   }
   u64 irr = nonzero64(B.pfx);
+  u64 cslow = nonzero64(B.cpx);  // campaign IDs that are not "c_" + a canonical number: camp_of decides
   {
     const __m256i ukey = _mm256_set1_epi64x((long long)g_ukey);
     const __m256i M = _mm256_set1_epi64x((long long)M40);
     const __m256i umax = _mm256_set1_epi64x((long long)(((u64)g_nu_cap << 9) - 1));
     for (u32 i = 0; i < n; i += 4) {
-      __m256i vk, vu;
+      __m256i vk, vu, vc;
       u32 bk = ids4(B.kq + i, B.ln[0] + i, vk);
       u32 bu = ids4(B.uq + i, B.ln[1] + i, vu);
+      const u32 bc = dec10x4(B.cq + i, B.ln[2] + i, vc);
       const __m256i num = unscramble4(vu, ukey);
       bk |= gtu64x4(vk, M);
       bu |= gtu64x4(vu, M) | gtu64x4(num, umax);
       _mm256_store_si256((__m256i*)(B.kv + i), vk);
+      _mm256_store_si256((__m256i*)(B.cv + i), vc);
       _mm_store_si128((__m128i*)(B.num + i), low32x4(num));
       irr |= (u64)(bk | bu) << i;
+      cslow |= (u64)bc << i;
     }
   }
   u32 cnt[4] = {0, 0, 0, 0};
@@ -962,19 +996,48 @@ static NOINLINE u32 process_clicks(CkB& B, const u8* const base, WCScatter<C16>:
   }
   for (u32 j = 0; j < cnt[3]; j++) ck_ts_exact(B, B.lst[3][j], base);
   const u64 wlen = (u64)(we - cws);
-  auto cur = cur_out;
-  for (u64 m = kept; m; m = _blsr_u64(m)) {
+  static const i32 no_camp = -1;  // (the table can be empty)
+  const u64 ncamp_tab = g_camp_by_num.size();
+  const i32* const camp_tab = ncamp_tab ? g_camp_by_num.data() : &no_camp;
+  // the campaigns: a canonical number looks up the table (out of it: not a campaign); anything else -> camp_of
+  for (u32 i = 0; i < n; i++) {
+    const u64 cn = B.cv[i];
+    const bool in_tab = cn < ncamp_tab;
+    const i32 c = camp_tab[in_tab ? cn : 0];
+    B.camp[i] = in_tab ? c : -1;
+  }
+  for (u64 m = cslow & kept; m; m = _blsr_u64(m)) {
     const u32 i = (u32)_tzcnt_u64(m);
-    const i32 camp = camp_fast(base + B.st[2][i], B.ln[2][i]);
-    const u64 rel = (u64)B.ts[i] - (u64)cws;  // in [0, wlen) iff the click is inside [window start - 7 days, window end)
-    if (__builtin_expect(!((rel < wlen) & (camp >= 0)), 0)) continue;
-    if (__builtin_expect((irr >> i) & 1, 0)) {
-      ck_slow(tl, B, i, base, (u32)rel, (u32)camp);
-      continue;
+    B.camp[i] = camp_of(base + B.st[2][i], B.ln[2][i]);
+  }
+  // the records, four lines at a time; a line is good when its ts is in the click window and it has a campaign
+  u64 good = 0;
+  {
+    const __m256i vcws = _mm256_set1_epi64x(cws), vwlen = _mm256_set1_epi64x((long long)wlen), lo32 = _mm256_set1_epi64x(0xFFFFFFFFLL);
+    for (u32 i = 0; i < n; i += 4) {
+      const __m256i rel = _mm256_sub_epi64(_mm256_load_si256((const __m256i*)(B.ts + i)), vcws);
+      const __m128i c4 = _mm_load_si128((const __m128i*)(B.camp + i));
+      const __m128i n4 = _mm_load_si128((const __m128i*)(B.num + i));
+      // rel in [0, wlen) (unsigned), and a campaign (sign bit clear)
+      const u32 ok = gtu64x4(vwlen, rel) & ~(u32)_mm_movemask_ps(_mm_castsi128_ps(c4)) & 0xF;
+      const __m256i w0 = _mm256_or_si256(_mm256_and_si256(rel, lo32), _mm256_slli_epi64(_mm256_cvtepu32_epi64(n4), 32));
+      const __m256i w1 = _mm256_or_si256(_mm256_load_si256((const __m256i*)(B.kv + i)), _mm256_slli_epi64(_mm256_cvtepu32_epi64(c4), 40));
+      const __m256i lo = _mm256_unpacklo_epi64(w0, w1), hi = _mm256_unpackhi_epi64(w0, w1);  // records 0, 2 / 1, 3
+      _mm256_store_si256((__m256i*)(B.rec + i), _mm256_permute2x128_si256(lo, hi, 0x20));
+      _mm256_store_si256((__m256i*)(B.rec + i + 2), _mm256_permute2x128_si256(lo, hi, 0x31));
+      _mm_store_si128((__m128i*)(B.part + i), _mm_srli_epi32(n4, 9 + KC));
+      good |= (u64)ok << i;
     }
-    const u64 w0 = (u64)(u32)rel | ((u64)B.num[i] << 32);
-    const u64 w1 = B.kv[i] | ((u64)(u32)camp << 40);
-    WCScatter<C16>::push16(cur, B.num[i] >> (9 + KC), _mm_set_epi64x((long long)w1, (long long)w0));
+  }
+  good &= kept;
+  auto cur = cur_out;
+  for (u64 m = good & ~irr; m; m = _blsr_u64(m)) {
+    const u32 i = (u32)_tzcnt_u64(m);
+    WCScatter<C16>::push16(cur, B.part[i], _mm_load_si128((const __m128i*)&B.rec[i]));
+  }
+  for (u64 m = good & irr; m; m = _blsr_u64(m)) {
+    const u32 i = (u32)_tzcnt_u64(m);
+    ck_slow(tl, B, i, base, (u32)((u64)B.ts[i] - (u64)cws), (u32)B.camp[i]);
   }
   cur_out = cur;
   B.n = 0;
