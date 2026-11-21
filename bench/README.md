@@ -73,7 +73,7 @@ DATA_DIR=data/dev1 OUTPUT_DIR=/tmp/out SCRATCH_DIR=/tmp/scr BENCH_DIR=<folder wi
 
 `BENCH_SIZES` is `events M : clicks M : rounds` per size.
 
-## Bench 8 (B, branch b-probe): where the cycles go, and the floors
+## Bench 9 (B, branch b-probe): where the cycles go, and the floors
 
 Four builds: `v` (v4 cf4f788, scored 0.38), `b` (b-v4n d720cb5), `s` (d720cb5 built with `-DSTAGES` and a
 profile of its own, source in `bench/variants/d720cb5-stg`) and `f` (`s` with `SS_SOL=1`). `BENCH_STAGES=s`

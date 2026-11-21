@@ -310,7 +310,7 @@ struct Run {
   int status = 0;
   char route = '?';
   bool ok = false;
-  std::string stg, pf, sol;  // a probe build's STAGES, PERF and SOL lines (bench 8)
+  std::string stg, pf, sol;  // a probe build's STAGES, PERF and SOL lines (bench 9)
 };
 // ms of the log line "[ seconds] <key>...": the first such line, or the last one
 static double log_at(const std::string& e, const char* key, bool last) {
@@ -473,7 +473,7 @@ int main() {
   const double tmax = atof(env_or("BENCH_TMAX", "150").c_str());
   const std::string seed = env_or("BENCH_SEED", "20261122");
   tl_tag = env_or("BENCH_TIMELINE", "");  // the build whose phase timeline the report gives
-  const std::string stg_tag = env_or("BENCH_STAGES", ""), sol_tag = env_or("BENCH_SOL", "");  // probe builds (bench 8)
+  const std::string stg_tag = env_or("BENCH_STAGES", ""), sol_tag = env_or("BENCH_SOL", "");  // probe builds (bench 9)
   std::vector<Row> srows;  // their rows, one per size
   g_day = day_of(slurp(data + "/manifest.json"));
   std::vector<Variant> vs = load_variants(dir);
