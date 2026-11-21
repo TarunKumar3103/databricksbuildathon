@@ -801,7 +801,9 @@ static NOINLINE u32 process_events(EvB& B, const u8* const base, WCScatter<D16>:
       const __m256i idx = _mm256_load_si256((const __m256i*)(B.idx + i));
       const __m256i num = _mm256_cvtepu32_epi64(_mm_load_si128((const __m128i*)(B.num + i)));
       // negative if: ts before the window, ts after it, the code out of range (either side), ingest too late
-      const __m256i late = _mm256_sub_epi64(_mm256_add_epi64(late0, rel), mullo64x4(ic1, k1000));
+      // (the low 32 bits of ic1 times 1000 is its product wherever it matters: a code out of [1, 0xFFFFFE] is
+      // caught by the two code terms below either way)
+      const __m256i late = _mm256_sub_epi64(_mm256_add_epi64(late0, rel), _mm256_mul_epu32(ic1, k1000));
       const __m256i neg = _mm256_or_si256(_mm256_or_si256(_mm256_or_si256(rel, _mm256_sub_epi64(wlast, rel)),
                                                           _mm256_or_si256(ic1, _mm256_sub_epi64(cmax, ic1))),
                                           late);
@@ -835,9 +837,12 @@ static NOINLINE u32 process_events(EvB& B, const u8* const base, WCScatter<D16>:
   purch &= kept & ~(irr | bad);
   // ---- the scatter
   auto cur = cur_out;
+  // (c: a copy of the cursor whose address never escapes, so that the compiler keeps it in registers;
+  // cur itself is handed to ev_slow below)
+  auto c = cur;
   for (u64 m = plain; m; m = _blsr_u64(m)) {
     const u32 i = (u32)_tzcnt_u64(m);
-    WCScatter<D16>::push16(cur, B.part[i], _mm_load_si128((const __m128i*)&B.rec[i]));
+    WCScatter<D16>::push16(c, B.part[i], _mm_load_si128((const __m128i*)&B.rec[i]));
   }
   // purchases with a valid price whose category and price fit the record: the plain record and the payload.
   // Anything else about them (a bad price, a payload that does not fit) is left to ev_slow, as before.
@@ -851,8 +856,9 @@ static NOINLINE u32 process_events(EvB& B, const u8* const base, WCScatter<D16>:
     if (cat >= 32 || price >= (1u << 17)) continue;
     plain |= 1ULL << i;
     const u64 w1 = B.rec[i].w1 | ((u64)((cat << 17) | price) << 24);
-    WCScatter<D16>::push16(cur, B.part[i], _mm_set_epi64x((long long)w1, (long long)B.rec[i].w0));
+    WCScatter<D16>::push16(c, B.part[i], _mm_set_epi64x((long long)w1, (long long)B.rec[i].w0));
   }
+  cur = c;
   for (u64 m = kept & ~plain; m; m = _blsr_u64(m)) {
     const u32 i = (u32)_tzcnt_u64(m);
     ev_slow(tl, tid, B, i, !((irr >> i) & 1), base, ws, wlen, cur);
