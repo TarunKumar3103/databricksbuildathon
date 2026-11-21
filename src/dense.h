@@ -423,6 +423,9 @@ struct Cols {
 
 // Event lines -> D16 records by event index.
 struct EvB : Cols<7, 64> {
+  alignas(32) u64 eq[CAP + 8], uq[CAP + 8];  // the 8 bytes after the prefix of event_id / user_id
+  alignas(32) u32 w4[CAP + 8];               // the first 4 bytes of event_type
+  alignas(32) u8 pfx[CAP + 8];               // nonzero: a prefix byte is not the expected one
   alignas(32) u64 idx[CAP + 8];    // event index
   alignas(32) u32 num[CAP + 8];    // user number
   alignas(32) i64 ts[CAP + 8];     // ms, TS_NONE if not a timestamp
@@ -515,17 +518,21 @@ static NOINLINE void ev_slow(TL& tl, int tid, EvB& B, u32 i, bool regular, const
   WCScatter<D16>::push16(cur, (u32)(idx >> KE), _mm_set_epi64x((long long)w1, (long long)w0));
 }
 
-// The IDs of four lines: the bytes after the prefix of field f, gathered and decoded. val gets the numbers;
-// the result has a bit per line whose ID is not a prefix byte `pre` and 1..8 base-36 digits without a
-// leading zero.
-static FORCE_INLINE u32 ids4(const u8* base, const u32* st, const u32* ln, u8 pre, __m256i& val) {
-  const __m128i s = _mm_load_si128((const __m128i*)st);
-  const __m256i raw = _mm256_i32gather_epi64((const long long*)(base + 1), s, 1);
+// The IDs of four lines, from the 8 bytes after their prefix and their field lengths. val gets the numbers;
+// the result has a bit per line whose ID is not 1..8 base-36 digits without a leading zero (the prefix byte
+// is checked separately).
+// (The bytes are fetched with plain loads, one line at a time, not with gather instructions: on the scorer's
+// processors those are slow.)
+static FORCE_INLINE u32 ids4(const u64* raw, const u32* ln, __m256i& val) {
   const __m256i sh = _mm256_sub_epi64(_mm256_set1_epi64x(72), _mm256_slli_epi64(_mm256_cvtepu32_epi64(_mm_load_si128((const __m128i*)ln)), 3));
-  u32 bad = b36x4(raw, sh, val);
-  const __m128i p = _mm_and_si128(_mm_i32gather_epi32((const int*)base, s, 1), _mm_set1_epi32(0xFF));
-  bad |= 0xF ^ (u32)_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(p, _mm_set1_epi32(pre))));
-  return bad;
+  return b36x4(_mm256_load_si256((const __m256i*)raw), sh, val);
+}
+// The lines (a bit each) whose byte in f is not 0; f has 64 bytes.
+static FORCE_INLINE u64 nonzero64(const u8* f) {
+  const __m256i z = _mm256_setzero_si256();
+  const u32 a = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_load_si256((const __m256i*)f), z));
+  const u32 b = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_load_si256((const __m256i*)(f + 32)), z));
+  return ~((u64)a | ((u64)b << 32));
 }
 
 // One batch. Returns the number of its lines that have an event_id.
@@ -534,8 +541,17 @@ static NOINLINE u32 process_events(EvB& B, const u8* const base, WCScatter<D16>:
   const u32 n = B.n;
   B.pad();
   const u64 nmask = n >= 64 ? ~0ULL : ((1ULL << n) - 1);
+  // ---- the bytes the vector code needs, fetched line by line
+  for (u32 i = 0; i < n; i++) {
+    const u8* const s0 = base + B.st[0][i];
+    const u8* const s1 = base + B.st[1][i];
+    memcpy(&B.eq[i], s0 + 1, 8);
+    memcpy(&B.uq[i], s1 + 1, 8);
+    B.pfx[i] = (u8)((s0[0] ^ 'e') | (s1[0] ^ 'u'));
+    memcpy(&B.w4[i], base + B.st[4][i], 4);
+  }
   // ---- IDs -> event index, user number; four lines at a time
-  u64 irr = 0;  // lines with an ID that is not regular
+  u64 irr = nonzero64(B.pfx);  // lines with an ID that is not regular
   {
     const __m256i ekey = _mm256_set1_epi64x((long long)g_ekey), ukey = _mm256_set1_epi64x((long long)g_ukey);
     const __m256i M = _mm256_set1_epi64x((long long)M40);
@@ -543,8 +559,8 @@ static NOINLINE u32 process_events(EvB& B, const u8* const base, WCScatter<D16>:
     const __m256i emax = _mm256_set1_epi64x((long long)(g_ne_cap - 1)), umax = _mm256_set1_epi64x((long long)(((u64)g_nu_cap << 9) - 1));
     for (u32 i = 0; i < n; i += 4) {
       __m256i ve, vu;
-      u32 be = ids4(base, B.st[0] + i, B.ln[0] + i, 'e', ve);
-      u32 bu = ids4(base, B.st[1] + i, B.ln[1] + i, 'u', vu);
+      u32 be = ids4(B.eq + i, B.ln[0] + i, ve);
+      u32 bu = ids4(B.uq + i, B.ln[1] + i, vu);
       const __m256i idx = unscramble4(ve, ekey), num = unscramble4(vu, ukey);
       be |= gtu64x4(ve, M) | gtu64x4(idx, emax);
       bu |= gtu64x4(vu, M) | gtu64x4(num, umax);
@@ -634,7 +650,7 @@ static NOINLINE u32 process_events(EvB& B, const u8* const base, WCScatter<D16>:
     const __m256i zero = _mm256_setzero_si256(), c4 = _mm256_set1_epi32(4);
     const __m256i view = _mm256_set1_epi32(0x77656976), cart = _mm256_set1_epi32(0x74726163);
     for (u32 i = 0; i < n; i += 8) {
-      const __m256i w4 = _mm256_i32gather_epi32((const int*)base, _mm256_load_si256((const __m256i*)(B.st[4] + i)), 1);
+      const __m256i w4 = _mm256_load_si256((const __m256i*)(B.w4 + i));
       const u32 simple = eq32x8(_mm256_load_si256((const __m256i*)(B.ln[4] + i)), c4) & (eq32x8(w4, view) | eq32x8(w4, cart));
       const u32 empty = eq32x8(_mm256_load_si256((const __m256i*)(B.ln[1] + i)), zero) | eq32x8(_mm256_load_si256((const __m256i*)(B.ln[5] + i)), zero);
       const u32 noid = eq32x8(_mm256_load_si256((const __m256i*)(B.ln[0] + i)), zero);
@@ -685,6 +701,8 @@ static NOINLINE u64 parse_event_chunk(const u8* begin, const u8* end, bool skip_
 
 // Click lines -> C16 records by person index.
 struct CkB : Cols<4, 64> {
+  alignas(32) u64 kq[CAP + 8], uq[CAP + 8];  // the 8 bytes after the prefix of click_id / user_id
+  alignas(32) u8 pfx[CAP + 8];               // nonzero: a prefix byte is not the expected one
   alignas(32) u64 kv[CAP + 8];   // number of the click_id
   alignas(32) u32 num[CAP + 8];  // user number
   alignas(32) i64 ts[CAP + 8];
@@ -717,15 +735,22 @@ static NOINLINE u32 process_clicks(CkB& B, const u8* const base, WCScatter<C16>:
   const u32 n = B.n;
   B.pad();
   const u64 nmask = n >= 64 ? ~0ULL : ((1ULL << n) - 1);
-  u64 irr = 0;
+  for (u32 i = 0; i < n; i++) {
+    const u8* const s0 = base + B.st[0][i];
+    const u8* const s1 = base + B.st[1][i];
+    memcpy(&B.kq[i], s0 + 1, 8);
+    memcpy(&B.uq[i], s1 + 1, 8);
+    B.pfx[i] = (u8)((s0[0] ^ 'k') | (s1[0] ^ 'u'));
+  }
+  u64 irr = nonzero64(B.pfx);
   {
     const __m256i ukey = _mm256_set1_epi64x((long long)g_ukey);
     const __m256i M = _mm256_set1_epi64x((long long)M40);
     const __m256i umax = _mm256_set1_epi64x((long long)(((u64)g_nu_cap << 9) - 1));
     for (u32 i = 0; i < n; i += 4) {
       __m256i vk, vu;
-      u32 bk = ids4(base, B.st[0] + i, B.ln[0] + i, 'k', vk);
-      u32 bu = ids4(base, B.st[1] + i, B.ln[1] + i, 'u', vu);
+      u32 bk = ids4(B.kq + i, B.ln[0] + i, vk);
+      u32 bu = ids4(B.uq + i, B.ln[1] + i, vu);
       const __m256i num = unscramble4(vu, ukey);
       bk |= gtu64x4(vk, M);
       bu |= gtu64x4(vu, M) | gtu64x4(num, umax);
