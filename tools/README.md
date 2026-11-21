@@ -40,8 +40,9 @@ make fuzz                                     # only when src/scan.h changed
 
 The dense route (`src/dense.h`) relies on the shape the generator gives the data and checks that shape at run time.
 `tools/mut/mutate.py` copies a generated set and breaks one assumption at a time (users swapped between events,
-timestamps moved, links added or removed, upper-cased and malformed IDs, aliases outside the linked set, prices
-too large for the compact record, earlier copies of events under another user, exact repeats). `loop.sh` runs every
+timestamps moved, links added or removed, links between other aliases of a person, upper-cased and malformed IDs,
+aliases outside the linked set, prices too large for the compact record, earlier copies of events under another
+user, exact repeats). `loop.sh` runs every
 mode for a range of seeds and compares the binary's output with the general route (`SS_DENSE=0`, or the binary in
 `$SS_ORACLE`). Any change to the dense route needs this, and any new assumption needs a new mode that breaks it.
 

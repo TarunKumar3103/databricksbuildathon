@@ -1326,25 +1326,36 @@ static void load_lookups(const std::string& data) {
     std::vector<std::pair<std::string, u32>> other;
     std::unordered_map<std::string, u32> seen_other;
     u32 maxnum = 0;
-    u32 last_cat = UINT32_MAX;
+    // category index: a small direct-mapped cache on the length and the first 8 bytes of the name, in front
+    // of a linear scan (there are only a few categories, and nearly every line hits the cache)
+    struct CatSlot {
+      u64 sig;
+      u32 len, ci;
+    };
+    CatSlot ccache[64];
+    for (auto& c : ccache) c = CatSlot{0, 0, UINT32_MAX};
     scan_chunk<2>((const u8*)sbuf.data(), (const u8*)sbuf.data() + sn, true, [&](const u8* sb, const u32* fo, const u32* fl) {
-      // category index (linear scan with a one-entry cache; there are only a few categories)
+      const u8* const cn = sb + fo[1];
+      const u32 cl = fl[1];
+      u64 sig;
+      memcpy(&sig, cn, 8);  // (64 readable bytes follow the text)
+      if (cl < 8) sig = _bzhi_u64(sig, 8 * cl);
+      CatSlot& cs = ccache[((sig * 0x9E3779B97F4A7C15ULL) >> 58) ^ (cl & 63)];
       u32 ci = UINT32_MAX;
-      if (last_cat != UINT32_MAX && cat_names[last_cat].size() == fl[1] &&
-          memcmp(cat_names[last_cat].data(), (sb + fo[1]), fl[1]) == 0)
-        ci = last_cat;
-      else {
+      if (cs.ci != UINT32_MAX && cs.sig == sig && cs.len == cl && (cl <= 8 || memcmp(cat_names[cs.ci].data(), cn, cl) == 0)) {
+        ci = cs.ci;
+      } else {
         for (u32 i = 0; i < cat_names.size(); i++)
-          if (cat_names[i].size() == fl[1] && memcmp(cat_names[i].data(), (sb + fo[1]), fl[1]) == 0) {
+          if (cat_names[i].size() == cl && memcmp(cat_names[i].data(), cn, cl) == 0) {
             ci = i;
             break;
           }
         if (ci == UINT32_MAX) {
           ci = (u32)cat_names.size();
-          cat_names.emplace_back((const char*)(sb + fo[1]), fl[1]);
+          cat_names.emplace_back((const char*)cn, cl);
           if (cat_names.size() > 4096) die("too many categories");
         }
-        last_cat = ci;
+        cs = CatSlot{sig, cl, ci};
       }
       const u8* id = (sb + fo[0]);
       u32 n = fl[0];
@@ -1482,38 +1493,11 @@ static NOINLINE u64 parse_link_chunk(const u8* begin, const u8* end, bool skip_h
   return nl + n;
 }
 
-namespace dn {
-static std::atomic<u64>* g_acc = nullptr;  // per person index: what the links say about it (dense.h)
-static FORCE_INLINE u32 reg_user_of_hash(u64 h);
-static FORCE_INLINE void link_member_num(u32 x, u32 r);
-}  // namespace dn
-
-static void build_links(std::vector<MFile>& files) {
-  std::vector<Chunk> chunks;
-  make_chunks(files, 1 << 18, chunks);
-  if (chunks.empty()) return;
-  const int nchunks = (int)chunks.size();
-  // An upper bound on the number of link lines sizes the table: at most two new IDs per line.
-  std::vector<size_t> part(nchunks, 0);
-  parallel_for(nchunks, [&](int t, int) {
-    const Chunk& c = chunks[t];
-    part[t] = count_newlines(files[c.file].data + c.nominal, c.nominal_end - c.nominal);
-  });
-  size_t max_lines = files.size();  // a last line without a newline
-  for (size_t c : part) max_lines += c;
-  g_Hbits = std::max<u32>(10, ceil_log2(max_lines * 3 + 1));  // load <= 2/3 even if every ID is new
+// What is left to do once every link is joined in H (g_Hbits slots): two passes over the table, both in runs
+// of SUB slots: the used slots of a run are listed without branching while the slots they point at are
+// prefetched, then the listed slots are processed. nlinks is only reported.
+static void finish_links(size_t nlinks) {
   const u64 nslots = 1ULL << g_Hbits;
-  g_H = (HSlot*)vm_alloc(sizeof(HSlot) * nslots);
-  parallel_for(nchunks, [&](int t, int) {
-    const Chunk& c = chunks[t];
-    const MFile& f = files[c.file];
-    size_t b = line_start_at_or_after(f, c.nominal), e = line_start_at_or_after(f, c.nominal_end);
-    part[t] = b < e ? parse_link_chunk(f.data + b, f.data + e, b == 0) : 0;
-  });
-  size_t nlinks = 0;
-  for (size_t c : part) nlinks += c;
-  // Two passes over the table, both in runs of SUB slots: the used slots of a run are listed without
-  // branching while the slots they point at are prefetched, then the listed slots are processed.
   const int ntask = (int)std::min<u64>(nslots >> 10, 1024);
   const u64 mask = nslots - 1;
   constexpr u32 SUB = 256;
@@ -1560,8 +1544,6 @@ static void build_links(std::vector<MFile>& files) {
     const u64 a = nslots * t / ntask, b = nslots * (t + 1) / ntask;
     const u32 fs = g_Fshift;
     u32 idx[SUB];
-    u32 xnum[SUB];  // (dense path) the user number of each listed ID
-    const bool dense = dn::g_acc != nullptr;
     for (u64 s0 = a; s0 < b; s0 += SUB) {
       const u32 m = (u32)std::min<u64>(SUB, b - s0);
       u32 n = 0;
@@ -1571,22 +1553,14 @@ static void build_links(std::vector<MFile>& files) {
         n += sl.key != 0;
         _mm_prefetch((const char*)&g_H[(sl.val - 1) & mask], _MM_HINT_T0);
       }
-      if (dense)
-        for (u32 k = 0; k < n; k++) {
-          const u32 x = dn::reg_user_of_hash(g_H[s0 + idx[k]].key);
-          xnum[k] = x;
-          __builtin_prefetch(&dn::g_acc[x == 0xFFFFFFFFu ? 0 : (x >> 9)], 1, 3);
-        }
       for (u32 k = 0; k < n; k++) {
         HSlot& sl = g_H[s0 + idx[k]];
         const u64 v = sl.val;
         if (v) {
           sl.val = g_H[v - 1].key;
           __atomic_fetch_or(&g_F[sl.key >> fs], f_bits(sl.key, fs), __ATOMIC_RELAXED);
-          if (dense) dn::link_member_num(xnum[k], dn::reg_user_of_hash(sl.val));
         } else {
           sl.val = sl.key;
-          if (dense) dn::link_member_num(xnum[k], xnum[k]);
         }
       }
     }
@@ -1594,6 +1568,37 @@ static void build_links(std::vector<MFile>& files) {
   LOG("links: %zu lines, %zu ids in %llu slots, %zu with another name; filter %llu KB", nlinks, ids,
       (unsigned long long)nslots, remap, (unsigned long long)(words * 8 / 1024));
 }
+
+// The general link phase: every ID of every link line goes into H.
+static void build_links(std::vector<MFile>& files) {
+  std::vector<Chunk> chunks;
+  make_chunks(files, 1 << 18, chunks);
+  if (chunks.empty()) return;
+  const int nchunks = (int)chunks.size();
+  // An upper bound on the number of link lines sizes the table: at most two new IDs per line.
+  std::vector<size_t> part(nchunks, 0);
+  parallel_for(nchunks, [&](int t, int) {
+    const Chunk& c = chunks[t];
+    part[t] = count_newlines(files[c.file].data + c.nominal, c.nominal_end - c.nominal);
+  });
+  size_t max_lines = files.size();  // a last line without a newline
+  for (size_t c : part) max_lines += c;
+  g_Hbits = std::max<u32>(10, ceil_log2(max_lines * 2 + 2));  // more slots than IDs even if every ID is new
+  g_H = (HSlot*)vm_alloc(sizeof(HSlot) << g_Hbits);
+  parallel_for(nchunks, [&](int t, int) {
+    const Chunk& c = chunks[t];
+    const MFile& f = files[c.file];
+    size_t b = line_start_at_or_after(f, c.nominal), e = line_start_at_or_after(f, c.nominal_end);
+    part[t] = b < e ? parse_link_chunk(f.data + b, f.data + e, b == 0) : 0;
+  });
+  size_t nlinks = 0;
+  for (size_t c : part) nlinks += c;
+  finish_links(nlinks);
+}
+
+namespace dn {
+static std::atomic<u64>* g_acc = nullptr;  // per person index: what the links say about it (dense.h)
+}  // namespace dn
 
 // ------------------------------------------------------------------------------------------
 // events + clicks parsing
@@ -3179,7 +3184,10 @@ int main(int argc, char** argv) {
     }
   });
   g_phase = 1;
-  build_links(lk);
+  if (dn::g_on)
+    dn::build_links_dense(lk);
+  else
+    build_links(lk);
   setup.join();
   LOG("lookups: window %lld..%lld, %zu categories, %u campaigns, %d days", (long long)g_ws, (long long)g_we,
       g_cats.size(), g_ncamp, g_ndays);
@@ -3231,9 +3239,17 @@ int main(int argc, char** argv) {
   if (dn::g_on) {
     // The data does not have the shape the dense path needs: start over with the general pipeline.
     LOG("dense path given up (%s): general pipeline", dn::g_fail_why);
-    for (auto& t : g_tl)  // (the records of the attempt; the link table stays)
+    for (auto& t : g_tl)  // (the records of the attempt)
       for (auto& sl : t.arena.slabs) madvise(sl.first, sl.second, MADV_DONTNEED);
     dn::g_acc = nullptr;
+    // The link table of the attempt holds only the links that the words of the dense path could not: the
+    // general pipeline needs all of them.
+    g_H = nullptr;
+    g_F = nullptr;
+    g_Fshift = 63;
+    g_Hbits = 0;
+    g_phase = 1;
+    build_links(lk);
     g_P1bits = P1bits_gen;
     g_P2bits = P2bits_gen;
     g_tl.clear();

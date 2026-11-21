@@ -15,9 +15,15 @@ invertible mixing function with one secret key per kind of ID. The keys are foun
   with the smallest `ingest_ts` keeps the slot) and the sort in one pass over memory that fits the L2 cache. A
   person's events then follow one another in time order, so sessions, rows and campaign counts come out of one
   sequential scan with no hash table and no sort.
-- A user number is (person index << 9) + alias. The link phase works out, per person index, whether its link
-  set is exactly the aliases 0..n-1 of that index and nothing else. Such persons are grouped and named by
-  index alone; their clicks are partitioned by person index and joined in the same scan.
+- A user number is (person index << 9) + alias, and nearly every link line joins two aliases of one index.
+  Such a line never reaches the link hash table: it is recorded in one 64-bit word per person index, a small
+  union-find over the aliases 0..9 (four bits per alias for the smallest alias of its set, updated with
+  compare-and-swap by all threads). Lines that do not fit a word (another kind of ID, two indexes, an alias
+  of 10 or more) go to the general table and mark their indexes. When all links are read, an index has a
+  "dense" person if it is unmarked and its linked aliases are one set, exactly the aliases 0..n-1 (or alias 0
+  is in no link at all); the links inside every other word are added to the general table, which so holds a
+  few thousand IDs instead of millions. Dense persons are grouped and named by index alone; their clicks are
+  partitioned by person index and joined in the same scan.
 - The CSV scanner hands the lines over eight at a time as columns (an 8 x 8 transpose of the separator
   offsets), so the per-line work that follows is vector work on columns: IDs are decoded four at
   a time (digits, range and leading-zero checks, the two multiplications of the inverse mixing), the lines

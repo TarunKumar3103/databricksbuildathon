@@ -137,60 +137,213 @@ static i64 g_ing_base = 0;  // ingest_ts is kept as whole seconds since this, pl
 static constexpr u64 ING_SPAN = 0xFFFFFEULL * 1000;
 static constexpr u32 ING_NOCODE = 0xFFFFFF;  // an ingest_ts that does not parse: later than all others
 
-// Per person index, filled in by the link phase. A linked ID x "counts" for its index if x is a regular user
-// ID and the name of its link set (the set's smallest ID) is a regular user ID of the same index:
-//   bits 0..9    how many IDs count
-//   bits 10..27  the sum of their aliases
-//   bits 28..37  how many of them are the name of their set (so: how many sets they are in)
-//   bit 46       alias 0 counts
-//   bit 63       some ID of this index is in a set with an ID that is not a regular ID of this index
+// Per person index, a word that the link phase fills in (g_acc). Nearly every link line joins two aliases of
+// one person index, and such a line only changes this word: it never reaches the general link table H.
+//   bits 0..39   four bits per alias a < KA: the smallest alias of the link set a is in (0 while a is in none)
+//   bits 40..49  the aliases that occur in a link (also in one to themselves)
+//   bits 52..55  set when all links are read: how many aliases the dense person of the index has (see dense_cnt)
 //   bit 62       the person has events or clicks kept outside the partitions (g_extra)
-static constexpr u64 ACC_POISON = 1ULL << 63, ACC_EXTRA = 1ULL << 62, ACC_HAS0 = 1ULL << 46;
+//   bit 63       the index has no dense person. During the link phase: one of its IDs is in a link line that
+//                does not fit the word (the other ID is not a regular ID of this index, or an alias is >= KA).
+// Everything the general pipeline may be asked about is put into H when the links are read: the lines that do
+// not fit a word, and, for every index without a dense person or with links beside it, the links in its word.
+static constexpr u32 KA = 10;
+static constexpr u64 ACC_POISON = 1ULL << 63, ACC_EXTRA = 1ULL << 62, ACC_LAB = (1ULL << (4 * KA)) - 1;
+static constexpr u32 ACC_MSH = 4 * KA, ACC_NSH = 52;
 
 // How many aliases the dense person of an index has: its IDs are exactly the aliases below this, and nothing
 // else is linked to them. 1 if alias 0 is in no link. 0: the index has no dense person (every record of its
-// IDs goes the general way).
-//   Not poisoned means every set that holds an ID of this index holds regular IDs of this index only, so all
-//   their members count. If they are in one set (one of them is a name), alias 0 is among them, and their n
-//   aliases sum to 0 + 1 + .. + n - 1, which only the aliases 0..n-1 do, then that set is exactly those aliases.
+// IDs goes the general way). Valid once the link phase has classified the words.
 static FORCE_INLINE u32 dense_cnt(u64 a) {
   if (__builtin_expect((a & ~ACC_EXTRA) == 0, 1)) return 1;
   if ((i64)a < 0) return 0;
-  if (!(a & ACC_HAS0)) return 1;
-  const u32 n = (u32)a & 0x3FF, sa = (u32)(a >> 10) & 0x3FFFF, sets = (u32)(a >> 28) & 0x3FF;
-  return (sets == 1 && sa * 2 == n * (n - 1)) ? n : 0;
+  return (u32)(a >> ACC_NSH) & 15;
 }
 
-// (person index << 9 | alias) of the link ID whose key has hash h, or NONE if it is not a regular user ID.
-static FORCE_INLINE u32 reg_user_of_hash(u64 h) {
-  const u64 k = unhash_id(h);
-  const u64 w = __builtin_bswap64(_pdep_u64(k, KEY_M7));  // the bytes after the first, zero padded
-  if ((k >> 56) != 'u' || w == 0) return NONE;
-  const u32 n = 8 - ((u32)__builtin_clzll(w) >> 3);  // digits
-  u64 va, vb;
-  const u32 ok = b36_pair((const u8*)&w, n, (const u8*)&w, n, va, vb);
-  if (ok != 0xFFFF || (((u8)w == '0') & (n > 1)) || va > M40) return NONE;
-  const u64 num = unscramble(va, g_ukey);
+// A link between the aliases a and b (both below KA) of person index p: their sets become one in the word.
+// A set is labelled by its smallest alias, so joining two sets relabels the members of the one with the
+// larger label. Any number of threads may do this at once.
+static FORCE_INLINE void link_aliases(u32 p, u32 a, u32 b) {
+  constexpr u64 N1 = 0x1111111111ULL, N7 = 0x7777777777ULL, N8 = 0x8888888888ULL;
+  std::atomic<u64>& word = g_acc[p];
+  u64 cur = word.load(std::memory_order_relaxed);
+  for (;;) {
+    u64 nw = cur;
+    if (!((nw >> (ACC_MSH + a)) & 1)) nw |= (1ULL << (ACC_MSH + a)) | ((u64)a << (4 * a));  // a set of its own
+    if (!((nw >> (ACC_MSH + b)) & 1)) nw |= (1ULL << (ACC_MSH + b)) | ((u64)b << (4 * b));
+    const u32 la = (u32)(nw >> (4 * a)) & 15, lb = (u32)(nw >> (4 * b)) & 15;
+    if (la != lb) {
+      const u64 lo = la < lb ? la : lb, hi = la < lb ? lb : la;
+      const u64 t = (nw & ACC_LAB) ^ (hi * N1);    // a zero nibble where the label is hi (hi > 0: no unused nibble)
+      const u64 z = ~(((t & N7) + N7) | t) & N8;   // the top bit of those nibbles
+      const u64 m = z >> 3;
+      nw = (nw & ~(m * 15)) | (m * lo);
+    }
+    if (nw == cur) return;
+    if (word.compare_exchange_weak(cur, nw, std::memory_order_relaxed)) return;
+  }
+}
+
+// The user number (person index << 9 | alias) of the ID of len bytes at s, or NONE if it is not a regular
+// user ID: 'u', then 1 to 8 base-36 digits without a leading zero, a number below 2^40 whose index is in range.
+// (The same conditions as in the event and click parsers.)
+static inline u32 reg_user(const u8* s, u32 len) {
+  if (len < 2 || len > 9 || s[0] != 'u') return NONE;
+  const u64 v = b36_scalar(s + 1, len - 1);
+  if (v == NOT36) return NONE;
+  const u64 num = unscramble(v, g_ukey);
   return (num >> 9) < g_nu_cap ? (u32)num : NONE;
 }
 
-// Called by the link phase for every linked ID: x and r are the user numbers (or NONE) of the ID and of the
-// name of its set. (An ID is the name of its set exactly when the two are equal.)
-static FORCE_INLINE void link_member_num(u32 x, u32 r) {
-  if (__builtin_expect(x != NONE && r != NONE && (x >> 9) == (r >> 9), 1)) {
-    const u64 a = x & 511;
-    g_acc[x >> 9].fetch_add(1 | (a << 10) | ((u64)(x == r) << 28) | (a == 0 ? ACC_HAS0 : 0), std::memory_order_relaxed);
+static inline u64 person_of(u64 h) { return g_H ? h_lookup(h) : h; }
+
+// ------------------------------------------------------------------------------------------
+// links
+//
+// The link phase of the dense path. A line whose two IDs are regular IDs of one person index, with aliases
+// below KA, is recorded in that index's word (link_aliases) and nowhere else. Any other line is kept for the
+// general link table H, and the indexes of its regular IDs are poisoned. When all lines are read, the words
+// are classified (dense_cnt), the links inside the words that the general pipeline can be asked about are
+// added to the kept lines, and H is built from those alone: thousands of IDs instead of millions.
+
+using LinkList = std::vector<std::array<u64, 2>>;  // links for H: the hashes of the two IDs
+
+// reg_user of the two IDs of a link line, both at once when they have the usual shape (8 readable bytes after
+// the first byte of each are needed, as everywhere).
+static FORCE_INLINE void reg_user_pair(const u8* a, u32 la, const u8* b, u32 lb, const u64 ukey, const u32 nu, u32& x, u32& y) {
+  if (__builtin_expect((la - 2 <= 7) & (lb - 2 <= 7) & (a[0] == 'u') & (b[0] == 'u'), 1)) {
+    u64 va, vb;
+    const u32 ok = b36_pair(a + 1, la - 1, b + 1, lb - 1, va, vb);
+    const u64 na = unscramble(va, ukey), nb = unscramble(vb, ukey);
+    x = (((ok & 0xFF) == 0xFF) & !((a[1] == '0') & (la > 2)) & (va <= M40) & ((na >> 9) < nu)) ? (u32)na : NONE;
+    y = (((ok >> 8) == 0xFF) & !((b[1] == '0') & (lb > 2)) & (vb <= M40) & ((nb >> 9) < nu)) ? (u32)nb : NONE;
   } else {
-    if (x != NONE) g_acc[x >> 9].fetch_or(ACC_POISON, std::memory_order_relaxed);
-    if (r != NONE) g_acc[r >> 9].fetch_or(ACC_POISON, std::memory_order_relaxed);
+    x = reg_user(a, la);
+    y = reg_user(b, lb);
   }
 }
-static inline void link_member(u64 hx, u64 hr) {
-  const u32 x = reg_user_of_hash(hx);
-  link_member_num(x, hx == hr ? x : reg_user_of_hash(hr));
+
+struct LkD {
+  static constexpr u32 CAP = 64;
+  alignas(32) u32 off[CAP][8];
+  alignas(32) u32 len[CAP][8];
+  u32 x[CAP], y[CAP];  // the user numbers of the two IDs, NONE if not regular
+};
+
+static NOINLINE void process_links_dense(LkD& B, const u32 n, const u8* const base, LinkList& keep) {
+  const u64 ukey = g_ukey;
+  const u32 nu = g_nu_cap;
+  for (u32 i = 0; i < n; i++) {
+    const u8* const a = base + B.off[i][0];
+    const u8* const b = base + B.off[i][1];
+    const u32 la = B.len[i][0], lb = B.len[i][1];
+    u32 x, y;
+    reg_user_pair(a, la, b, lb, ukey, nu, x, y);
+    B.x[i] = x;
+    B.y[i] = y;
+    __builtin_prefetch(&g_acc[x == NONE ? 0 : (x >> 9)], 1, 3);
+  }
+  for (u32 i = 0; i < n; i++) {
+    const u32 x = B.x[i], y = B.y[i];
+    if (__builtin_expect((x != NONE) & (y != NONE) & ((x >> 9) == (y >> 9)) & ((x & 511) < KA) & ((y & 511) < KA), 1)) {
+      link_aliases(x >> 9, x & 511, y & 511);
+    } else {
+      keep.push_back({hash_id(make_key(base + B.off[i][0], B.len[i][0])), hash_id(make_key(base + B.off[i][1], B.len[i][1]))});
+      if (x != NONE) g_acc[x >> 9].fetch_or(ACC_POISON, std::memory_order_relaxed);
+      if (y != NONE) g_acc[y >> 9].fetch_or(ACC_POISON, std::memory_order_relaxed);
+    }
+  }
 }
 
-static inline u64 person_of(u64 h) { return g_H ? h_lookup(h) : h; }
+static NOINLINE u64 parse_link_chunk_dense(const u8* begin, const u8* end, bool skip_header, LinkList& keep) {
+  LkD B;
+  u32 n = 0;
+  u64 nl = 0;
+  const u8* base = begin;
+  scan::scan_lines<2>(begin, end, skip_header, [&](const u8* sb, __m256i st, __m256i ln) __attribute__((always_inline)) {
+    _mm256_store_si256((__m256i*)B.off[n], st);
+    _mm256_store_si256((__m256i*)B.len[n], ln);
+    base = sb;
+    // a line with an empty ID links nothing: its slot is reused
+    n += (_mm256_movemask_epi8(_mm256_cmpeq_epi32(ln, _mm256_setzero_si256())) & 0xFF) == 0;
+    if (__builtin_expect(n == LkD::CAP, 0)) {
+      process_links_dense(B, n, sb, keep);
+      nl += n;
+      n = 0;
+    }
+  });
+  if (n) process_links_dense(B, n, base, keep);
+  return nl + n;
+}
+
+static void build_links_dense(std::vector<MFile>& files) {
+  std::vector<Chunk> chunks;
+  make_chunks(files, 1 << 18, chunks);
+  const int nchunks = (int)chunks.size();
+  std::vector<LinkList> keep(NT);  // per thread
+  std::vector<size_t> part(std::max(nchunks, 1), 0);
+  parallel_for(nchunks, [&](int t, int tid) {
+    const Chunk& c = chunks[t];
+    const MFile& f = files[c.file];
+    size_t b = line_start_at_or_after(f, c.nominal), e = line_start_at_or_after(f, c.nominal_end);
+    part[t] = b < e ? parse_link_chunk_dense(f.data + b, f.data + e, b == 0, keep[tid]) : 0;
+  });
+  size_t nlinks = 0, nkept = 0;
+  for (size_t c : part) nlinks += c;
+  for (auto& k : keep) nkept += k.size();
+  // Classify the words. An index has a dense person of n aliases if it is not poisoned and either alias 0 is
+  // in no link (n = 1), or all linked aliases are in one set (every label is 0, the smallest alias) and they
+  // are exactly the aliases 0..n-1. Whatever links a word holds beside its dense person, or without one, go
+  // to H: each member of a set with the set's smallest alias.
+  const u32 nu = g_nu_cap;
+  const int ntask = (int)std::max<u32>(1, std::min<u32>(nu >> 13, 512));
+  std::vector<size_t> ndense(NT, 0);
+  parallel_for(ntask, [&](int t, int tid) {
+    const u32 pa = (u32)((u64)nu * t / ntask), pb = (u32)((u64)nu * (t + 1) / ntask);
+    LinkList& out = keep[tid];
+    const u64 ukey = g_ukey;
+    size_t nd = 0;
+    for (u32 p = pa; p < pb; p++) {
+      const u64 w = g_acc[p].load(std::memory_order_relaxed);
+      if (w == 0) continue;
+      const u32 mask = (u32)(w >> ACC_MSH) & ((1u << KA) - 1);
+      bool general = (i64)w < 0;
+      u32 cnt = 1;
+      if (!general && (mask & 1)) {
+        if ((w & ACC_LAB) == 0 && (mask & (mask + 1)) == 0)
+          cnt = (u32)_mm_popcnt_u32(mask);
+        else
+          general = true;
+      }
+      if (general || !(mask & 1)) {
+        for (u32 m = mask; m; m = _blsr_u32(m)) {
+          const u32 al = (u32)_tzcnt_u32(m), lab = (u32)(w >> (4 * al)) & 15;
+          if (lab != al)
+            out.push_back({hash_id(id_key('u', scramble(((u64)p << 9) | al, ukey))), hash_id(id_key('u', scramble(((u64)p << 9) | lab, ukey)))});
+        }
+      }
+      nd += !general && cnt > 1;
+      g_acc[p].store(general ? ACC_POISON : ((w & ~ACC_POISON) | ((u64)cnt << ACC_NSH)), std::memory_order_relaxed);
+    }
+    ndense[tid] += nd;
+  });
+  size_t npairs = 0, nlinked = 0;
+  for (auto& k : keep) npairs += k.size();
+  for (size_t c : ndense) nlinked += c;
+  // H from the kept links: at most two new IDs per link
+  g_Hbits = std::max<u32>(10, ceil_log2(npairs * 2 + 2));
+  g_H = (HSlot*)vm_alloc(sizeof(HSlot) << g_Hbits);
+  {
+    const u32 hshift = 64 - g_Hbits;
+    const u64 hmask = (1ULL << g_Hbits) - 1;
+    parallel_for(NT, [&](int t, int) {
+      for (const auto& pr : keep[t]) uf_unite(h_slot_for(pr[0], hmask, hshift), h_slot_for(pr[1], hmask, hshift));
+    });
+  }
+  LOG("links (dense): %zu lines, %zu do not fit a word, %zu links to the general table, %zu indexes with linked aliases only",
+      nlinks, nkept, npairs, nlinked);
+  finish_links(nlinks);
+}
 
 // Events and clicks of dense persons that are not in the partitions: events whose event_id is not regular,
 // clicks whose click_id is not. Built after the parse, read-only afterwards.
@@ -1692,7 +1845,77 @@ static long selftest(Next&& next) {
     }
     n++;
   }
-  fprintf(stderr, "selftest ids: %ld cases, %ld mismatches\n", n, bad);
+  // links: the two IDs of a line at once against one at a time; the sets in a word against a plain union-find
+  {
+    const u64 key0 = g_ukey;
+    const u32 cap0 = g_nu_cap;
+    std::atomic<u64>* const acc0 = g_acc;
+    g_ukey = next() & M40;
+    g_nu_cap = 1u << 20;
+    for (int it = 0; it < 1000000; it++) {
+      u8 t[2][24];
+      u32 l[2];
+      for (int k = 0; k < 2; k++) {
+        memset(t[k], ',', 24);
+        const u32 mode = (u32)(next() % 8);
+        if (mode < 5) {  // a user ID as the generator writes it: an index in range, or any number
+          const u64 num = mode < 3 ? next() % ((u64)g_nu_cap << 10) : (next() & M40);
+          t[k][0] = 'u';
+          l[k] = 1 + b36_write(scramble(num, g_ukey), t[k] + 1);
+        } else {  // any text
+          l[k] = (u32)(next() % 12);
+          for (u32 j = 0; j < l[k]; j++)
+            t[k][j] = (j == 0 && next() % 4) ? (u8)'u' : (u8)(mode == 7 && next() % 5 == 0 ? odd[next() % 44] : alpha[next() % 36]);
+        }
+      }
+      u32 x, y;
+      reg_user_pair(t[0], l[0], t[1], l[1], g_ukey, g_nu_cap, x, y);
+      if (x != reg_user(t[0], l[0]) || y != reg_user(t[1], l[1])) {
+        if (bad < 10) fprintf(stderr, "LINK IDS MISMATCH '%.*s' '%.*s'\n", (int)l[0], t[0], (int)l[1], t[1]);
+        bad++;
+      }
+      n++;
+    }
+    std::atomic<u64> word[1];
+    g_acc = word;
+    for (int it = 0; it < 300000; it++) {
+      word[0].store(0);
+      u32 par[KA];
+      bool pres[KA];
+      for (u32 k = 0; k < KA; k++) {
+        par[k] = k;
+        pres[k] = false;
+      }
+      auto find = [&](u32 v) {
+        while (par[v] != v) v = par[v];
+        return v;
+      };
+      const u32 nl = (u32)(next() % 12), range = 1 + (u32)(next() % KA);
+      for (u32 j = 0; j < nl; j++) {
+        const u32 a = (u32)(next() % range), b = next() % 4 == 0 ? a : (u32)(next() % range);
+        link_aliases(0, a, b);
+        pres[a] = pres[b] = true;
+        par[find(a)] = find(b);
+      }
+      const u64 w = word[0].load();
+      for (u32 k = 0; k < KA; k++) {
+        u32 least = k;  // the smallest alias in k's set
+        for (u32 j = 0; j < k; j++)
+          if (pres[j] && find(j) == find(k)) {
+            least = j;
+            break;
+          }
+        const u32 lab = (u32)(w >> (4 * k)) & 15;
+        if ((((w >> (ACC_MSH + k)) & 1) != 0) != pres[k] || lab != (pres[k] ? least : 0)) bad++;
+      }
+      if (w >> (ACC_MSH + KA)) bad++;
+      n++;
+    }
+    g_ukey = key0;
+    g_nu_cap = cap0;
+    g_acc = acc0;
+  }
+  fprintf(stderr, "selftest ids and links: %ld cases, %ld mismatches\n", n, bad);
   return bad;
 }
 

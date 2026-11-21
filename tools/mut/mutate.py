@@ -177,5 +177,35 @@ elif mode == "dupties":
         extra = [l for l in body if plain(l, 4) and random.random() < 0.05]
         return body + extra
     ev(f); ck(g)
+elif mode == "aliaslinks":
+    # links between other aliases of one person: sets that are not the aliases 0..n-1, several sets under one
+    # index, aliases at and beyond the limit of the per-person link word; events and clicks moved onto such aliases
+    AL = [0, 1, 2, 3, 4, 5, 8, 9, 10, 11]
+    def realias(uid, a):
+        n = unum(uid)
+        if n is None or (n >> 9) >= (1 << 22): return uid
+        return "u" + b36(scr((n & ~511) | a, ukey))
+    first = [True]
+    def fl(body):
+        for i, l in enumerate(body):
+            if plain(l, 2) and random.random() < 0.03:
+                p = l.split(","); k = random.choice([0, 1]); p[k] = realias(p[k], random.choice(AL)); body[i] = ",".join(p)
+        if first[0]:
+            first[0] = False
+            for _ in range(400):
+                u = random.choice(allusers)
+                body.append(realias(u, random.choice(AL)) + "," + realias(u, random.choice(AL)))
+        return body
+    def fe(body):
+        for i, l in enumerate(body):
+            if plain(l, 7) and random.random() < 0.02:
+                p = l.split(","); p[1] = realias(p[1], random.choice(AL)); body[i] = ",".join(p)
+        return body
+    def fc(body):
+        for i, l in enumerate(body):
+            if plain(l, 4) and random.random() < 0.03:
+                p = l.split(","); p[1] = realias(p[1], random.choice(AL)); body[i] = ",".join(p)
+        return body
+    lk(fl); ev(fe); ck(fc)
 else:
     sys.exit("unknown mode")

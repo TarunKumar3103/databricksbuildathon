@@ -10,7 +10,7 @@ if [ -z "$UK" ] || [ "$UK" = 0 ]; then echo "no user key found: $BASE is not a g
 oracle() { if [ -n "${SS_ORACLE:-}" ]; then "$SS_ORACLE" "$1" "$2" 2> /dev/null; else SS_DENSE=0 "$BIN" "$1" "$2" 2> /dev/null; fi; }
 n=0; bad=0
 for s in $(seq "$3" "$4"); do
-  for m in ${MODES:-swapusers timeorder crosslinks upper faringest droplinks revised bigprice newalias oddids clickusers dupties}; do
+  for m in ${MODES:-swapusers timeorder crosslinks upper faringest droplinks revised bigprice newalias oddids clickusers dupties aliaslinks}; do
     MSEED=$s python3 "$M/mutate.py" "$BASE" "$T/d" "$m" "$UK" || { echo "$m seed $s: mutate failed"; bad=$((bad + 1)); continue; }
     rm -rf "$T/a" "$T/b"; mkdir -p "$T/a" "$T/b"
     oracle "$T/d" "$T/a"; "$BIN" "$T/d" "$T/b" 2> /dev/null
