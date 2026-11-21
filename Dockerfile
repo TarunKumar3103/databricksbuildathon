@@ -6,7 +6,10 @@ WORKDIR /build
 COPY src/ ./src/
 # -fno-tree-vectorize: the hot loops are vectorised by hand; the auto-vectoriser only gets in the way
 # (it turns runs of scalar stores into slower insert/permute sequences).
+# PROBE BUILD: prints machine details and timings to stderr and writes user_daily empty on purpose, so the
+# dev-set check fails and shows the log. Never submit this commit for a score.
 RUN g++ -std=c++17 -O2 -fno-tree-vectorize -march=cascadelake -mtune=cascadelake -static -pthread \
+        -DPROBE '-DPROBE_BUILD="v3-3e84304"' \
         -o /shopping-sessions src/main.cpp \
  && strip /shopping-sessions
 

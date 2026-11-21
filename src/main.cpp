@@ -124,11 +124,12 @@ static void parallel_threads(F&& f) {
   for (auto& t : th) t.join();
 }
 
+static bool g_thp = true;
 static void* vm_alloc(size_t bytes) {
   if (bytes == 0) bytes = 64;
   void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
   if (p == MAP_FAILED) die("mmap anonymous");
-  madvise(p, bytes, MADV_HUGEPAGE);
+  if (g_thp) madvise(p, bytes, MADV_HUGEPAGE);
   return p;
 }
 
@@ -2506,6 +2507,12 @@ static int selftest() {
 
 static int bench_parse(const char* data, const char* file, int reps);
 
+#ifdef PROBE
+#include <sys/wait.h>
+#include "probe.h"
+static int g_p1_adj = 0, g_p2_adj = 0;
+#endif
+
 int main(int argc, char** argv) {
   g_t0 = now_s();
   if (argc >= 2 && strcmp(argv[1], "--selftest") == 0) return selftest();
@@ -2532,6 +2539,62 @@ int main(int argc, char** argv) {
   }
   NT = std::max(1, std::min(NT, 256));
   init_years();
+#ifdef PROBE
+  bool probe_parent = true;
+  {
+    g_log = true;
+    fprintf(stderr, "PROBE begin (build %s), threads %d\n", PROBE_BUILD, NT);
+    probe::report(data);
+    std::string scratch = getenv("SCRATCH_DIR") ? getenv("SCRATCH_DIR") : "/scratch";
+    // the event parse alone, one thread, on the largest events file
+    {
+      std::string best;
+      size_t mx = 0;
+      for (auto& f : list_csv(data + "/events")) {
+        struct stat st;
+        if (stat(f.c_str(), &st) == 0 && (size_t)st.st_size > mx) {
+          mx = st.st_size;
+          best = f;
+        }
+      }
+      pid_t pid = fork();
+      if (pid == 0) {
+        fprintf(stderr, "PROBE parse benchmark (TSC ticks per line, %zu MB file):\n", mx >> 20);
+        g_log = false;
+        bench_parse(data.c_str(), best.c_str(), 5);
+        _exit(0);
+      }
+      if (pid > 0) waitpid(pid, nullptr, 0);
+    }
+    // the whole pipeline in child processes:
+    //   0: 1 thread   1: all threads   2: all threads, no huge pages   3: 1 thread, 4x the person partitions
+    //   4: all threads, 4x the person partitions   5: all threads, 2x the event partitions   6: all threads again
+    for (int variant = 0; variant < 7; variant++) {
+      pid_t pid = fork();
+      if (pid == 0) {
+        probe_parent = false;
+        if (variant == 0 || variant == 3) NT = 1;
+        if (variant == 2) g_thp = false;
+        if (variant == 3 || variant == 4) g_p2_adj = 2;
+        if (variant == 5) g_p1_adj = 1;
+        out = scratch + "/probe_out" + std::to_string(variant);
+        mkdir(out.c_str(), 0777);
+        fprintf(stderr, "PROBE pipeline variant %d: threads %d, huge pages %s, P1 adj %d, P2 adj %d\n", variant, NT,
+                g_thp ? "advised" : "off", g_p1_adj, g_p2_adj);
+        g_t0 = now_s();
+        fprintf(stderr, "ABS start %.6f\n", g_t0);
+        break;
+      }
+      int st = 0;
+      if (pid > 0) waitpid(pid, &st, 0);
+      fprintf(stderr, "PROBE variant %d: exit observed at ABS %.6f (status %d)\n", variant, now_s(), st);
+    }
+    if (probe_parent) {
+      fprintf(stderr, "PROBE final run: threads %d (user_daily is written empty on purpose)\n", NT);
+      g_t0 = now_s();
+    }
+  }
+#endif
 
   load_lookups(data);
   LOG("lookups: window %lld..%lld, %zu categories, %u campaigns, %d days", (long long)g_ws, (long long)g_we,
@@ -2548,6 +2611,10 @@ int main(int argc, char** argv) {
   u64 est_lines = ev_bytes / 70 + 1;
   g_P1bits = std::min<u32>(12, std::max<u32>(4, ceil_log2(est_lines / 16384 + 1)));
   g_P2bits = std::min<u32>(12, std::max<u32>(4, ceil_log2(est_lines / 32768 + 1)));
+#ifdef PROBE
+  g_P1bits += g_p1_adj;
+  g_P2bits += g_p2_adj;
+#endif
   g_tl.resize(NT);
   for (auto& t : g_tl) {
     t.r1.init(1u << g_P1bits);
@@ -2576,6 +2643,10 @@ int main(int argc, char** argv) {
   person_phase();
   LOG("person phase done");
   g_phase = 5;
+#ifdef PROBE
+  if (probe_parent)
+    for (auto& t : g_tl) t.out.rows.clear();
+#endif
   write_outputs(out);
   LOG("output written");
   if (g_log) {
@@ -2589,6 +2660,16 @@ int main(int argc, char** argv) {
     fprintf(stderr, " | total %.3f   sys s: total %.3f (parse %.3f)\n", tot, tots, g_phase_sys[2].load() / 1e6);
     fprintf(stderr, "ABS end %.6f\n", now_s());
   }
+#ifdef PROBE
+  {
+    struct rusage ru;
+    getrusage(RUSAGE_SELF, &ru);
+    fprintf(stderr, "PROBE rusage: user %.3f sys %.3f maxrss %ld MB minflt %ld majflt %ld nvcsw %ld nivcsw %ld AnonHuge %llu MB\n",
+            ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6, ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6,
+            ru.ru_maxrss / 1024, ru.ru_minflt, ru.ru_majflt, ru.ru_nvcsw, ru.ru_nivcsw,
+            (unsigned long long)(probe::anon_huge_kb() >> 10));
+  }
+#endif
   return 0;
 }
 
