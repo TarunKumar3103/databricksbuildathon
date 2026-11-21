@@ -514,26 +514,16 @@ static void init_daycode() {
     for (int i = 0; i < 416; i++) g_daycode[k][i] = g_dayms[k][i] == DAYMS_NONE ? 0 : (g_dayms[k][i] - g_ing_base) / 1000 + 1;
 }
 
-// Eight 32-bit lanes at a time (mask compares and compress-store with AVX-512, plain AVX2 otherwise).
+// Eight 32-bit lanes at a time (mask compares with AVX-512, plain AVX2 otherwise).
 #if defined(__AVX512VL__) && defined(__AVX512DQ__) && defined(__AVX512F__)
 static FORCE_INLINE __m256i movm32x8(u32 m) { return _mm256_movm_epi32((__mmask8)m); }  // -1 in the lanes of set bits
 static FORCE_INLINE u32 eq32x8(__m256i a, __m256i b) { return _mm256_cmpeq_epi32_mask(a, b); }
-// the indexes first + j of the set bits j of m, appended at dst (which has room for 8); returns how many
-static FORCE_INLINE u32 list8(u32* dst, u32 m, u32 first) {
-  _mm256_mask_compressstoreu_epi32(dst, (__mmask8)m, _mm256_add_epi32(_mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7), _mm256_set1_epi32((int)first)));
-  return (u32)_mm_popcnt_u32(m);
-}
 #else
 static FORCE_INLINE __m256i movm32x8(u32 m) {
   const __m256i bits = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
   return _mm256_cmpeq_epi32(_mm256_and_si256(_mm256_set1_epi32((int)m), bits), bits);
 }
 static FORCE_INLINE u32 eq32x8(__m256i a, __m256i b) { return (u32)_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(a, b))); }
-static FORCE_INLINE u32 list8(u32* dst, u32 m, u32 first) {
-  u32 c = 0;
-  for (; m; m = _blsr_u32(m)) dst[c++] = first + (u32)_tzcnt_u32(m);
-  return c;
-}
 #endif
 
 // The lanes of v at the set bits of m (8 bits), moved down to lanes 0, 1, ... in order (the other lanes are
@@ -555,6 +545,12 @@ static FORCE_INLINE __m256i pack8(__m256i v, u32 m) { return _mm256_permutevar8x
 static FORCE_INLINE __m256i pack8x(__m256i v, u32 m, __m256i& from) {
   from = lanes_of8(m);
   return _mm256_permutevar8x32_epi32(v, from);
+}
+// the indexes first + j of the set bits j of m, appended at dst (which has room for 8); returns how many.
+// (By the lane table with AVX-512 too, in place of a compress-store to memory.)
+static FORCE_INLINE u32 list8(u32* dst, u32 m, u32 first) {
+  _mm256_storeu_si256((__m256i*)dst, _mm256_add_epi32(lanes_of8(m), _mm256_set1_epi32((int)first)));
+  return (u32)_mm_popcnt_u32(m);
 }
 
 // A batch of lines as the scanner hands them over: per field, a column of starts (offsets from the chunk
