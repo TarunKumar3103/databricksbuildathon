@@ -95,8 +95,12 @@ whole job. The general route alone is what runs on the fixtures; `SS_DENSE=0` fo
 
 ## Build and test
 
+The image compiles with clang 18 from Ubuntu's archive (`ubuntu:24.04` build stage). gcc 13 builds the same
+source to the same output; on the cost model clang needs about 5% fewer cycles per event line. `make native`
+and the tools under `tools/` still use g++ unless `CXX` is set.
+
 ```sh
-make build              # docker image (gcc:13 build stage, debian:bookworm-slim run stage)
+make build              # docker image (ubuntu:24.04 + clang 18 build stage, debian:bookworm-slim run stage)
 make fixtures           # all 36 fixtures through the image with scorer flags
 make native fixtures-native   # same without Docker
 make selftest fuzz      # SIMD parser self-test, CSV scanner fuzzer
