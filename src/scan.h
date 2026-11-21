@@ -161,15 +161,20 @@ static inline __attribute__((always_inline)) void scan_lines(const u8* begin, co
   // Bit masks of the 64 bytes at `off`: separators, newlines, quotes.
   auto block_masks = [&](size_t off, u64& bsep, u64& bmn, u64& bmq) __attribute__((always_inline)) {
     const u8* blk = p + off;
+#if defined(__AVX512BW__)
+    // one 64-byte load and three compares straight into mask registers. (512-bit, but only loads and byte
+    // compares: the parse runs 256-bit integer multiplies all along, which already hold the cores at the
+    // frequency these allow.)
+    const __m512i x = _mm512_loadu_si512((const void*)blk);
+    const u64 mc = _cvtmask64_u64(_mm512_cmpeq_epi8_mask(x, _mm512_set1_epi8(',')));
+    bmn = _cvtmask64_u64(_mm512_cmpeq_epi8_mask(x, _mm512_set1_epi8('\n')));
+    bmq = _cvtmask64_u64(_mm512_cmpeq_epi8_mask(x, _mm512_set1_epi8('"')));
+    (void)vc;
+    (void)vn;
+    (void)vq;
+#else
     const __m256i a = _mm256_loadu_si256((const __m256i*)blk);
     const __m256i b = _mm256_loadu_si256((const __m256i*)(blk + 32));
-#if defined(__AVX512BW__) && defined(__AVX512VL__)
-    // compares straight into mask registers (still 256-bit vectors: no frequency penalty), two halves joined
-    // in one step: a third fewer instructions for the three masks, and measurably faster on the scorer
-    const u64 mc = _cvtmask64_u64(_mm512_kunpackd(_mm256_cmpeq_epi8_mask(b, vc), _mm256_cmpeq_epi8_mask(a, vc)));
-    bmn = _cvtmask64_u64(_mm512_kunpackd(_mm256_cmpeq_epi8_mask(b, vn), _mm256_cmpeq_epi8_mask(a, vn)));
-    bmq = _cvtmask64_u64(_mm512_kunpackd(_mm256_cmpeq_epi8_mask(b, vq), _mm256_cmpeq_epi8_mask(a, vq)));
-#else
     const u64 mc = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, vc)) |
                    ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, vc)) << 32);
     bmn = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, vn)) |
@@ -438,15 +443,20 @@ static inline __attribute__((always_inline)) void scan_cols(const u8* begin, con
   // Bit masks of the 64 bytes at `off`: separators, newlines, quotes.
   auto block_masks = [&](size_t off, u64& bsep, u64& bmn, u64& bmq) __attribute__((always_inline)) {
     const u8* blk = p + off;
+#if defined(__AVX512BW__)
+    // one 64-byte load and three compares straight into mask registers. (512-bit, but only loads and byte
+    // compares: the parse runs 256-bit integer multiplies all along, which already hold the cores at the
+    // frequency these allow.)
+    const __m512i x = _mm512_loadu_si512((const void*)blk);
+    const u64 mc = _cvtmask64_u64(_mm512_cmpeq_epi8_mask(x, _mm512_set1_epi8(',')));
+    bmn = _cvtmask64_u64(_mm512_cmpeq_epi8_mask(x, _mm512_set1_epi8('\n')));
+    bmq = _cvtmask64_u64(_mm512_cmpeq_epi8_mask(x, _mm512_set1_epi8('"')));
+    (void)vc;
+    (void)vn;
+    (void)vq;
+#else
     const __m256i a = _mm256_loadu_si256((const __m256i*)blk);
     const __m256i b = _mm256_loadu_si256((const __m256i*)(blk + 32));
-#if defined(__AVX512BW__) && defined(__AVX512VL__)
-    // compares straight into mask registers (still 256-bit vectors: no frequency penalty), two halves joined
-    // in one step: a third fewer instructions for the three masks, and measurably faster on the scorer
-    const u64 mc = _cvtmask64_u64(_mm512_kunpackd(_mm256_cmpeq_epi8_mask(b, vc), _mm256_cmpeq_epi8_mask(a, vc)));
-    bmn = _cvtmask64_u64(_mm512_kunpackd(_mm256_cmpeq_epi8_mask(b, vn), _mm256_cmpeq_epi8_mask(a, vn)));
-    bmq = _cvtmask64_u64(_mm512_kunpackd(_mm256_cmpeq_epi8_mask(b, vq), _mm256_cmpeq_epi8_mask(a, vq)));
-#else
     const u64 mc = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, vc)) |
                    ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, vc)) << 32);
     bmn = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, vn)) |
