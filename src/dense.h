@@ -130,7 +130,7 @@ static NOINLINE void fail(const char* why) {
 static u64 g_ukey = 0, g_ekey = 0;
 static u64 g_ne_cap = 0;  // regular event indexes are below this
 static u32 g_nu_cap = 0;  // regular person indexes are below this (at most 2^23, so a user number fits 32 bits)
-static constexpr u32 KE = 14, KC = 9;  // event indexes per event partition, person indexes per click partition
+static constexpr u32 KE = 14, KC = 8;  // event indexes per event partition, person indexes per click partition
 static constexpr u32 ESLOTS = 1u << KE, ELOM = ESLOTS - 1;
 static u32 g_PE = 0, g_PC = 0;
 static i64 g_ing_base = 0;  // ingest_ts is kept as whole seconds since this, plus 1, in 24 bits
@@ -1224,11 +1224,10 @@ static NOINLINE bool place(u32 j, D16* T, DS& S) {
   if (!nblk) return false;
   S.blk.push_back(S.blk[0]);  // (something harmless to prefetch after the last block)
   for (size_t bi = 0; bi < nblk; bi++) {
+    // (the blocks were written long ago: the whole next one is asked for while this one is placed)
     const char* const nx = (const char*)S.blk[bi + 1].first;
-    _mm_prefetch(nx, _MM_HINT_T0);
-    _mm_prefetch(nx + 64, _MM_HINT_T0);
-    _mm_prefetch(nx + 128, _MM_HINT_T0);
-    _mm_prefetch(nx + 192, _MM_HINT_T0);
+    const u32 nxb = S.blk[bi + 1].second * (u32)sizeof(D16);
+    for (u32 o = 0; o < nxb; o += 64) _mm_prefetch(nx + o, _MM_HINT_T0);
     const D16* r = S.blk[bi].first;
     const D16* const re = r + S.blk[bi].second;
     u8* const Tb = (u8*)T;
@@ -1356,6 +1355,9 @@ static FORCE_INLINE u32 inwin8(const u32* t, u32 lo, u32 hi) {
 #endif
 }
 
+// The larger of two values, never as a branch.
+static FORCE_INLINE u32 umax32(u32 a, u32 b) { return a ^ ((a ^ b) & (0u - (u32)(a < b))); }
+
 // How many of the eight values at p are below t / at most t (unsigned).
 static FORCE_INLINE u32 cnt_lt8(const u32* p, u32 t) {
   const __m256i v = _mm256_loadu_si256((const __m256i*)p), vt = _mm256_set1_epi32((int)t);
@@ -1436,7 +1438,7 @@ static FORCE_INLINE void day_ranges(const u32* endr, const u32* evr, Days& D) {
   alignas(32) u32 s[16], e[16], n[16], v[16];
   u32 pe = 0, pc = 0;
   for (int d = 0; d < 16; d++) {
-    const u32 ne = std::max(pe, endr[d]), nc = std::max(pc, evr[d]);
+    const u32 ne = umax32(pe, endr[d]), nc = umax32(pc, evr[d]);
     s[d] = pe;
     e[d] = ne;
     n[d] = ne - pe;
@@ -1700,8 +1702,12 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
       u64* const sclick = S.sclick.data();
       sort_person_clicks(S.pts.data(), S.pcamp.data(), S.pclick.data(), mc, S.tin.data(), sts, scamp, sclick, S.rtmp);
       // among clicks of one time the one with the smallest click_id counts: it goes last
-      for (u32 k = 1; k < mc; k++)
-        if (__builtin_expect(sts[k] == sts[k - 1], 0)) {
+      u32 tie = 0;
+      for (u32 v = 0; v < nv; v++)  // (the entries after the last click are all 0xFFFFFFFF: they are left out)
+        tie |= eq32x8(_mm256_loadu_si256((const __m256i*)(sts + 8 * v)), _mm256_loadu_si256((const __m256i*)(sts + 8 * v + 1))) &
+               (mc - 1 - 8 * v >= 8 ? 0xFFu : ((1u << (mc - 1 - 8 * v)) - 1));
+      for (u32 k = 1; __builtin_expect(tie != 0, 0) && k < mc; k++)
+        if (sts[k] == sts[k - 1]) {
           const u32 r0 = k - 1;
           u32 r1 = k + 1;
           while (r1 < mc && sts[r1] == sts[r0]) r1++;

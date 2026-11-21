@@ -2108,11 +2108,45 @@ static FORCE_INLINE u32 count_le(const u32* ts, u32 nv, u32 x) {
 // Up to RANK_MAX clicks, the rank of each one is counted with vector compares against all of them: no
 // data-dependent branch, and most persons have only a few clicks. Beyond that, a radix sort.
 static constexpr u32 RANK_MAX = 64;
+// The rank sort for up to 4 * NG clicks, as a fixed run of steps: nothing in it depends on the number of
+// clicks or on their times. The lanes after the last click get the largest key and all land on entry n.
+template <int NG>
+static FORCE_INLINE void rank_sort_fixed(const u32* ts, const u32* camp, const u64* click, const u32 n, u32* sts,
+                                         u32* scamp, u64* sclick) {
+  alignas(32) u64 key[4 * NG];
+  __m256i kv[NG], cnt[NG];
+  const __m256i flip = _mm256_set1_epi64x((long long)0x8000000000000000ULL);
+  const __m256i big = _mm256_set1_epi64x(INT64_MAX), last = _mm256_set1_epi64x((long long)n - 1);
+  for (int g = 0; g < NG; g++) {
+    const __m256i pos = _mm256_setr_epi64x(4 * g, 4 * g + 1, 4 * g + 2, 4 * g + 3);
+    const __m256i t = _mm256_cvtepu32_epi64(_mm_loadu_si128((const __m128i*)(ts + 4 * g)));
+    const __m256i k = _mm256_xor_si256(_mm256_or_si256(_mm256_slli_epi64(t, 32), pos), flip);
+    kv[g] = _mm256_blendv_epi8(k, big, _mm256_cmpgt_epi64(pos, last));
+    _mm256_store_si256((__m256i*)(key + 4 * g), kv[g]);
+    cnt[g] = _mm256_setzero_si256();
+  }
+  for (int k = 0; k < 4 * NG; k++) {
+    const __m256i vk = _mm256_set1_epi64x((long long)key[k]);
+    for (int g = 0; g < NG; g++) cnt[g] = _mm256_sub_epi64(cnt[g], _mm256_cmpgt_epi64(kv[g], vk));
+  }
+  for (int g = 0; g < NG; g++) _mm256_store_si256((__m256i*)(key + 4 * g), cnt[g]);
+  for (u32 i = 0; i < 4 * NG; i++) {
+    const u32 r = (u32)key[i], j = i < n ? i : n - 1;  // (a lane after the last click: entry n, never used)
+    sts[r] = ts[j];
+    scamp[r] = camp[j];
+    sclick[r] = click[j];
+  }
+}
+
 static NOINLINE void sort_person_clicks(const u32* ts, const u32* camp, const u64* click, const u32 n, u32* tin,
                                         u32* sts, u32* scamp, u64* sclick, std::vector<u64>& tmp) {
   (void)tin;
   const __m256i ones = _mm256_set1_epi32(-1);
-  if (n <= RANK_MAX) {
+  if (n <= 8) {
+    rank_sort_fixed<2>(ts, camp, click, n, sts, scamp, sclick);
+  } else if (n <= 16) {
+    rank_sort_fixed<4>(ts, camp, click, n, sts, scamp, sclick);
+  } else if (n <= RANK_MAX) {
     // Keys that all differ: the time, then the position. The rank of a key is the number of keys below it,
     // counted for four keys at once against each key in turn. (Signed compares: the top bit is flipped.)
     alignas(32) u64 key[RANK_MAX + 8];
