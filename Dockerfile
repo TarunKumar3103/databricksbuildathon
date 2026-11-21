@@ -6,7 +6,11 @@ WORKDIR /build
 COPY src/ ./src/
 # -fno-tree-vectorize: the hot loops are vectorised by hand; the auto-vectoriser only gets in the way
 # (it turns runs of scalar stores into slower insert/permute sequences).
+# -Wa,-mbranches-within-32B-boundaries: Skylake to Cascade Lake cores keep a jump that crosses or ends on a
+# 32-byte boundary out of the decoded-uop cache (the JCC erratum microcode fix); the assembler pads so that
+# no jump does.
 RUN g++ -std=c++17 -O2 -fno-tree-vectorize -march=cascadelake -mtune=cascadelake -static -pthread \
+        -Wa,-mbranches-within-32B-boundaries \
         -o /shopping-sessions src/main.cpp \
  && strip /shopping-sessions
 

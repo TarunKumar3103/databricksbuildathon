@@ -29,7 +29,7 @@ make native                                   # bin/shopping-sessions
 tools/verify.sh bin/shopping-sessions full    # self-test, 36 fixtures, dev answer, 21 seeds, 20M + 40M at 1/3/8 threads
 tools/mut/loop.sh bin/shopping-sessions data/s7_e200000_c50000 1 3     # 36 damaged data sets, see below
 tools/mut/loop.sh bin/shopping-sessions data/s2_e200000_c50000 1 3
-g++ -std=c++17 -O2 -fno-tree-vectorize -march=cascadelake -mtune=cascadelake -static -pthread -o /tmp/ss src/main.cpp
+g++ -std=c++17 -O2 -fno-tree-vectorize -march=cascadelake -mtune=cascadelake -static -pthread -Wa,-mbranches-within-32B-boundaries -o /tmp/ss src/main.cpp
 tools/ctest.sh /tmp/ss ss-test                # the static binary in a container with the scorer's flags
 make fuzz                                     # only when src/scan.h changed
 ```
