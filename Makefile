@@ -17,7 +17,7 @@ build:
 
 ## Native binary (no Docker), for quick local loops
 native: bin/shopping-sessions
-bin/shopping-sessions: src/main.cpp src/parquet.h src/scan.h
+bin/shopping-sessions: src/main.cpp src/dense.h src/parquet.h src/scan.h
 	mkdir -p bin && $(CXX) $(CXXFLAGS) -o $@ src/main.cpp
 
 ## All 36 edge-case fixtures through the Docker image, with scorer flags

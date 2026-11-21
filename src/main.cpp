@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -685,6 +686,7 @@ static bool parse_ts_ref(const u8* s, u32 n, i64& out) {
 static u32 g_ytxt[2];          // candidate years as their 4 ASCII digits (0: none)
 static i64 g_dayms[2][416];    // [candidate][month * 32 + day] -> ms at 00:00 UTC, DAYMS_NONE if no such date
 static constexpr i64 DAYMS_NONE = INT64_MIN;
+static i64 g_daycode[2][416];  // the same in whole seconds since a base chosen by the dense path, plus 1
 
 static void civil_from_days(i64 days, i64& y, i64& m, i64& d) {
   i64 z = days + 719468;
@@ -723,8 +725,9 @@ static void init_fast_years(i64 lo_ms, i64 hi_ms) {
 // Two F1 timestamps at once. True iff both are valid F1 in a candidate year; then ta / tb are their values.
 // Needs 20 readable bytes at a and at b. OKM: the positions (bytes 4..19 of a, then of b) that are checked;
 // leaving out bit 15 accepts any byte in place of a's 'Z'.
+// (cb: b once more, in seconds: its day's entry in g_daycode plus the seconds of the day.)
 template <u32 OKM>
-static FORCE_INLINE bool f1_pair_m(const u8* a, const u8* b, i64& ta, i64& tb) {
+static FORCE_INLINE bool f1_pair_mc(const u8* a, const u8* b, i64& ta, i64& tb, i64& cb) {
   // bytes 4..19 of both: "-MM-DDTHH:MM:SSZ"
   const __m256i v = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128((const __m128i*)(a + 4))),
                                             _mm_loadu_si128((const __m128i*)(b + 4)), 1);
@@ -756,8 +759,15 @@ static FORCE_INLINE bool f1_pair_m(const u8* a, const u8* b, i64& ta, i64& tb) {
   const i64 da = g_dayms[ka][L[0]], db = g_dayms[kb][L[4]];
   if ((da == DAYMS_NONE) | (db == DAYMS_NONE)) return false;
   ta = da + (i64)(L[1] * 60 + L[2]) * 1000;
-  tb = db + (i64)(L[5] * 60 + L[6]) * 1000;
+  const u32 sb = L[5] * 60 + L[6];
+  tb = db + (i64)sb * 1000;
+  cb = g_daycode[kb][L[4]] + (i64)sb;
   return true;
+}
+template <u32 OKM>
+static FORCE_INLINE bool f1_pair_m(const u8* a, const u8* b, i64& ta, i64& tb) {
+  i64 cb;
+  return f1_pair_mc<OKM>(a, b, ta, tb, cb);
 }
 
 static FORCE_INLINE bool f1_pair(const u8* a, const u8* b, i64& ta, i64& tb) {
@@ -766,7 +776,7 @@ static FORCE_INLINE bool f1_pair(const u8* a, const u8* b, i64& ta, i64& tb) {
 
 // One F1 timestamp. Needs 20 readable bytes at a. OKM as above (16 bits).
 template <u32 OKM>
-static FORCE_INLINE bool f1_one_m(const u8* a, i64& ta) {
+static FORCE_INLINE bool f1_one_mc(const u8* a, i64& ta, i64& ca) {
   const __m128i v = _mm_loadu_si128((const __m128i*)(a + 4));
   const __m128i d = _mm_sub_epi8(v, _mm_set1_epi8('0'));
   const __m128i isdig = _mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d);
@@ -788,8 +798,15 @@ static FORCE_INLINE bool f1_one_m(const u8* a, i64& ta) {
   if (!((ya == g_ytxt[0]) | ka)) return false;
   const i64 da = g_dayms[ka][L[0]];
   if (da == DAYMS_NONE) return false;
-  ta = da + (i64)(L[1] * 60 + L[2]) * 1000;
+  const u32 sa = L[1] * 60 + L[2];
+  ta = da + (i64)sa * 1000;
+  ca = g_daycode[ka][L[0]] + (i64)sa;
   return true;
+}
+template <u32 OKM>
+static FORCE_INLINE bool f1_one_m(const u8* a, i64& ta) {
+  i64 ca;
+  return f1_one_mc<OKM>(a, ta, ca);
 }
 static FORCE_INLINE bool f1_one(const u8* a, i64& ta) { return f1_one_m<0xFFFFu>(a, ta); }
 
@@ -1138,11 +1155,45 @@ struct OutCols {
   }
 };
 
+// Records of the dense path (dense.h)
+struct D16 {  // event line, partitioned by event index
+  u64 w0;  // bits 0..30: ts in ms since the window start, plus 1 (0: not a valid event); bit 31: bits 32..63
+           // are not the user number but thread << 24 | index of a side entry (XEv); bits 32..63: user number
+  u64 w1;  // bits 0..23: ingest_ts code; bits 24..45: purchase, category << 17 | price; bits 46..59: slot
+};
+struct C16 {  // valid click, partitioned by person index
+  u64 w0;  // bits 0..31: ts in ms since the window start - 7 days; bits 32..63: user number
+  u64 w1;  // bits 0..39: number of the click_id; bits 40..63: campaign
+};
+struct X1Rec {  // event line whose event_id is not regular (hashes as in R1)
+  u64 eid;
+  i64 ingest;
+  u64 uid;
+  u32 ts, payload;
+  u32 num;  // user number, or 0xFFFFFFFF if the user_id is not regular
+};
+struct XEv {  // side entry of a valid event whose user or payload does not fit a D16
+  u64 uid;  // hash_id(user_id key)
+  u32 payload;
+  u32 num;  // user number, or 0xFFFFFFFF
+};
+struct XClk {  // valid click whose click_id or user_id is not regular
+  u64 uid;    // hash_id(user_id key)
+  u64 click;  // click_id key
+  u32 ts, camp;
+  u32 num;  // user number, or 0xFFFFFFFF
+};
+
 struct TL {
   Arena arena;
   WCScatter<R1> r1;
   WCScatter<R2> r2;
   WCScatter<R2C> r2c;
+  WCScatter<D16> ev;
+  WCScatter<C16> ck;
+  std::vector<X1Rec> x1;
+  std::vector<XEv> xev;
+  std::vector<XClk> xclk;
   OutCols out;
   std::vector<CStat> c_stat;   // ndays x (ncamp + 1): credited sessions, purchasing sessions, revenue
   std::vector<u32> c_assist;   // ndays x (ncamp + 1)
@@ -1431,6 +1482,12 @@ static NOINLINE u64 parse_link_chunk(const u8* begin, const u8* end, bool skip_h
   return nl + n;
 }
 
+namespace dn {
+static std::atomic<u64>* g_acc = nullptr;  // per person index: what the links say about it (dense.h)
+static FORCE_INLINE u32 reg_user_of_hash(u64 h);
+static FORCE_INLINE void link_member_num(u32 x, u32 r);
+}  // namespace dn
+
 static void build_links(std::vector<MFile>& files) {
   std::vector<Chunk> chunks;
   make_chunks(files, 1 << 18, chunks);
@@ -1503,6 +1560,8 @@ static void build_links(std::vector<MFile>& files) {
     const u64 a = nslots * t / ntask, b = nslots * (t + 1) / ntask;
     const u32 fs = g_Fshift;
     u32 idx[SUB];
+    u32 xnum[SUB];  // (dense path) the user number of each listed ID
+    const bool dense = dn::g_acc != nullptr;
     for (u64 s0 = a; s0 < b; s0 += SUB) {
       const u32 m = (u32)std::min<u64>(SUB, b - s0);
       u32 n = 0;
@@ -1512,14 +1571,22 @@ static void build_links(std::vector<MFile>& files) {
         n += sl.key != 0;
         _mm_prefetch((const char*)&g_H[(sl.val - 1) & mask], _MM_HINT_T0);
       }
+      if (dense)
+        for (u32 k = 0; k < n; k++) {
+          const u32 x = dn::reg_user_of_hash(g_H[s0 + idx[k]].key);
+          xnum[k] = x;
+          __builtin_prefetch(&dn::g_acc[x == 0xFFFFFFFFu ? 0 : (x >> 9)], 1, 3);
+        }
       for (u32 k = 0; k < n; k++) {
         HSlot& sl = g_H[s0 + idx[k]];
         const u64 v = sl.val;
         if (v) {
           sl.val = g_H[v - 1].key;
           __atomic_fetch_or(&g_F[sl.key >> fs], f_bits(sl.key, fs), __ATOMIC_RELAXED);
+          if (dense) dn::link_member_num(xnum[k], dn::reg_user_of_hash(sl.val));
         } else {
           sl.val = sl.key;
+          if (dense) dn::link_member_num(xnum[k], xnum[k]);
         }
       }
     }
@@ -2090,7 +2157,7 @@ static NOINLINE void sort_person_clicks(const u32* ts, const u32* camp, const u6
   _mm256_storeu_si256((__m256i*)(sts + n), ones);
 }
 
-static void person_phase() {
+static void person_phase(bool keep_stats = false) {
   u32 P2 = 1u << g_P2bits;
   std::vector<size_t> ne(P2, 0), nc(P2, 0);
   for (u32 p = 0; p < P2; p++)
@@ -2105,11 +2172,12 @@ static void person_phase() {
   const u32 NB = (u32)(((u64)(g_we - g_ws - 1) >> BSHIFT) + 1);
   const u32 NW = (NB + 63) / 64;
   const u32 NCAT = (u32)g_cats.size();
-  parallel_for(NT, [&](int t, int) {
-    TL& tl = g_tl[t];
-    tl.c_stat.assign((size_t)(NC + 1) * ND, CStat{0, 0, 0});
-    tl.c_assist.assign((size_t)(NC + 1) * ND, 0);
-  });
+  if (!keep_stats)
+    parallel_for(NT, [&](int t, int) {
+      TL& tl = g_tl[t];
+      tl.c_stat.assign((size_t)(NC + 1) * ND, CStat{0, 0, 0});
+      tl.c_assist.assign((size_t)(NC + 1) * ND, 0);
+    });
   struct PSlot {
     u64 h;  // 0: free (the hash of a person is never 0)
     u32 lid;
@@ -2543,6 +2611,8 @@ static void person_phase() {
     }
   });
 }
+
+#include "dense.h"
 
 // ------------------------------------------------------------------------------------------
 // output
@@ -3017,7 +3087,8 @@ static int selftest() {
     }
   }
   fprintf(stderr, "selftest keys: %ld cases (%ld fast), %ld mismatches\n", n4, nfast, bad4);
-  return (bad || bad2 || bad3 || bad4 || bad5) ? 1 : 0;
+  const long bad6 = dn::selftest(next);
+  return (bad || bad2 || bad3 || bad4 || bad5 || bad6) ? 1 : 0;
 }
 
 // ------------------------------------------------------------------------------------------
@@ -3060,16 +3131,49 @@ int main(int argc, char** argv) {
   size_t ev_bytes = 0;
   for (auto& f : ev) ev_bytes += f.size;
   u64 est_lines = ev_bytes / 70 + 1;
-  g_P1bits = std::min<u32>(12, std::max<u32>(4, ceil_log2(est_lines / 16384 + 1)));
-  g_P2bits = std::min<u32>(12, std::max<u32>(4, ceil_log2(est_lines / 32768 + 1)));
-  LOG("mapped %zu event files (%zu bytes), %zu click files, %zu link files; P1=%u P2=%u threads=%d", ev.size(),
-      ev_bytes, ck.size(), lk.size(), 1u << g_P1bits, 1u << g_P2bits, NT);
+  const u32 P1bits_gen = std::min<u32>(12, std::max<u32>(4, ceil_log2(est_lines / 16384 + 1)));
+  const u32 P2bits_gen = std::min<u32>(12, std::max<u32>(4, ceil_log2(est_lines / 32768 + 1)));
+  g_P1bits = P1bits_gen;
+  g_P2bits = P2bits_gen;
+  // The dense path (dense.h), if a sample of the events gives the key of the user IDs.
+  std::vector<dn::Samp> samp;
+  {
+    const char* e = getenv("SS_DENSE");
+    dn::g_ne_cap = ((u64)(ev_bytes / 56) | (dn::ESLOTS - 1)) + 1;
+    const u64 nu = ((dn::g_ne_cap / 30 + 1024) | ((1u << dn::KC) - 1)) + 1;
+    if (!(e && *e == '0') && nu <= (1u << 23)) {
+      dn::g_nu_cap = (u32)nu;
+      dn::g_PE = (u32)(dn::g_ne_cap >> dn::KE);
+      dn::g_PC = dn::g_nu_cap >> dn::KC;
+      dn::sample<7>(ev, 'e', 'u', 4096, samp);
+      if (dn::recover_user_key(samp)) {
+        dn::g_on = true;
+        dn::g_acc = (std::atomic<u64>*)vm_alloc(sizeof(std::atomic<u64>) * dn::g_nu_cap);
+        g_P2bits = std::min<u32>(8, std::max<u32>(4, ceil_log2(est_lines / (32768 * 16) + 1)));
+      }
+    }
+  }
+  LOG("mapped %zu event files (%zu bytes), %zu click files, %zu link files; P1=%u P2=%u threads=%d dense=%d ukey=%llx",
+      ev.size(), ev_bytes, ck.size(), lk.size(), 1u << g_P1bits, 1u << g_P2bits, NT, (int)dn::g_on,
+      (unsigned long long)dn::g_ukey);
   // The lookups and the per-thread state are not needed for the links: set them up on the side meanwhile.
   std::thread setup([&] {
     load_lookups(data);
+    if (dn::g_on && !dn::recover_event_key(samp)) dn::fail("no key for the event ids");
+    if (dn::g_on && (u64)(g_we - g_ws) > 0x7FFFFFF0ULL) dn::fail("window too long");
+    if (dn::g_on && g_cats.size() > 255) dn::fail("too many categories");
+    if (dn::g_on) {
+      dn::g_ing_base = g_ws - 30 * DAY;
+      dn::init_daycode();
+    }
     g_tl.resize(NT);
     for (auto& t : g_tl) {
-      t.r1.init(1u << g_P1bits);
+      if (dn::g_on && !dn::g_fail.load()) {
+        t.ev.init(dn::g_PE);
+        t.ck.init(dn::g_PC);
+      } else {
+        t.r1.init(1u << g_P1bits);
+      }
       t.r2.init(1u << g_P2bits);
       t.r2c.init(1u << g_P2bits);
     }
@@ -3079,6 +3183,67 @@ int main(int argc, char** argv) {
   setup.join();
   LOG("lookups: window %lld..%lld, %zu categories, %u campaigns, %d days", (long long)g_ws, (long long)g_we,
       g_cats.size(), g_ncamp, g_ndays);
+
+  if (dn::g_on && !dn::g_fail.load()) {
+    g_phase = 2;
+    dn::parse(ev, ck);
+    {
+      u64 a = 0, b = 0;
+      for (auto& t : g_tl) {
+        a += t.n_event_lines;
+        b += t.n_click_lines;
+      }
+      LOG("parsed (dense): %llu event lines, %llu click lines", (unsigned long long)a, (unsigned long long)b);
+    }
+    if (const char* e = getenv("SS_DENSE_FAIL"))  // (tests of the way back to the general pipeline)
+      if (!strcmp(e, "parse")) dn::fail("test: after the parse");
+    if (!dn::g_fail.load()) {
+      g_phase = 3;
+      dn::resolve_special();
+      dn::scan_all();
+      if (const char* e = getenv("SS_DENSE_FAIL"))
+        if (!strcmp(e, "scan")) dn::fail("test: after the scan");
+    }
+    if (!dn::g_fail.load()) {
+      LOG("dense scan done");
+      g_phase = 4;
+      person_phase(true);
+      LOG("general person phase done");
+      g_phase = 5;
+      write_outputs(out);
+      LOG("output written");
+      if (g_log) {
+        double tot = 0, tots = 0;
+        for (int i = 0; i < 6; i++) {
+          tot += g_phase_cycles[i].load() / 1e6;
+          tots += g_phase_sys[i].load() / 1e6;
+        }
+        fprintf(stderr, "user s:");
+        for (int i = 1; i < 6; i++) fprintf(stderr, " %s %.3f", g_phase_names[i], g_phase_cycles[i].load() / 1e6);
+        fprintf(stderr, " | total %.3f   sys s: total %.3f (parse %.3f)\n", tot, tots, g_phase_sys[2].load() / 1e6);
+      }
+      release_memory();
+      if (g_log) fprintf(stderr, "ABS end %.6f\n", now_s());
+      fflush(nullptr);
+      _exit(0);
+    }
+  }
+  if (dn::g_on) {
+    // The data does not have the shape the dense path needs: start over with the general pipeline.
+    LOG("dense path given up (%s): general pipeline", dn::g_fail_why);
+    for (auto& t : g_tl)  // (the records of the attempt; the link table stays)
+      for (auto& sl : t.arena.slabs) madvise(sl.first, sl.second, MADV_DONTNEED);
+    dn::g_acc = nullptr;
+    g_P1bits = P1bits_gen;
+    g_P2bits = P2bits_gen;
+    g_tl.clear();
+    g_tl.resize(NT);
+    for (auto& t : g_tl) {
+      t.r1.init(1u << g_P1bits);
+      t.r2.init(1u << g_P2bits);
+      t.r2c.init(1u << g_P2bits);
+    }
+  }
 
   g_phase = 2;
   parse_events_clicks(ev, ck);

@@ -3,7 +3,33 @@
 One static C++17 binary (no engine, no runtime dependencies) that reads `/data` and writes
 `/output/user_daily/` and `/output/campaign_daily/` as Parquet, following `rules.md` exactly.
 
-## How it works
+## Two routes through the same rules
+
+**The dense route** (`src/dense.h`) is tried first. It is for data whose IDs have the shape the organisers'
+generator gives them: a prefix letter and a base-36 number below 2^40, made from a running index by a fixed,
+invertible mixing function with one secret key per kind of ID. The keys are found from a sample of the events
+(a few million trial keys at most), and undoing the mixing turns every such ID back into its index. Then:
+
+- Event indexes are dense and run in the order (user, time). Events are partitioned by index range, and a
+  partition is put in order by writing every 16-byte record to the slot of its index: that is the dedup (the copy
+  with the smallest `ingest_ts` keeps the slot) and the sort in one pass over memory that fits the L2 cache. A
+  person's events then follow one another in time order, so sessions, rows and campaign counts come out of one
+  sequential scan with no hash table and no sort.
+- A user number is (person index << 9) + alias. The link phase works out, per person index, whether its link
+  set is exactly the aliases 0..n-1 of that index and nothing else. Such persons are grouped and named by
+  index alone; their clicks are partitioned by person index and joined in the same scan.
+- IDs are decoded four at a time with vector code (digits, range and leading-zero checks, the two
+  multiplications of the inverse mixing).
+
+Nothing of this is taken on trust. Any key is a bijection on the ID numbers, so a wrong key cannot produce a
+wrong answer, only sparse indexes. Records that do not fit (IDs of another form, link sets that mix person
+indexes or contain other IDs, aliases outside the set, payloads too large for the compact record) go through
+the general person phase one by one, in the same run. And if the data as a whole does not have the expected
+shape (a person's events not in one run of increasing time, persons out of index order, an `ingest_ts` far
+from the window, too many irregular lines), the attempt is dropped and **the general route** below redoes the
+whole job. The general route alone is what runs on the fixtures; `SS_DENSE=0` forces it.
+
+## How the general route works
 
 1. **Lookups.** `manifest.json`, `products.csv`, `campaigns.csv`. Product and campaign IDs of the form
    `p<n>` / `c_<n>` resolve through direct arrays, anything else through a hash map.
@@ -67,5 +93,5 @@ make selftest fuzz      # SIMD parser self-test, CSV scanner fuzzer
 make dev run-dev check-dev    # 1M-event dev set (needs `generate`) against dev-answer/
 ```
 
-`SS_LOG=1` prints phase timings to stderr. `tests/reference.py` is a slow, plain Python
+`SS_LOG=1` prints phase timings to stderr (and which route ran). `tests/reference.py` is a slow, plain Python
 implementation of the rules used as an oracle for differential tests on other seeds.
