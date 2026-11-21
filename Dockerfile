@@ -14,7 +14,7 @@ RUN set -e; mkdir -p /out; \
     g++ -std=c++17 -O2 -march=cascadelake -static -pthread -o /out/bench bench/driver.cpp & pd=$!; \
     for p in $p0 $p1 $pd; do wait $p; done; \
     strip /out/*; \
-    cp bench/generate bench/variants.txt bench/bin/* /out/; \
+    cp bench/generate bench/variants.txt bench/prebuilt/* /out/; \
     ls -la /out
 
 # Optional: clang 18 from Ubuntu's archive, run on the build machine. If the packages cannot be fetched there,

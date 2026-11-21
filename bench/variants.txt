@@ -1,7 +1,7 @@
 # The builds the bench times: tag, binary in /usr/local/bench, then optional ENV=VALUE settings.
 # The first build also writes the dev output that the report rows are added to.
 a ss-77eeb25-f0                  # v4 77eeb25 with gcc 13, as its Dockerfile builds it (JCC padding)
-L ss-77eeb25-clang18-O2          # the same source, clang 18.1.3 -O2 -fno-vectorize -fno-slp-vectorize; built in chat C's sandbox, in bench/bin
+L ss-77eeb25-clang18-O2          # the same source, clang 18.1.3 -O2 -fno-vectorize -fno-slp-vectorize; built in chat C's sandbox, in bench/prebuilt
 M ss-77eeb25-clang18-O3          # the same at -O3
 K ss-77eeb25-clang-built         # clang 18 installed from Ubuntu's archive and run on the build machine; missing if that failed
 p ss-4f8cb95                     # v4 4f8cb95 with gcc 13, as in bench 1, to tie the two benches together

@@ -50,7 +50,7 @@ whole bench in seconds.
 
 Put each build's sources under `bench/variants/<name>/src/`, add its compile line to the `Dockerfile`, and add
 a line to `variants.txt`; `bench/mkbench.py PLAN` does all three for gcc builds of any commits. A binary built
-elsewhere can sit in `bench/bin/`, which is copied as it is. A build whose binary is not in the image (an
+elsewhere can sit in `bench/prebuilt/` (not `bench/bin/`, which `.gitignore` hides), which is copied as it is. A build whose binary is not in the image (an
 optional build stage that could not run) is reported as `tag=missing`. Builds are compared fairly only within
 one run of the bench.
 
