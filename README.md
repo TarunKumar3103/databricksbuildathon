@@ -7,10 +7,12 @@ One static C++17 binary (no engine, no runtime dependencies) that reads `/data` 
 
 1. **Lookups.** `manifest.json`, `products.csv`, `campaigns.csv`. Product and campaign IDs of the form
    `p<n>` / `c_<n>` resolve through direct arrays, anything else through a hash map.
-2. **Links.** Parsed in parallel; distinct IDs are deduplicated per hash partition, then joined with a
-   lock-free union-find that always links the root with the byte-wise larger ID under the smaller one,
-   so every root *is* the person's name. Result: a hash table `ID -> person`, plus a Bloom filter of the
-   IDs whose person is not the ID itself.
+2. **Links.** All threads parse the link files and insert the IDs into one open-addressing hash table
+   (compare-and-swap on the key). The same table holds a lock-free union-find: a slot's value is its
+   parent, and a join always puts the root with the byte-wise larger ID under the smaller one, so every
+   root *is* the person's name. Two more parallel passes point every ID at its root and then replace the
+   parent by the person. Result: a hash table `ID -> person`, plus a Bloom filter of the IDs whose
+   person is not the ID itself. The small lookup files are read on a side thread meanwhile.
 3. **Events and clicks.** Files are memory-mapped and split into chunks at line boundaries. A SIMD CSV
    scanner (`src/scan.h`) finds commas, newlines and quotes per 64-byte block, validates quote placement
    with bit tricks (blocks with any irregular quote fall back to an exact byte-by-byte check), flattens
@@ -32,8 +34,8 @@ One static C++17 binary (no engine, no runtime dependencies) that reads `/data` 
    Every other record is the only copy of its event. Survivors look up their person in batches (split
    by the Bloom filter without branching, then probe the table for the flagged ones) and are
    re-partitioned by person.
-   Clicks are partitioned by person directly (copies are identical, so click dedup cannot change any
-   result).
+   Clicks look up their person while they are parsed and are partitioned by person directly (copies are
+   identical, so click dedup cannot change any result).
 5. **Sessions.** Per person partition, events are counting-sorted by (person, 2^20 ms time bucket). A
    bucket spans less than 30 minutes, so each bucket lies in one session and gaps only need checking
    between consecutive buckets: no comparison sort. Clicks per person are sorted by time; a sliding

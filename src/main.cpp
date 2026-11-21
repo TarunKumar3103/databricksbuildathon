@@ -2,11 +2,12 @@
 //
 // Phases:
 //   1. lookups: manifest, products, campaigns
-//   2. links: parse -> distinct IDs (hash partitioned) -> lock-free union-find -> table H: id -> person name
+//   2. links: all threads insert the IDs into one hash table H and join them with a lock-free union-find
+//      kept in the same table; then H maps id -> person
 //   3. events + clicks: parse in parallel chunks.
-//        events -> R1 records, partitioned by hash(event_id)       (for dedup)
-//        clicks -> R2C records, partitioned by hash(person)        (for attribution)
-//   4. dedup per event_id partition -> R2 records, partitioned by hash(person)
+//        events -> R1 records, partitioned by hash(event_id)                    (for dedup)
+//        clicks -> person lookup -> R2C records, partitioned by hash(person)    (for attribution)
+//   4. dedup per event_id partition -> person lookup -> R2 records, partitioned by hash(person)
 //   5. per person partition: group, sort, sessionize, attribute, aggregate
 //   6. write Parquet
 #include <dirent.h>
@@ -113,14 +114,6 @@ static void parallel_for(int ntasks, F&& f) {
   th.reserve(n);
   for (int i = 1; i < n; i++) th.emplace_back(worker, i);
   worker(0);
-  for (auto& t : th) t.join();
-}
-
-template <class F>
-static void parallel_threads(F&& f) {
-  std::vector<std::thread> th;
-  for (int i = 1; i < NT; i++) th.emplace_back(f, i);
-  f(0);
   for (auto& t : th) t.join();
 }
 
@@ -959,15 +952,16 @@ static FORCE_INLINE i32 camp_fast(const u8* s, u32 n) {
   return g_camp_by_num[v];
 }
 
-// H: link ID -> person. Both are stored as hashes (hash_id of the ID's key, hash_id of the person's name
-// key); while the links are being built, the value is the ID's union-find node instead. Open addressing; the
-// top g_Hpbits bits of the slot index pick a region that is probed (linearly, wrapping) on its own.
+// H: link ID -> person, open addressing with linear probing. Keys are hash_id of the ID's key (0: empty slot;
+// no ID has key 0). Once the links are built, the value is hash_id of the person's name key. While they are
+// being built it is the ID's union-find parent: 0 for a root, else the parent's slot index + 1. Zero-filled
+// memory is thus an empty table in which every ID that arrives starts as its own root.
 struct HSlot {
-  u64 key;  // 0: empty (no ID has key 0)
+  u64 key;
   u64 val;
 };
 static HSlot* g_H = nullptr;
-static u32 g_Hbits = 0, g_Hpbits = 0;
+static u32 g_Hbits = 0;
 // Blocked Bloom filter of the IDs whose person differs from the ID itself (the only ones that need H).
 // Three bits per ID in one 64-bit word; the word is picked by the top bits of the hash, the bits by the
 // 18 bits below them.
@@ -977,71 +971,64 @@ static FORCE_INLINE u64 f_bits(u64 h, u32 fs) {
   return (1ULL << ((h >> (fs - 6)) & 63)) | (1ULL << ((h >> (fs - 12)) & 63)) | (1ULL << ((h >> (fs - 18)) & 63));
 }
 
-static inline u64 h_slot_index(u64 h) { return h >> (64 - g_Hbits); }
-
-// The value stored for the ID with hash h, or h itself if the ID is not in H.
+// The person (as a hash) of the ID with hash h: its value in H, or h itself if the ID is in no link.
 static inline u64 h_lookup(u64 h) {
-  u32 sbits = g_Hbits - g_Hpbits;
-  u64 smask = (1ULL << sbits) - 1;
-  u64 idx = h_slot_index(h);
-  u64 base = idx & ~smask;
-  u64 i = idx & smask;
+  const u64 mask = (1ULL << g_Hbits) - 1;
+  u64 i = h >> (64 - g_Hbits);
   for (;;) {
-    const HSlot& s = g_H[base + i];
+    const HSlot& s = g_H[i];
     if (s.key == h) return s.val;
     if (s.key == 0) return h;
-    i = (i + 1) & smask;
+    i = (i + 1) & mask;
   }
 }
 
-// Calls emit(i, value) for i in [0, n) where value = h_lookup(hash of key_at(i)), with the H probes
-// software-prefetched D items ahead.
-template <class KeyAt, class Emit>
-static inline void lookup_pipeline(size_t n, KeyAt&& key_at, Emit&& emit) {
-  constexpr size_t D = 32;
-  u64 hs[D];
-  size_t pre = n < D ? n : D;
-  for (size_t i = 0; i < pre; i++) {
-    hs[i] = hash_id(key_at(i));
-    _mm_prefetch((const char*)&g_H[h_slot_index(hs[i])], _MM_HINT_T0);
-  }
-  for (size_t i = 0; i < n; i++) {
-    size_t s = i & (D - 1);
-    u64 v = h_lookup(hs[s]);
-    if (i + D < n) {
-      hs[s] = hash_id(key_at(i + D));
-      _mm_prefetch((const char*)&g_H[h_slot_index(hs[s])], _MM_HINT_T0);
-    }
-    emit(i, v);
-  }
-}
+// ---- while the links are being built (all threads at once)
 
-struct UNode {
-  std::atomic<u32> parent;
-  u32 pad;
-  u64 key;
-};
-static UNode* g_nodes = nullptr;
-
-static inline u32 uf_find(u32 x) {
+// The slot of the ID with hash h, which is inserted if it is not there yet.
+static FORCE_INLINE u64 h_slot_for(u64 h, u64 mask, u32 hshift) {
+  u64 i = h >> hshift;
   for (;;) {
-    u32 p = g_nodes[x].parent.load(std::memory_order_relaxed);
-    if (p == x) return x;
-    u32 gp = g_nodes[p].parent.load(std::memory_order_relaxed);
-    if (gp == p) return p;
-    g_nodes[x].parent.store(gp, std::memory_order_relaxed);
-    x = gp;
+    u64 k = __atomic_load_n(&g_H[i].key, __ATOMIC_RELAXED);
+    if (k == h) return i;
+    if (k == 0) {
+      if (__atomic_compare_exchange_n(&g_H[i].key, &k, h, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) return i;
+      if (k == h) return i;  // another thread has just put the same ID here
+    }
+    i = (i + 1) & mask;
   }
 }
 
-static inline void uf_unite(u32 a, u32 b) {
+static inline u64 uf_find(u64 x) {
+  for (;;) {
+    const u64 p = __atomic_load_n(&g_H[x].val, __ATOMIC_RELAXED);
+    if (p == 0) return x;
+    const u64 gp = __atomic_load_n(&g_H[p - 1].val, __ATOMIC_RELAXED);
+    if (gp == 0) return p - 1;
+    __atomic_store_n(&g_H[x].val, gp, __ATOMIC_RELAXED);  // any ancestor is a valid parent
+    x = gp - 1;
+  }
+}
+
+// The root of a slot, without writing anything.
+static inline u64 uf_root(u64 x) {
+  for (;;) {
+    const u64 p = __atomic_load_n(&g_H[x].val, __ATOMIC_RELAXED);
+    if (p == 0) return x;
+    x = p - 1;
+  }
+}
+
+// Joins the sets of two slots. The root whose ID is byte-wise smaller stays the root, so in the end every
+// root is the smallest ID of its set: the person's name.
+static inline void uf_unite(u64 a, u64 b) {
   for (;;) {
     a = uf_find(a);
     b = uf_find(b);
     if (a == b) return;
-    if (key_cmp(g_nodes[a].key, g_nodes[b].key) > 0) std::swap(a, b);
-    u32 exp = b;
-    if (g_nodes[b].parent.compare_exchange_strong(exp, a, std::memory_order_acq_rel)) return;
+    if (key_cmp(unhash_id(g_H[a].key), unhash_id(g_H[b].key)) > 0) std::swap(a, b);
+    u64 exp = 0;  // b must still be a root
+    if (__atomic_compare_exchange_n(&g_H[b].val, &exp, a + 1, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) return;
   }
 }
 
@@ -1057,12 +1044,6 @@ struct R1 {  // event line, partitioned by event_id; eid = hash_id(event_id key)
   u32 ts;       // ms since window start, TS_INVALID if the line is not a valid event
   u32 payload;  // purchase: cat << 24 | price; else 0
 };
-struct C0 {  // valid click line, unpartitioned
-  u64 uid;  // hash_id(user_id key)
-  u64 click;
-  u32 ts;  // ms since window start - 7 days
-  u32 camp;
-};
 struct R2 {  // surviving event, partitioned by person; h = hash_id(person name key)
   u64 h;
   u32 ts;
@@ -1071,7 +1052,7 @@ struct R2 {  // surviving event, partitioned by person; h = hash_id(person name 
 struct R2C {  // valid click, partitioned by person; h = hash_id(person name key)
   u64 h;
   u64 click;
-  u32 ts;
+  u32 ts;  // ms since window start - 7 days
   u32 camp;
   u64 pad;
 };
@@ -1098,16 +1079,76 @@ struct OutRows {
 struct TL {
   Arena arena;
   WCScatter<R1> r1;
-  Stream<C0> c0;
   WCScatter<R2> r2;
   WCScatter<R2C> r2c;
-  std::vector<std::pair<u64, u64>> links;
   OutRows out;
   std::vector<CStat> c_stat;   // ndays x (ncamp + 1): credited sessions, purchasing sessions, revenue
   std::vector<u32> c_assist;   // ndays x (ncamp + 1)
   u64 n_event_lines = 0, n_click_lines = 0;
 };
 static std::vector<TL> g_tl;
+
+// Person lookup and scatter for a stream of items, a batch at a time. Each item comes with the hash of its
+// user ID. Two simple loops instead of one with data-dependent branches: (1) split the batch, without
+// branching, into items whose ID is its own person and items the filter flags, prefetching the H slot of the
+// latter; (2) emit both lists. emit(cursor, person hash, item) is called once per item, in no particular
+// order. The filter word of an item is prefetched when the item is added.
+template <class Item, class Rec, class Emit>
+struct Router {
+  static constexpr u32 CAP = 128;
+  using Cursor = typename WCScatter<Rec>::Cursor;
+  u64 key[CAP];
+  Item item[CAP];
+  u8 ld[CAP + 1], lh[CAP + 1];
+  u32 n = 0;
+  Cursor& cur;
+  Emit& emit;
+  Router(Cursor& c, Emit& e) : cur(c), emit(e) {}
+  FORCE_INLINE void add(u64 uh, const Item& it) { add_if(uh, it, 1); }
+  // The item is stored either way; it stays only if keep is 1.
+  FORCE_INLINE void add_if(u64 uh, const Item& it, u32 keep) {
+    key[n] = uh;
+    item[n] = it;
+    _mm_prefetch((const char*)&g_F[uh >> g_Fshift], _MM_HINT_T0);  // (a null g_F is harmless here)
+    n += keep;
+    if (__builtin_expect(n == CAP, 0)) run();
+  }
+  NOINLINE void run() {
+    const u32 m = n;
+    n = 0;
+    Cursor c = cur;  // in registers for the loops below
+    if (!g_H) {
+      for (u32 i = 0; i < m; i++) emit(c, key[i], item[i]);
+      cur = c;
+      return;
+    }
+    const u64* const F = g_F;
+    const HSlot* const H = g_H;
+    const u32 fs = g_Fshift, hshift = 64 - g_Hbits;
+    u32 nd = 0, nh = 0;
+    for (u32 i = 0; i < m; i++) {
+      const u64 x = key[i];
+      const u64 b = f_bits(x, fs);
+      const u32 maybe = (F[x >> fs] & b) == b;
+      ld[nd] = (u8)i;
+      lh[nh] = (u8)i;
+      nd += maybe ^ 1;
+      nh += maybe;
+      // prefetch the H slot of flagged items only (the others get a harmless address)
+      const uintptr_t slot = (uintptr_t)&H[x >> hshift], dummy = (uintptr_t)key;
+      _mm_prefetch((const char*)(dummy ^ ((slot ^ dummy) & (0 - (uintptr_t)maybe))), _MM_HINT_T0);
+    }
+    for (u32 j = 0; j < nd; j++) {
+      const u32 i = ld[j];
+      emit(c, key[i], item[i]);
+    }
+    for (u32 j = 0; j < nh; j++) {
+      const u32 i = lh[j];
+      emit(c, h_lookup(key[i]), item[i]);
+    }
+    cur = c;
+  }
+};
 
 // ------------------------------------------------------------------------------------------
 // lookups
@@ -1247,141 +1288,163 @@ static void load_lookups(const std::string& data) {
 // ------------------------------------------------------------------------------------------
 // links
 
+static size_t count_newlines(const u8* p, size_t n) {  // may read up to 31 bytes past the end (zeros or text)
+  const __m256i nl = _mm256_set1_epi8('\n');
+  size_t c = 0, i = 0;
+  for (; i + 32 <= n; i += 32)
+    c += (u32)__builtin_popcount((u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i*)(p + i)), nl)));
+  for (; i < n; i++) c += p[i] == '\n';
+  return c;
+}
+
+struct LkBatch {
+  static constexpr u32 CAP = 32;
+  alignas(32) u32 off[CAP][8];
+  alignas(32) u32 len[CAP][8];
+  u64 ha[CAP], hb[CAP];
+  u64 sa[CAP], sb[CAP];
+};
+
+// A batch of link lines: hash both IDs and prefetch their slots; find or insert them; join them.
+static NOINLINE void process_links(LkBatch& B, const u32 n, const u8* const base) {
+  const u32 hshift = 64 - g_Hbits;
+  const u64 mask = (1ULL << g_Hbits) - 1;
+  for (u32 i = 0; i < n; i++) {
+    const u32* off = B.off[i];
+    const u32* len = B.len[i];
+    const u64 ha = hash_id(make_key(base + off[0], len[0])), hb = hash_id(make_key(base + off[1], len[1]));
+    B.ha[i] = ha;
+    B.hb[i] = hb;
+    __builtin_prefetch(&g_H[ha >> hshift], 1, 3);
+    __builtin_prefetch(&g_H[hb >> hshift], 1, 3);
+  }
+  for (u32 i = 0; i < n; i++) {
+    const u64 sa = h_slot_for(B.ha[i], mask, hshift), sb = h_slot_for(B.hb[i], mask, hshift);
+    B.sa[i] = sa;
+    B.sb[i] = sb;
+    // their parents, if they have any (a root gets a harmless address)
+    _mm_prefetch((const char*)&g_H[(__atomic_load_n(&g_H[sa].val, __ATOMIC_RELAXED) - 1) & mask], _MM_HINT_T0);
+    _mm_prefetch((const char*)&g_H[(__atomic_load_n(&g_H[sb].val, __ATOMIC_RELAXED) - 1) & mask], _MM_HINT_T0);
+  }
+  for (u32 i = 0; i < n; i++) uf_unite(B.sa[i], B.sb[i]);
+}
+
+static NOINLINE u64 parse_link_chunk(const u8* begin, const u8* end, bool skip_header) {
+  LkBatch B;
+  u32 n = 0;
+  u64 nl = 0;
+  const u8* base = begin;
+  scan::scan_lines<2>(begin, end, skip_header, [&](const u8* sb, __m256i st, __m256i ln) __attribute__((always_inline)) {
+    _mm256_store_si256((__m256i*)B.off[n], st);
+    _mm256_store_si256((__m256i*)B.len[n], ln);
+    base = sb;
+    // a line with an empty ID links nothing: its slot is reused
+    n += (_mm256_movemask_epi8(_mm256_cmpeq_epi32(ln, _mm256_setzero_si256())) & 0xFF) == 0;
+    if (__builtin_expect(n == LkBatch::CAP, 0)) {
+      process_links(B, n, sb);
+      nl += n;
+      n = 0;
+    }
+  });
+  if (n) process_links(B, n, base);
+  return nl + n;
+}
+
 static void build_links(std::vector<MFile>& files) {
   std::vector<Chunk> chunks;
-  make_chunks(files, 1 << 20, chunks);
-  parallel_for((int)chunks.size(), [&](int t, int tid) {
+  make_chunks(files, 1 << 18, chunks);
+  if (chunks.empty()) return;
+  const int nchunks = (int)chunks.size();
+  // An upper bound on the number of link lines sizes the table: at most two new IDs per line.
+  std::vector<size_t> part(nchunks, 0);
+  parallel_for(nchunks, [&](int t, int) {
+    const Chunk& c = chunks[t];
+    part[t] = count_newlines(files[c.file].data + c.nominal, c.nominal_end - c.nominal);
+  });
+  size_t max_lines = files.size();  // a last line without a newline
+  for (size_t c : part) max_lines += c;
+  g_Hbits = std::max<u32>(10, ceil_log2(max_lines * 3 + 1));  // load <= 2/3 even if every ID is new
+  const u64 nslots = 1ULL << g_Hbits;
+  g_H = (HSlot*)vm_alloc(sizeof(HSlot) * nslots);
+  parallel_for(nchunks, [&](int t, int) {
     const Chunk& c = chunks[t];
     const MFile& f = files[c.file];
     size_t b = line_start_at_or_after(f, c.nominal), e = line_start_at_or_after(f, c.nominal_end);
-    if (b >= e) return;
-    auto& out = g_tl[tid].links;
-    scan_chunk<2>(f.data + b, f.data + e, b == 0, [&](const u8* sb, const u32* fo, const u32* fl) {
-      if (fl[0] == 0 || fl[1] == 0) return;
-      out.push_back({make_key((sb + fo[0]), fl[0]), make_key((sb + fo[1]), fl[1])});
-    });
+    part[t] = b < e ? parse_link_chunk(f.data + b, f.data + e, b == 0) : 0;
   });
   size_t nlinks = 0;
-  for (auto& t : g_tl) nlinks += t.links.size();
-  LOG("links: %zu lines", nlinks);
-  if (nlinks == 0) return;
-
-  u32 pbits = std::min<u32>(10, std::max<u32>(1, ceil_log2(nlinks / 4096 + 1)));
-  u32 P = 1u << pbits;
-  // scatter keys into partitions (per producing thread)
-  std::vector<std::vector<std::vector<u64>>> kp(NT, std::vector<std::vector<u64>>(P));
-  parallel_for(NT, [&](int t, int) {
-    auto& mine = kp[t];
-    size_t expect = g_tl[t].links.size() * 2 / P + 16;
-    for (auto& v : mine) v.reserve(expect + expect / 4);
-    for (auto& pr : g_tl[t].links) {
-      mine[hash_id(pr.first) >> (64 - pbits)].push_back(pr.first);
-      mine[hash_id(pr.second) >> (64 - pbits)].push_back(pr.second);
-    }
-  });
-  std::vector<std::vector<u64>> distinct(P);
-  parallel_for((int)P, [&](int p, int) {
-    size_t raw = 0;
-    for (int t = 0; t < NT; t++) raw += kp[t][p].size();
-    u32 bits = ceil_log2(raw * 2 + 16);
-    std::vector<u64> tab((size_t)1 << bits, 0);
-    u64 mask = ((u64)1 << bits) - 1;
-    auto& d = distinct[p];
-    d.reserve(raw);
-    for (int t = 0; t < NT; t++)
-      for (u64 k : kp[t][p]) {
-        u64 i = (hash_id(k) << pbits) >> (64 - bits);  // the hash bits below the partition's
-        for (;;) {
-          if (tab[i] == k) break;
-          if (tab[i] == 0) {
-            tab[i] = k;
-            d.push_back(k);
-            break;
-          }
-          i = (i + 1) & mask;
-        }
-      }
-    for (int t = 0; t < NT; t++) std::vector<u64>().swap(kp[t][p]);
-  });
-  size_t maxd = 0;
-  std::vector<size_t> off(P + 1, 0);
-  for (u32 p = 0; p < P; p++) {
-    maxd = std::max(maxd, distinct[p].size());
-    off[p + 1] = off[p] + distinct[p].size();
-  }
-  size_t total = off[P];
-  u32 sbits = std::max<u32>(4, ceil_log2(maxd * 2 + 1));
-  g_Hpbits = pbits;
-  g_Hbits = pbits + sbits;
-  g_H = (HSlot*)vm_alloc(sizeof(HSlot) << g_Hbits);
-  g_nodes = (UNode*)vm_alloc(sizeof(UNode) * (total + 1));
-  LOG("links: %zu distinct ids, H bits %u (%u partitions)", total, g_Hbits, P);
-  parallel_for((int)P, [&](int p, int) {
-    u64 smask = (1ULL << sbits) - 1;
-    for (size_t j = 0; j < distinct[p].size(); j++) {
-      u64 k = distinct[p][j];
-      u32 id = (u32)(off[p] + j);
-      g_nodes[id].parent.store(id, std::memory_order_relaxed);
-      g_nodes[id].key = k;
-      const u64 h = hash_id(k);
-      u64 idx = h_slot_index(h);
-      u64 base = idx & ~smask, i = idx & smask;
-      for (;;) {
-        HSlot& s = g_H[base + i];
-        if (s.key == 0) {
-          s.key = h;
-          s.val = id;
-          break;
-        }
-        i = (i + 1) & smask;
-      }
-    }
-    std::vector<u64>().swap(distinct[p]);
-  });
-  // map both ends to node ids (prefetched), then unite
-  parallel_for(NT, [&](int t, int) {
-    auto& L = g_tl[t].links;
-    size_t n = L.size();
-    std::vector<u32> ids(2 * n);
-    lookup_pipeline(
-        2 * n, [&](size_t i) { return (i & 1) ? L[i >> 1].second : L[i >> 1].first; },
-        [&](size_t i, u64 v) { ids[i] = (u32)v; });
-    std::vector<std::pair<u64, u64>>().swap(L);
-    constexpr size_t D = 8;
-    for (size_t i = 0; i < n; i++) {
-      if (i + D < n) {
-        _mm_prefetch((const char*)&g_nodes[ids[2 * (i + D)]], _MM_HINT_T0);
-        _mm_prefetch((const char*)&g_nodes[ids[2 * (i + D) + 1]], _MM_HINT_T0);
-      }
-      uf_unite(ids[2 * i], ids[2 * i + 1]);
-    }
-  });
-  // finalize: H value = hash of the root's name key
-  u64 nslots = 1ULL << g_Hbits;
-  int ntask = 256;
-  std::vector<size_t> nremap(ntask, 0);
+  for (size_t c : part) nlinks += c;
+  // Two passes over the table, both in runs of SUB slots: the used slots of a run are listed without
+  // branching while the slots they point at are prefetched, then the listed slots are processed.
+  const int ntask = (int)std::min<u64>(nslots >> 10, 1024);
+  const u64 mask = nslots - 1;
+  constexpr u32 SUB = 256;
+  // Pass 1: point every ID at its root, directly. Each slot is written by one thread only here (uf_find would
+  // also rewrite the slots it passes, and could then leave an ID pointing at an ancestor that is not the root).
+  std::vector<size_t> nused(ntask, 0), nroots(ntask, 0);
   parallel_for(ntask, [&](int t, int) {
-    u64 a = nslots * t / ntask, b = nslots * (t + 1) / ntask;
-    size_t c = 0;
-    for (u64 i = a; i < b; i++) {
-      if (g_H[i].key) {
-        g_H[i].val = hash_id(g_nodes[uf_find((u32)g_H[i].val)].key);
-        c += g_H[i].val != g_H[i].key;
+    const u64 a = nslots * t / ntask, b = nslots * (t + 1) / ntask;
+    size_t used = 0, roots = 0;
+    u32 idx[SUB];
+    for (u64 s0 = a; s0 < b; s0 += SUB) {
+      const u32 m = (u32)std::min<u64>(SUB, b - s0);
+      u32 n = 0;
+      for (u32 j = 0; j < m; j++) {
+        const HSlot& sl = g_H[s0 + j];
+        idx[n] = j;
+        n += sl.key != 0;
+        // (an empty slot or a root gets a harmless address)
+        _mm_prefetch((const char*)&g_H[(__atomic_load_n(&sl.val, __ATOMIC_RELAXED) - 1) & mask], _MM_HINT_T0);
       }
+      for (u32 k = 0; k < n; k++) {
+        const u64 i = s0 + idx[k];
+        const u64 r = uf_root(i);
+        __atomic_store_n(&g_H[i].val, r == i ? 0 : r + 1, __ATOMIC_RELAXED);
+        roots += r == i;
+      }
+      used += n;
     }
-    nremap[t] = c;
+    nused[t] = used;
+    nroots[t] = roots;
   });
-  size_t remap = 0;
-  for (size_t c : nremap) remap += c;
+  size_t ids = 0, remap = 0;
+  for (int t = 0; t < ntask; t++) {
+    ids += nused[t];
+    remap += nused[t] - nroots[t];
+  }
   u64 words = 1 << 10;
-  while (words * 8 < remap) words <<= 1;  // >= 8 bits per key
+  while (words * 8 < remap) words <<= 1;  // >= 8 bits per ID in the filter
   g_F = (u64*)vm_alloc(words * 8);
   g_Fshift = 64 - ceil_log2(words);
-  for (u64 i = 0; i < nslots; i++) {
-    const HSlot& sl = g_H[i];
-    if (sl.key && sl.val != sl.key) g_F[sl.key >> g_Fshift] |= f_bits(sl.key, g_Fshift);
-  }
-  LOG("links: %zu ids remap to another name; filter %llu KB", remap, (unsigned long long)(words * 8 / 1024));
+  // Pass 2: parent -> person. The root's key is the hash of the person's name. Nothing reads another slot's
+  // value any more, so the values can be replaced in place.
+  parallel_for(ntask, [&](int t, int) {
+    const u64 a = nslots * t / ntask, b = nslots * (t + 1) / ntask;
+    const u32 fs = g_Fshift;
+    u32 idx[SUB];
+    for (u64 s0 = a; s0 < b; s0 += SUB) {
+      const u32 m = (u32)std::min<u64>(SUB, b - s0);
+      u32 n = 0;
+      for (u32 j = 0; j < m; j++) {
+        const HSlot& sl = g_H[s0 + j];
+        idx[n] = j;
+        n += sl.key != 0;
+        _mm_prefetch((const char*)&g_H[(sl.val - 1) & mask], _MM_HINT_T0);
+      }
+      for (u32 k = 0; k < n; k++) {
+        HSlot& sl = g_H[s0 + idx[k]];
+        const u64 v = sl.val;
+        if (v) {
+          sl.val = g_H[v - 1].key;
+          __atomic_fetch_or(&g_F[sl.key >> fs], f_bits(sl.key, fs), __ATOMIC_RELAXED);
+        } else {
+          sl.val = sl.key;
+        }
+      }
+    }
+  });
+  LOG("links: %zu lines, %zu ids in %llu slots, %zu with another name; filter %llu KB", nlinks, ids,
+      (unsigned long long)nslots, remap, (unsigned long long)(words * 8 / 1024));
 }
 
 // ------------------------------------------------------------------------------------------
@@ -1418,8 +1481,6 @@ static inline bool parse_price(const u8* s, u32 n, u32& out) {
   out = v;
   return true;
 }
-
-static void build_links(std::vector<MFile>& files);
 
 // Event lines are parsed a batch at a time, in three simple loops over the batch instead of one long loop
 // body per line: keys and hashes; timestamps, grouped by the form of `ts` so each group runs one kernel
@@ -1561,9 +1622,10 @@ static NOINLINE void ck_ts_exact(CkBatch& B, u32 i, const u8* base) {
   if (!parse_ts(base + B.off[i][3], B.len[i][3], B.ts[i])) B.ts[i] = INT64_MIN;
 }
 
-// Writes the valid clicks of the batch at `out` (room for n records) and returns the end.
-static NOINLINE C0* process_clicks(CkBatch& B, const u32 n, const u8* const base, C0* out, const i64 cws,
-                                   const i64 we) {
+// The valid clicks of the batch go to the router (person lookup, then the person's partition).
+template <class RT>
+static NOINLINE void process_clicks(CkBatch& B, const u32 n, const u8* const base, RT& router, const i64 cws,
+                                    const i64 we) {
   static const u8 CLS[32] = {3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 1, 3, 3, 3, 3, 3, 3, 0, 3, 3, 3, 3, 2, 3, 3, 3, 3, 3, 3};
   u32 cnt[4] = {0, 0, 0, 0};
   for (u32 i = 0; i < n; i++) {
@@ -1596,7 +1658,7 @@ static NOINLINE C0* process_clicks(CkBatch& B, const u32 n, const u8* const base
   }
   for (u32 j = 0; j < cnt[2]; j++) ck_ts_exact(B, B.idx[2][j], base);
   for (u32 j = 0; j < cnt[3]; j++) ck_ts_exact(B, B.idx[3][j], base);
-  // ---- keys, campaign, record: written unconditionally, kept only if the click is valid
+  // ---- keys and campaign; every line is handed to the router, which keeps the valid ones
   const u64 wlen = (u64)(we - cws);
   for (u32 i = 0; i < n; i++) {
     const u32* off = B.off[i];
@@ -1606,26 +1668,23 @@ static NOINLINE C0* process_clicks(CkBatch& B, const u32 n, const u8* const base
     const i32 camp = camp_fast(base + off[2], len[2]);
     const u64 rel = (u64)B.ts[i] - (u64)cws;  // in [0, wlen) iff the click is inside [window start - 7 days, window end)
     const u64 tc = (u64)(u32)rel | ((u64)(u32)camp << 32);
-    out->uid = uid;
-    out->click = click;
-    memcpy(&out->ts, &tc, 8);
-    out += (rel < wlen) & (camp >= 0);
+    router.add_if(uid, u64x2{click, tc}, (u32)((rel < wlen) & (camp >= 0)));
   }
-  return out;
 }
 
-// One chunk of a clicks file -> C0 records. Returns the number of lines with a click_id and a user_id.
+// One chunk of a clicks file -> R2C records. Returns the number of lines with a click_id and a user_id.
 static NOINLINE u64 parse_click_chunk(const u8* begin, const u8* end, bool skip_header, TL& tl, const i64 cws,
                                       const i64 we) {
   CkBatch B;
   u32 n = 0;
   u64 nl = 0;
   const u8* base = begin;
-  auto run = [&](u32 m) __attribute__((always_inline)) {
-    C0* d = tl.c0.reserve(CkBatch::CAP, tl.arena);
-    tl.c0.cur = process_clicks(B, m, base, d, cws, we);
-    nl += m;
+  const u32 p2shift = 64 - g_P2bits;
+  auto cur = tl.r2c.cursor(tl.arena);
+  auto emit = [p2shift](WCScatter<R2C>::Cursor& c, u64 ph, const u64x2& v) __attribute__((always_inline)) {
+    WCScatter<R2C>::push32(c, (u32)(ph >> p2shift), _mm256_set_epi64x(0, (long long)v.b, (long long)v.a, (long long)ph));
   };
+  Router<u64x2, R2C, decltype(emit)> router(cur, emit);
   scan::scan_lines<4>(begin, end, skip_header, [&](const u8* sb, __m256i st, __m256i ln) __attribute__((always_inline)) {
     _mm256_store_si256((__m256i*)B.off[n], st);
     _mm256_store_si256((__m256i*)B.len[n], ln);
@@ -1633,15 +1692,19 @@ static NOINLINE u64 parse_click_chunk(const u8* begin, const u8* end, bool skip_
     // a line without click_id or user_id is dropped: its slot is reused
     n += (_mm256_movemask_epi8(_mm256_cmpeq_epi32(ln, _mm256_setzero_si256())) & 0xFF) == 0;
     if (__builtin_expect(n == CkBatch::CAP, 0)) {
-      run(n);
+      process_clicks(B, n, sb, router, cws, we);
+      nl += n;
       n = 0;
     }
   });
-  if (n) run(n);
-  return nl;
+  if (n) process_clicks(B, n, base, router, cws, we);
+  router.run();
+  tl.r2c.close(cur);
+  tl.r2c.flush(tl.arena);
+  return nl + n;
 }
 
-static void parse_events_clicks(std::vector<MFile>& ev, std::vector<MFile>& ck, std::vector<MFile>& lk) {
+static void parse_events_clicks(std::vector<MFile>& ev, std::vector<MFile>& ck) {
   size_t ev_bytes = 0, ck_bytes = 0;
   for (auto& f : ev) ev_bytes += f.size;
   for (auto& f : ck) ck_bytes += f.size;
@@ -1651,9 +1714,7 @@ static void parse_events_clicks(std::vector<MFile>& ev, std::vector<MFile>& ck, 
   make_chunks(ck, chunk, cc);
   const u32 p1shift = 64 - g_P1bits;
   const i64 ws = g_ws, we = g_we, cws = g_ws - WEEK;
-  int ntasks = (int)(ce.size() + cc.size());
-  std::atomic<int> next{0};
-  auto task = [&](int t, int tid) {
+  parallel_for((int)(ce.size() + cc.size()), [&](int t, int tid) {
     TL& tl = g_tl[tid];
     if (t < (int)ce.size()) {
       const Chunk& c = ce[t];
@@ -1670,102 +1731,12 @@ static void parse_events_clicks(std::vector<MFile>& ev, std::vector<MFile>& ck, 
       tl.n_click_lines += parse_click_chunk(f.data + b, f.data + e, b == 0, tl, cws, we);
       drop_parsed(f, c.nominal, c.nominal_end);
     }
-  };
-  parallel_threads([&](int tid) {
-    u64 u0 = 0, s0 = 0, u1 = 0, s1 = 0;
-    if (g_log) thread_times(u0, s0);
-    if (tid == 0) {
-      tl_serial_tid = 0;
-      build_links(lk);
-      tl_serial_tid = -1;
-      if (g_log) {
-        thread_times(u1, s1);
-        g_phase_cycles[1] += u1 - u0;
-        g_phase_sys[1] += s1 - s0;
-        u0 = u1;
-        s0 = s1;
-      }
-      LOG("links done (thread 0)");
-    }
-    for (;;) {
-      int t = next.fetch_add(1, std::memory_order_relaxed);
-      if (t >= ntasks) break;
-      task(t, tid);
-    }
-    if (g_log) {
-      thread_times(u1, s1);
-      g_phase_cycles[2] += u1 - u0;
-      g_phase_sys[2] += s1 - s0;
-    }
   });
-  parallel_for(NT, [&](int t, int) {
-    TL& tl = g_tl[t];
-    tl.r1.finish(tl.arena);
-    tl.c0.finish();
-  });
+  parallel_for(NT, [&](int t, int) { g_tl[t].r1.finish(g_tl[t].arena); });
 }
 
 // ------------------------------------------------------------------------------------------
-// dedup (per event_id partition) and person lookups; click person lookups
-
-// Person lookup and scatter for a stream of items, a batch at a time. Each item comes with the hash of its
-// user ID. Two simple loops instead of one with data-dependent branches: (1) split the batch, without
-// branching, into items whose ID is its own person and items the filter flags, prefetching the H slot of the
-// latter; (2) emit both lists. emit(cursor, person hash, item) is called once per item, in no particular
-// order. The filter word of an item is prefetched when the item is added.
-template <class Item, class Rec, class Emit>
-struct Router {
-  static constexpr u32 CAP = 128;
-  using Cursor = typename WCScatter<Rec>::Cursor;
-  u64 key[CAP];
-  Item item[CAP];
-  u8 ld[CAP + 1], lh[CAP + 1];
-  u32 n = 0;
-  Cursor& cur;
-  Emit& emit;
-  Router(Cursor& c, Emit& e) : cur(c), emit(e) {}
-  FORCE_INLINE void add(u64 uh, const Item& it) {
-    key[n] = uh;
-    item[n] = it;
-    _mm_prefetch((const char*)&g_F[uh >> g_Fshift], _MM_HINT_T0);  // (a null g_F is harmless here)
-    if (__builtin_expect(++n == CAP, 0)) run();
-  }
-  NOINLINE void run() {
-    const u32 m = n;
-    n = 0;
-    Cursor c = cur;  // in registers for the loops below
-    if (!g_H) {
-      for (u32 i = 0; i < m; i++) emit(c, key[i], item[i]);
-      cur = c;
-      return;
-    }
-    const u64* const F = g_F;
-    const HSlot* const H = g_H;
-    const u32 fs = g_Fshift, hshift = 64 - g_Hbits;
-    u32 nd = 0, nh = 0;
-    for (u32 i = 0; i < m; i++) {
-      const u64 x = key[i];
-      const u64 b = f_bits(x, fs);
-      const u32 maybe = (F[x >> fs] & b) == b;
-      ld[nd] = (u8)i;
-      lh[nh] = (u8)i;
-      nd += maybe ^ 1;
-      nh += maybe;
-      // prefetch the H slot of flagged items only (the others get a harmless address)
-      const uintptr_t slot = (uintptr_t)&H[x >> hshift], dummy = (uintptr_t)key;
-      _mm_prefetch((const char*)(dummy ^ ((slot ^ dummy) & (0 - (uintptr_t)maybe))), _MM_HINT_T0);
-    }
-    for (u32 j = 0; j < nd; j++) {
-      const u32 i = ld[j];
-      emit(c, key[i], item[i]);
-    }
-    for (u32 j = 0; j < nh; j++) {
-      const u32 i = lh[j];
-      emit(c, h_lookup(key[i]), item[i]);
-    }
-    cur = c;
-  }
-};
+// dedup (per event_id partition) and person lookups
 
 // Dedup of one event_id partition, then the survivors are routed to their person partition.
 //
@@ -1783,16 +1754,6 @@ static void dedup_and_route() {
   std::vector<int> order(P1);
   for (u32 p = 0; p < P1; p++) order[p] = (int)p;
   std::sort(order.begin(), order.end(), [&](int a, int b) { return sizes[a] > sizes[b]; });
-  // click tasks: groups of blocks of each thread's c0 stream
-  struct CTask {
-    int t;
-    size_t b0, b1;
-  };
-  std::vector<CTask> ctasks;
-  for (int t = 0; t < NT; t++) {
-    size_t nb = g_tl[t].c0.blocks.size();
-    for (size_t b = 0; b < nb; b += 16) ctasks.push_back({t, b, std::min(nb, b + 16)});
-  }
   struct DSlot {
     u64 eid;
     const R1* best;
@@ -1803,32 +1764,8 @@ static void dedup_and_route() {
     std::vector<DSlot> tab;
   };
   std::vector<Scratch> scr(NT);
-  int ntasks = (int)(P1 + ctasks.size());
-  parallel_for(ntasks, [&](int oi, int tid) {
+  parallel_for((int)P1, [&](int oi, int tid) {
     TL& tl = g_tl[tid];
-    if (oi >= (int)P1) {
-      const CTask& ct = ctasks[oi - P1];
-      auto& blocks = g_tl[ct.t].c0.blocks;
-      auto cur = tl.r2c.cursor(tl.arena);
-      auto emit = [p2shift](WCScatter<R2C>::Cursor& c, u64 ph, const u64x2& v) __attribute__((always_inline)) {
-        WCScatter<R2C>::push32(c, (u32)(ph >> p2shift),
-                               _mm256_set_epi64x(0, (long long)v.b, (long long)v.a, (long long)ph));
-      };
-      Router<u64x2, R2C, decltype(emit)> router(cur, emit);
-      for (size_t b = ct.b0; b < ct.b1; b++) {
-        const C0* r = blocks[b].first;
-        for (u32 j = 0; j < blocks[b].second; j++) {
-          u64 tc;
-          memcpy(&tc, &r[j].ts, 8);
-          router.add(r[j].uid, u64x2{r[j].click, tc});
-        }
-        router.run();
-        tl.arena.free_blocks.push_back(blocks[b].first);
-      }
-      tl.r2c.close(cur);
-      tl.r2c.flush(tl.arena);
-      return;
-    }
     int p = order[oi];
     const size_t n = sizes[p];
     if (n == 0) return;
@@ -2728,10 +2665,6 @@ int main(int argc, char** argv) {
   NT = std::max(1, std::min(NT, 256));
   init_years();
 
-  load_lookups(data);
-  LOG("lookups: window %lld..%lld, %zu categories, %u campaigns, %d days", (long long)g_ws, (long long)g_we,
-      g_cats.size(), g_ncamp, g_ndays);
-
   std::vector<std::string> evp = list_csv(data + "/events"), ckp = list_csv(data + "/clicks"),
                            lkp = list_csv(data + "/links");
   std::vector<MFile> ev, ck, lk;
@@ -2743,17 +2676,26 @@ int main(int argc, char** argv) {
   u64 est_lines = ev_bytes / 70 + 1;
   g_P1bits = std::min<u32>(12, std::max<u32>(4, ceil_log2(est_lines / 16384 + 1)));
   g_P2bits = std::min<u32>(12, std::max<u32>(4, ceil_log2(est_lines / 32768 + 1)));
-  g_tl.resize(NT);
-  for (auto& t : g_tl) {
-    t.r1.init(1u << g_P1bits);
-    t.r2.init(1u << g_P2bits);
-    t.r2c.init(1u << g_P2bits);
-  }
   LOG("mapped %zu event files (%zu bytes), %zu click files, %zu link files; P1=%u P2=%u threads=%d", ev.size(),
       ev_bytes, ck.size(), lk.size(), 1u << g_P1bits, 1u << g_P2bits, NT);
+  // The lookups and the per-thread state are not needed for the links: set them up on the side meanwhile.
+  std::thread setup([&] {
+    load_lookups(data);
+    g_tl.resize(NT);
+    for (auto& t : g_tl) {
+      t.r1.init(1u << g_P1bits);
+      t.r2.init(1u << g_P2bits);
+      t.r2c.init(1u << g_P2bits);
+    }
+  });
+  g_phase = 1;
+  build_links(lk);
+  setup.join();
+  LOG("lookups: window %lld..%lld, %zu categories, %u campaigns, %d days", (long long)g_ws, (long long)g_we,
+      g_cats.size(), g_ncamp, g_ndays);
 
   g_phase = 2;
-  parse_events_clicks(ev, ck, lk);
+  parse_events_clicks(ev, ck);
   {
     u64 a = 0, b = 0;
     for (auto& t : g_tl) {
@@ -2793,7 +2735,7 @@ static int bench_parse(const char* data, const char* file, int reps) {
   init_years();
   NT = 1;
   load_lookups(data);
-  std::vector<MFile> ev{map_file(file)}, ck, lk;
+  std::vector<MFile> ev{map_file(file)}, ck;
   g_P1bits = 11;
   g_P2bits = 10;
   g_tl.resize(1);
@@ -2812,7 +2754,7 @@ static int bench_parse(const char* data, const char* file, int reps) {
     t.r2.init(1u << g_P2bits);
     t.r2c.init(1u << g_P2bits);
     u64 c0 = __rdtsc();
-    parse_events_clicks(ev, ck, lk);
+    parse_events_clicks(ev, ck);
     u64 c1 = __rdtsc();
     fprintf(stderr, "rep %d: %.1f cycles/line (%llu lines)\n", r, (double)(c1 - c0) / t.n_event_lines,
             (unsigned long long)t.n_event_lines);
