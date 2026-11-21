@@ -536,6 +536,27 @@ static FORCE_INLINE u32 list8(u32* dst, u32 m, u32 first) {
 }
 #endif
 
+// The lanes of v at the set bits of m (8 bits), moved down to lanes 0, 1, ... in order (the other lanes are
+// left undefined), by a table of the lane numbers for each m. pack8x also gives those lane numbers.
+// (One table load and one permute; with AVX-512 a compress instruction would do the same in about as many uops.)
+struct Lanes8 {
+  u64 ix[256];
+  constexpr Lanes8() : ix() {
+    for (u32 m = 0; m < 256; m++) {
+      u32 c = 0;
+      for (u32 l = 0; l < 8; l++)
+        if (m >> l & 1) ix[m] |= (u64)l << (8 * c++);
+    }
+  }
+};
+alignas(64) static constexpr Lanes8 k_lanes8{};
+static FORCE_INLINE __m256i lanes_of8(u32 m) { return _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*)(k_lanes8.ix + m))); }
+static FORCE_INLINE __m256i pack8(__m256i v, u32 m) { return _mm256_permutevar8x32_epi32(v, lanes_of8(m)); }
+static FORCE_INLINE __m256i pack8x(__m256i v, u32 m, __m256i& from) {
+  from = lanes_of8(m);
+  return _mm256_permutevar8x32_epi32(v, from);
+}
+
 // A batch of lines as the scanner hands them over: per field, a column of starts (offsets from the chunk
 // base) and a column of lengths. Groups of eight lines arrive as columns of separators (scan_cols); single
 // lines as two vectors of eight values.
@@ -1206,16 +1227,22 @@ static NOINLINE bool place(u32 j, D16* T, DS& S) {
     _mm_prefetch(nx + 128, _MM_HINT_T0);
     _mm_prefetch(nx + 192, _MM_HINT_T0);
     const D16* r = S.blk[bi].first;
-    const u32 n = S.blk[bi].second;
-    for (u32 i = 0; i < n; i++) {
-      const u64 w0 = r[i].w0, w1 = r[i].w1;
-      D16& s = T[(w1 >> 46) & ELOM];
-      const u64 o0 = s.w0, o1 = s.w1;
+    const D16* const re = r + S.blk[bi].second;
+    u8* const Tb = (u8*)T;
+    auto put = [Tb](const D16* q) __attribute__((always_inline)) {
+      const u64 w0 = q->w0, w1 = q->w1;
+      D16* const s = (D16*)(Tb + ((w1 >> 42) & ((u64)ELOM << 4)));  // (the slot is bits 46 to 59)
+      const u64 o0 = s->w0, o1 = s->w1;
       // (an empty slot has code 0, which wraps to the largest value)
-      const bool take = (u32)(((u32)w1 & 0xFFFFFF) - 1) < (u32)(((u32)o1 & 0xFFFFFF) - 1);
-      s.w0 = take ? w0 : o0;
-      s.w1 = take ? w1 : o1;
+      const bool take = _bzhi_u32((u32)w1, 24) - 1 < _bzhi_u32((u32)o1, 24) - 1;
+      s->w0 = take ? w0 : o0;
+      s->w1 = take ? w1 : o1;
+    };
+    for (; r + 2 <= re; r += 2) {  // (in order: two records may have the same slot)
+      put(r);
+      put(r + 1);
     }
+    if (r < re) put(r);
   }
   return true;
 }
@@ -1682,46 +1709,135 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
   i64 h_prev = ps.prev, h_order = ps.order;
 #define DN_OUT() (ps.ns = h_ns, ps.nev = h_nev, ps.prev = h_prev, ps.order = h_order)
 #define DN_IN() (h_base = ps.cur_base, h_cnt = ps.cur_cnt, h_ns = ps.ns, h_nev = ps.nev, h_xnext = ps.x_next, h_prev = ps.prev, h_order = ps.order)
+  // One slot, the whole way (a macro, so that the state stays in the locals above; continue leaves it).
+#define DN_SLOT(I)                                                                       \
+  do {                                                                                   \
+    const u64 w0 = T[I].w0;                                                              \
+    const u32 tsf = (u32)w0;                                                             \
+    if ((tsf & 0x7FFFFFFF) == 0) continue; /* no record, or an event that is not valid */ \
+    const u32 ts = (tsf & 0x7FFFFFFF) - 1;                                               \
+    u32 un = (u32)(w0 >> 32), cat = 0, price = 0;                                        \
+    if (__builtin_expect((i32)tsf < 0, 0)) { /* a side entry */                          \
+      const XEv& x = g_tl[un >> 24].xev[un & 0xFFFFFF];                                  \
+      if (x.num == NONE) {                                                               \
+        push_r2(c2, p2shift, person_of(x.uid), ts, x.payload);                           \
+        n_general++;                                                                     \
+        continue;                                                                        \
+      }                                                                                  \
+      un = x.num;                                                                        \
+      cat = x.payload >> 24;                                                             \
+      price = x.payload & 0xFFFFFF;                                                      \
+    } else {                                                                             \
+      const u32 pay = (u32)(T[I].w1 >> 24) & 0x3FFFFF;                                   \
+      if (__builtin_expect(pay != 0, 0)) {                                               \
+        cat = pay >> 17;                                                                 \
+        price = pay & 0x1FFFF;                                                           \
+      }                                                                                  \
+    }                                                                                    \
+    if (__builtin_expect(un - h_base >= h_cnt, 0)) { /* not an ID of the open person */  \
+      DN_OUT();                                                                          \
+      const bool mine = other(un, ts, cat, price);                                       \
+      DN_IN();                                                                           \
+      if (!mine) continue;                                                               \
+    }                                                                                    \
+    if (__builtin_expect(ts >= h_xnext, 0)) {                                            \
+      DN_OUT();                                                                          \
+      feed_extras(ts);                                                                   \
+      DN_IN();                                                                           \
+    }                                                                                    \
+    DN_FEED(h_ns, h_nev, h_prev, h_order, ts, cat, price);                               \
+  } while (0)
+  static_assert(ESLOTS % 8 == 0, "the slot table is read in groups of eight");
+  // Eight slots at a time. The vector path takes the valid events of a group up to the first one it cannot:
+  // a side entry or an ID that is not of the open person. That one goes the whole way, and the vector path
+  // goes on with the slots after it. The vector path runs only while a person is open, has no extra event
+  // still to come, and its last time fits 31 bits (so the gaps fit 32-bit lanes).
+  bool vec_ok = false;
+  __m256i v_base = _mm256_setzero_si256(), v_cnt = _mm256_setzero_si256();
+  // (the asm statements keep the compiler from building these again from scalars in every group)
+#define DN_VEC()                                                                      \
+  do {                                                                                \
+    vec_ok = h_cnt != 0 && h_xnext == NONE && (u64)h_prev < 0x80000000ULL;            \
+    v_base = _mm256_set1_epi32((int)h_base);                                          \
+    v_cnt = _mm256_set1_epi32((int)h_cnt);                                            \
+    __asm__("" : "+x"(v_base), "+x"(v_cnt));                                          \
+  } while (0)
+  __m256i k_ord = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7), k_sh1 = _mm256_setr_epi32(0, 0, 1, 2, 3, 4, 5, 6);
+  __m256i k_m31 = _mm256_set1_epi32(0x7FFFFFFF), k_min30 = _mm256_set1_epi32((int)MIN30);
+  __m256i k_price = _mm256_set1_epi64x(0x1FFFFLL << 24);
+  __asm__("" : "+x"(k_ord), "+x"(k_sh1), "+x"(k_m31), "+x"(k_min30), "+x"(k_price));
+  alignas(32) u32 pbuf[16];
   for (u32 j = pb; j < pe && !g_fail.load(std::memory_order_relaxed); j++) {
     if (!place(j, T, S)) continue;
-    for (u32 i = 0; i < ESLOTS; i++) {
-      const u64 w0 = T[i].w0;
-      const u32 tsf = (u32)w0;
-      if ((tsf & 0x7FFFFFFF) == 0) continue;  // no record, or an event that is not valid
-      const u32 ts = (tsf & 0x7FFFFFFF) - 1;
-      u32 un = (u32)(w0 >> 32), cat = 0, price = 0;
-      if (__builtin_expect((i32)tsf < 0, 0)) {  // a side entry
-        const XEv& x = g_tl[un >> 24].xev[un & 0xFFFFFF];
-        if (x.num == NONE) {
-          push_r2(c2, p2shift, person_of(x.uid), ts, x.payload);
-          n_general++;
-          continue;
+    DN_VEC();
+    for (u32 i = 0; i < ESLOTS; i += 8) {
+      u32 done = 0;  // the slots of the group that are dealt with
+      for (;;) {
+        u32 k;  // the first slot the vector path did not take
+        if (__builtin_expect(vec_ok, 1)) {
+          const __m256i* const tv = (const __m256i*)(T + i);
+          const __m256i L0 = _mm256_load_si256(tv), L1 = _mm256_load_si256(tv + 1);
+          const __m256i L2 = _mm256_load_si256(tv + 2), L3 = _mm256_load_si256(tv + 3);
+          const __m256 X = _mm256_castsi256_ps(_mm256_unpacklo_epi64(L0, L1));  // w0 of slots 0 2 | 1 3
+          const __m256 Y = _mm256_castsi256_ps(_mm256_unpacklo_epi64(L2, L3));  // ... 4 6 | 5 7
+          const __m256i TF = _mm256_permutevar8x32_epi32(_mm256_castps_si256(_mm256_shuffle_ps(X, Y, 0x88)), k_ord);  // low words
+          const __m256i UN = _mm256_permutevar8x32_epi32(_mm256_castps_si256(_mm256_shuffle_ps(X, Y, 0xDD)), k_ord);  // user numbers
+          const __m256i TV = _mm256_and_si256(TF, k_m31);
+          const u32 avail = ~((u32)_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(TV, _mm256_setzero_si256()))) | done) & 0xFF;
+          // not of the open person: un - base >= cnt, unsigned; a side entry has the top bit of its low word
+          const __m256i D = _mm256_sub_epi32(UN, v_base);
+          const __m256i OUT = _mm256_or_si256(_mm256_cmpeq_epi32(_mm256_max_epu32(D, v_cnt), D), TF);
+          const u32 irr = (u32)_mm256_movemask_ps(_mm256_castsi256_ps(OUT)) & avail;
+          k = _tzcnt_u32(irr | 0x100);
+          const u32 fm = _bzhi_u32(avail, k), n = (u32)_mm_popcnt_u32(fm);
+          // the times of the events it takes, in order, and their gaps
+          const __m256i TC = _mm256_sub_epi32(pack8(TV, fm), _mm256_set1_epi32(1));
+          const u32 prev32 = (u32)h_prev;
+          const __m256i SH = _mm256_blend_epi32(_mm256_permutevar8x32_epi32(TC, k_sh1), _mm256_castsi128_si256(_mm_cvtsi32_si128((int)prev32)), 1);
+          const __m256i G = _mm256_sub_epi32(TC, SH);
+          const u32 bad = _bzhi_u32((u32)_mm256_movemask_ps(_mm256_castsi256_ps(G)), n);
+          const u32 st = _bzhi_u32((u32)_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(G, k_min30))), n);
+          // the sessions they start (the lanes after the last start are written too, and are never read)
+          __m256i from;
+          const __m256i SS = pack8x(TC, st, from);
+          const u32 ns0 = h_ns;
+          _mm256_storeu_si256((__m256i*)(sess_ts + ns0), SS);
+          _mm256_storeu_si256((__m256i*)(sess_ev + ns0), _mm256_add_epi32(from, _mm256_set1_epi32((int)h_nev)));
+          h_ns += (u32)_mm_popcnt_u32(st);
+          h_nev += n;
+          h_order |= -(i64)bad;
+          pbuf[0] = prev32;
+          _mm256_storeu_si256((__m256i*)(pbuf + 1), TC);
+          h_prev = pbuf[n];
+          const __m256i P = _mm256_unpackhi_epi64(L0, L1), Q = _mm256_unpackhi_epi64(L2, L3);  // w1 of slots 0 2 1 3, 4 6 5 7
+          if (__builtin_expect(!_mm256_testz_si256(_mm256_or_si256(P, Q), k_price), 0)) {  // a purchase among the 8 slots
+            const __m256i z = _mm256_setzero_si256();
+            const u32 pz = (u32)_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(_mm256_and_si256(_mm256_permute4x64_epi64(P, 0xD8), k_price), z))) |
+                           (u32)_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(_mm256_and_si256(_mm256_permute4x64_epi64(Q, 0xD8), k_price), z))) << 4;
+            for (u32 m = fm & ~pz; m; m = _blsr_u32(m)) {
+              const u32 l = (u32)_tzcnt_u32(m), pay = (u32)(T[i + l].w1 >> 24) & 0x3FFFFF;
+              const u32 c = (u32)_mm_popcnt_u32(fm & ((1u << l) - 1));  // its place among the events taken
+              S.pur.push_back(DS::Pur{ns0 + (u32)_mm_popcnt_u32(st & ((2u << c) - 1)) - 1, pay >> 17, pay & 0x1FFFF});
+            }
+          }
+          if (__builtin_expect(h_ns >= SCAP, 0)) {  // (as in DN_FEED)
+            h_order = -1;
+            h_ns = 1;
+          }
+          if (k >= 8) break;
+        } else {
+          k = (u32)_tzcnt_u32(~done);
         }
-        un = x.num;
-        cat = x.payload >> 24;
-        price = x.payload & 0xFFFFFF;
-      } else {
-        const u32 pay = (u32)(T[i].w1 >> 24) & 0x3FFFFF;
-        if (__builtin_expect(pay != 0, 0)) {
-          cat = pay >> 17;
-          price = pay & 0x1FFFF;
-        }
+        DN_SLOT(i + k);
+        DN_VEC();
+        done = (2u << k) - 1;
+        if (done == 0xFF) break;
       }
-      if (__builtin_expect(un - h_base >= h_cnt, 0)) {  // not an ID of the open person
-        DN_OUT();
-        const bool mine = other(un, ts, cat, price);
-        DN_IN();
-        if (!mine) continue;
-      }
-      if (__builtin_expect(ts >= h_xnext, 0)) {
-        DN_OUT();
-        feed_extras(ts);
-        DN_IN();
-      }
-      DN_FEED(h_ns, h_nev, h_prev, h_order, ts, cat, price);
     }
     memset(T, 0, sizeof(D16) * ESLOTS);
   }
+#undef DN_SLOT
+#undef DN_VEC
   // ---- the rest of the open person, in the partitions after ours
   if (ps.cur_p != NONE || h_cnt) {
     for (u32 j = pe; j < g_PE && !g_fail.load(std::memory_order_relaxed); j++) {
