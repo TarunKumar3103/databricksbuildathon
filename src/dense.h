@@ -547,6 +547,7 @@ static NOINLINE i64 icode_of_ms(i64 ing) {
 static void init_daycode() {
   for (int k = 0; k < 2; k++)
     for (int i = 0; i < 416; i++) g_daycode[k][i] = g_dayms[k][i] == DAYMS_NONE ? 0 : (g_dayms[k][i] - g_ing_base) / 1000 + 1;
+  memcpy(g_day_m[1], g_daycode[g_ymain_row], sizeof g_day_m[1]);
 }
 
 // Eight 32-bit lanes at a time (mask compares with AVX-512, plain AVX2 otherwise).

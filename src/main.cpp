@@ -753,6 +753,12 @@ static FORCE_INLINE u32 year_row(u32 y) {
   k = y == g_ytxt[1] ? 1 : k;
   return k;
 }
+// The year of the middle of the range init_fast_years was given (0: none), and copies of its rows of g_dayms
+// and g_daycode at fixed addresses: when every year a kernel looks at is this one, it reads these without
+// year_row (no row number to multiply, no row to select).
+static u32 g_ymain = 0;
+static i64 g_day_m[2][416];  // [0]: g_dayms, [1]: g_daycode (one table, so one base address for both)
+static u32 g_ymain_row = 2;
 
 static void civil_from_days(i64 days, i64& y, i64& m, i64& d) {
   i64 z = days + 719468;
@@ -787,7 +793,35 @@ static void init_fast_years(i64 lo_ms, i64 hi_ms) {
       for (int dd = 1; dd <= dim; dd++) g_dayms[k][mo * 32 + dd] = days_from_civil(ys[k], mo, dd) * DAY;
     }
   }
+  // the main year: that of the middle of the range, as its row (year_row's answer for it)
+  i64 ym;
+  civil_from_days(fdiv(lo_ms + (hi_ms - lo_ms) / 2, DAY), ym, m, d);
+  g_ymain_row = ym == ys[1] && g_ytxt[1] ? 1 : (ym == ys[0] && g_ytxt[0] ? 0 : 2);
+  g_ymain = g_ymain_row < 2 ? g_ytxt[g_ymain_row] : 0;
+  if (g_ymain && year_row(g_ymain) != g_ymain_row) g_ymain_row = year_row(g_ymain);  // (equal years: row 1)
+  memcpy(g_day_m[0], g_dayms[g_ymain_row], sizeof g_day_m[0]);
+  memcpy(g_day_m[1], g_daycode[g_ymain_row], sizeof g_day_m[1]);
 }
+
+// The digit and separator check of the F1 kernels as one compare: each of the 16 bytes "-MM-DDTHH:MM:SSZ" (bytes
+// 4..19 of a timestamp) less what it should be ('0' for a digit, the separator itself) may be at most 9 for a
+// digit, 0 for a separator, and anything (255) where OKM leaves a byte out. Lanes of 16 bytes, n of them.
+static constexpr bool f1_is_sep(int j) { return j == 0 || j == 3 || j == 6 || j == 9 || j == 12 || j == 15; }
+template <u32 OKM, int N>
+struct F1Lim {
+  alignas(32) u8 lim[16 * N];
+  alignas(32) u8 base[16 * N];
+  constexpr F1Lim() : lim(), base() {
+    const char sepc[16] = {'-', 0, 0, '-', 0, 0, 'T', 0, 0, ':', 0, 0, ':', 0, 0, 'Z'};
+    for (int i = 0; i < 16 * N; i++) {
+      const int j = i & 15;
+      base[i] = f1_is_sep(j) ? (u8)sepc[j] : (u8)'0';
+      lim[i] = ((OKM >> i) & 1) ? (f1_is_sep(j) ? 0 : 9) : 255;
+    }
+  }
+};
+template <u32 OKM, int N>
+alignas(32) static constexpr F1Lim<OKM, N> k_f1lim{};
 
 // Two F1 timestamps at once. True iff both are valid F1 in a candidate year; then ta / tb are their values.
 // Needs 20 readable bytes at a and at b. OKM: the positions (bytes 4..19 of a, then of b) that are checked;
@@ -798,21 +832,18 @@ static FORCE_INLINE bool f1_pair_mc(const u8* a, const u8* b, i64& ta, i64& tb, 
   // bytes 4..19 of both: "-MM-DDTHH:MM:SSZ"
   const __m256i v = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128((const __m128i*)(a + 4))),
                                             _mm_loadu_si128((const __m128i*)(b + 4)), 1);
-  const __m256i d = _mm256_sub_epi8(v, _mm256_set1_epi8('0'));
-  const __m256i isdig = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
-  const __m256i sepval = _mm256_setr_epi8('-', 0, 0, '-', 0, 0, 'T', 0, 0, ':', 0, 0, ':', 0, 0, 'Z', '-', 0, 0, '-',
-                                          0, 0, 'T', 0, 0, ':', 0, 0, ':', 0, 0, 'Z');
-  const __m256i sepm = _mm256_setr_epi8(-1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, -1, 0, 0, -1, 0, 0, -1, 0,
-                                        0, -1, 0, 0, -1, 0, 0, -1);
-  const u32 okm = (u32)_mm256_movemask_epi8(_mm256_blendv_epi8(isdig, _mm256_cmpeq_epi8(v, sepval), sepm));
+  const F1Lim<OKM, 2>& K = k_f1lim<OKM, 2>;
+  const __m256i d = _mm256_sub_epi8(v, _mm256_load_si256((const __m256i*)K.base));  // the digits where they belong
+  const __m256i ok = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_load_si256((const __m256i*)K.lim)), d);
   const __m256i g = _mm256_shuffle_epi8(d, _mm256_setr_epi8(1, 2, 4, 5, 7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1, 1,
                                                             2, 4, 5, 7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1));
   const __m256i p = _mm256_maddubs_epi16(
       g, _mm256_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0,
                           0, 0, 0, 0));  // month, day, hour, minute, second
-  // upper bounds (they also keep month * 32 + day inside the table); month 0 / day 0 are not in the table
+  // upper bounds (they also keep month * 32 + day inside the table); month 0 / day 0 are not in the table. Both
+  // checks in one mask: every byte checked fine and no field too large.
   const __m256i bad = _mm256_cmpgt_epi16(p, _mm256_setr_epi16(12, 31, 23, 59, 59, 0, 0, 0, 12, 31, 23, 59, 59, 0, 0, 0));
-  if (((okm & OKM) != OKM) | !_mm256_testz_si256(bad, bad)) return false;
+  if ((u32)_mm256_movemask_epi8(_mm256_andnot_si256(bad, ok)) != 0xFFFFFFFFu) return false;
   const __m256i q = _mm256_madd_epi16(p, _mm256_setr_epi16(32, 1, 60, 1, 1, 0, 0, 0, 32, 1, 60, 1, 1, 0, 0, 0));
   alignas(32) u32 Lbuf[8];  // month * 32 + day, hour * 60 + minute, second, 0
   _mm256_store_si256((__m256i*)Lbuf, q);
@@ -821,13 +852,23 @@ static FORCE_INLINE bool f1_pair_mc(const u8* a, const u8* b, i64& ta, i64& tb, 
   u32 ya, yb;
   memcpy(&ya, a, 4);
   memcpy(&yb, b, 4);
-  const u32 ka = year_row(ya), kb = year_row(yb);
-  const i64 da = g_dayms[ka][L[0]], db = g_dayms[kb][L[4]];
+  i64 da, db, cd;
+  if (__builtin_expect(((ya ^ g_ymain) | (yb ^ g_ymain)) == 0, 1)) {
+    da = g_day_m[0][L[0]];
+    db = g_day_m[0][L[4]];
+    cd = g_day_m[1][L[4]];
+    __asm__("" : "+r"(da), "+r"(db), "+r"(cd));  // (loaded here: merged with the other branch as addresses, they cost three LEAs)
+  } else {
+    const u32 ka = year_row(ya), kb = year_row(yb);
+    da = g_dayms[ka][L[0]];
+    db = g_dayms[kb][L[4]];
+    cd = g_daycode[kb][L[4]];
+  }
   if ((da == DAYMS_NONE) | (db == DAYMS_NONE)) return false;
   ta = da + (i64)(L[1] * 60 + L[2]) * 1000;
   const u32 sb = L[5] * 60 + L[6];
   tb = db + (i64)sb * 1000;
-  cb = g_daycode[kb][L[4]] + (i64)sb;
+  cb = cd + (i64)sb;
   return true;
 }
 template <u32 OKM>
@@ -844,15 +885,13 @@ static FORCE_INLINE bool f1_pair(const u8* a, const u8* b, i64& ta, i64& tb) {
 template <u32 OKM>
 static FORCE_INLINE bool f1_one_mc(const u8* a, i64& ta, i64& ca) {
   const __m128i v = _mm_loadu_si128((const __m128i*)(a + 4));
-  const __m128i d = _mm_sub_epi8(v, _mm_set1_epi8('0'));
-  const __m128i isdig = _mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d);
-  const __m128i sepval = _mm_setr_epi8('-', 0, 0, '-', 0, 0, 'T', 0, 0, ':', 0, 0, ':', 0, 0, 'Z');
-  const __m128i sepm = _mm_setr_epi8(-1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1);
-  const u32 okm = (u32)_mm_movemask_epi8(_mm_blendv_epi8(isdig, _mm_cmpeq_epi8(v, sepval), sepm));
+  const F1Lim<OKM, 1>& K = k_f1lim<OKM, 1>;
+  const __m128i d = _mm_sub_epi8(v, _mm_load_si128((const __m128i*)K.base));
+  const __m128i ok = _mm_cmpeq_epi8(_mm_min_epu8(d, _mm_load_si128((const __m128i*)K.lim)), d);
   const __m128i g = _mm_shuffle_epi8(d, _mm_setr_epi8(1, 2, 4, 5, 7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1));
   const __m128i p = _mm_maddubs_epi16(g, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0));
   const __m128i bad = _mm_cmpgt_epi16(p, _mm_setr_epi16(12, 31, 23, 59, 59, 0, 0, 0));
-  if (((okm & OKM) != OKM) | !_mm_testz_si128(bad, bad)) return false;
+  if ((u32)_mm_movemask_epi8(_mm_andnot_si128(bad, ok)) != 0xFFFFu) return false;
   const __m128i q = _mm_madd_epi16(p, _mm_setr_epi16(32, 1, 60, 1, 1, 0, 0, 0));
   alignas(16) u32 Lbuf[4];
   _mm_store_si128((__m128i*)Lbuf, q);
@@ -860,12 +899,20 @@ static FORCE_INLINE bool f1_one_mc(const u8* a, i64& ta, i64& ca) {
   __asm__("" : "+r"(L));
   u32 ya;
   memcpy(&ya, a, 4);
-  const u32 ka = year_row(ya);
-  const i64 da = g_dayms[ka][L[0]];
+  i64 da, cd;
+  if (__builtin_expect(ya == g_ymain, 1)) {
+    da = g_day_m[0][L[0]];
+    cd = g_day_m[1][L[0]];
+    __asm__("" : "+r"(da), "+r"(cd));
+  } else {
+    const u32 ka = year_row(ya);
+    da = g_dayms[ka][L[0]];
+    cd = g_daycode[ka][L[0]];
+  }
   if (da == DAYMS_NONE) return false;
   const u32 sa = L[1] * 60 + L[2];
   ta = da + (i64)sa * 1000;
-  ca = g_daycode[ka][L[0]] + (i64)sa;
+  ca = cd + (i64)sa;
   return true;
 }
 template <u32 OKM>
