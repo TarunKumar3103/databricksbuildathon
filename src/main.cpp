@@ -666,6 +666,116 @@ static bool parse_ts_ref(const u8* s, u32 n, i64& out) {
 }
 
 // ------------------------------------------------------------------------------------------
+// Fast path for F1 timestamps ("YYYY-MM-DDTHH:MM:SSZ") in the years the window can touch.
+//
+// The year is compared as text with the (at most two) candidate years; the other 16 bytes are validated in
+// one vector compare, and the date is turned into milliseconds with one table lookup. Anything these
+// kernels do not accept is decided by parse_ts / parse_f1, so they only have to be right when they say yes.
+
+static u32 g_ytxt[2];          // candidate years as their 4 ASCII digits (0: none)
+static i64 g_dayms[2][416];    // [candidate][month * 32 + day] -> ms at 00:00 UTC, DAYMS_NONE if no such date
+static constexpr i64 DAYMS_NONE = INT64_MIN;
+
+static void civil_from_days(i64 days, i64& y, i64& m, i64& d) {
+  i64 z = days + 719468;
+  i64 era = (z >= 0 ? z : z - 146096) / 146097;
+  i64 doe = z - era * 146097;
+  i64 yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  y = yoe + era * 400;
+  i64 doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  i64 mp = (5 * doy + 2) / 153;
+  d = doy - (153 * mp + 2) / 5 + 1;
+  m = mp < 10 ? mp + 3 : mp - 9;
+  y += (m <= 2);
+}
+
+// Candidate years: those of lo_ms and hi_ms. Any choice is safe; it only decides what takes the fast path.
+static void init_fast_years(i64 lo_ms, i64 hi_ms) {
+  auto fdiv = [](i64 a, i64 b) { return a >= 0 ? a / b : -((-a + b - 1) / b); };
+  i64 ys[2];
+  i64 m, d;
+  civil_from_days(fdiv(lo_ms, DAY), ys[0], m, d);
+  civil_from_days(fdiv(hi_ms, DAY), ys[1], m, d);
+  for (int k = 0; k < 2; k++) {
+    g_ytxt[k] = 0;
+    for (int i = 0; i < 416; i++) g_dayms[k][i] = DAYMS_NONE;
+    if (ys[k] < 1000 || ys[k] > 9999) continue;
+    char t[8];
+    snprintf(t, sizeof t, "%04d", (int)ys[k]);
+    memcpy(&g_ytxt[k], t, 4);
+    for (int mo = 1; mo <= 12; mo++) {
+      const int dim = DIM[mo] + ((mo == 2 && is_leap((u32)ys[k])) ? 1 : 0);
+      for (int dd = 1; dd <= dim; dd++) g_dayms[k][mo * 32 + dd] = days_from_civil(ys[k], mo, dd) * DAY;
+    }
+  }
+}
+
+// Two F1 timestamps at once. True iff both are valid F1 in a candidate year; then ta / tb are their values.
+// Needs 20 readable bytes at a and at b.
+static FORCE_INLINE bool f1_pair(const u8* a, const u8* b, i64& ta, i64& tb) {
+  // bytes 4..19 of both: "-MM-DDTHH:MM:SSZ"
+  const __m256i v = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128((const __m128i*)(a + 4))),
+                                            _mm_loadu_si128((const __m128i*)(b + 4)), 1);
+  const __m256i d = _mm256_sub_epi8(v, _mm256_set1_epi8('0'));
+  const __m256i isdig = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
+  const __m256i sepval = _mm256_setr_epi8('-', 0, 0, '-', 0, 0, 'T', 0, 0, ':', 0, 0, ':', 0, 0, 'Z', '-', 0, 0, '-',
+                                          0, 0, 'T', 0, 0, ':', 0, 0, ':', 0, 0, 'Z');
+  const __m256i sepm = _mm256_setr_epi8(-1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, -1, 0, 0, -1, 0, 0, -1, 0,
+                                        0, -1, 0, 0, -1, 0, 0, -1);
+  const u32 okm = (u32)_mm256_movemask_epi8(_mm256_blendv_epi8(isdig, _mm256_cmpeq_epi8(v, sepval), sepm));
+  const __m256i g = _mm256_shuffle_epi8(d, _mm256_setr_epi8(1, 2, 4, 5, 7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1, 1,
+                                                            2, 4, 5, 7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1));
+  const __m256i p = _mm256_maddubs_epi16(
+      g, _mm256_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0,
+                          0, 0, 0, 0));  // month, day, hour, minute, second
+  // upper bounds (they also keep month * 32 + day inside the table); month 0 / day 0 are not in the table
+  const __m256i bad = _mm256_cmpgt_epi16(p, _mm256_setr_epi16(12, 31, 23, 59, 59, 0, 0, 0, 12, 31, 23, 59, 59, 0, 0, 0));
+  if ((okm != 0xFFFFFFFFu) | !_mm256_testz_si256(bad, bad)) return false;
+  const __m256i q = _mm256_madd_epi16(p, _mm256_setr_epi16(32, 1, 60, 1, 1, 0, 0, 0, 32, 1, 60, 1, 1, 0, 0, 0));
+  alignas(32) u32 Lbuf[8];  // month * 32 + day, hour * 60 + minute, second, 0
+  _mm256_store_si256((__m256i*)Lbuf, q);
+  const u32* L = Lbuf;
+  __asm__("" : "+r"(L));  // plain loads instead of vector extracts
+  u32 ya, yb;
+  memcpy(&ya, a, 4);
+  memcpy(&yb, b, 4);
+  const u32 ka = ya == g_ytxt[1], kb = yb == g_ytxt[1];
+  if (!(((ya == g_ytxt[0]) | ka) & ((yb == g_ytxt[0]) | kb))) return false;
+  const i64 da = g_dayms[ka][L[0]], db = g_dayms[kb][L[4]];
+  if ((da == DAYMS_NONE) | (db == DAYMS_NONE)) return false;
+  ta = da + (i64)(L[1] * 60 + L[2]) * 1000;
+  tb = db + (i64)(L[5] * 60 + L[6]) * 1000;
+  return true;
+}
+
+// One F1 timestamp. Needs 20 readable bytes at a.
+static FORCE_INLINE bool f1_one(const u8* a, i64& ta) {
+  const __m128i v = _mm_loadu_si128((const __m128i*)(a + 4));
+  const __m128i d = _mm_sub_epi8(v, _mm_set1_epi8('0'));
+  const __m128i isdig = _mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d);
+  const __m128i sepval = _mm_setr_epi8('-', 0, 0, '-', 0, 0, 'T', 0, 0, ':', 0, 0, ':', 0, 0, 'Z');
+  const __m128i sepm = _mm_setr_epi8(-1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1);
+  const u32 okm = (u32)_mm_movemask_epi8(_mm_blendv_epi8(isdig, _mm_cmpeq_epi8(v, sepval), sepm));
+  const __m128i g = _mm_shuffle_epi8(d, _mm_setr_epi8(1, 2, 4, 5, 7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1));
+  const __m128i p = _mm_maddubs_epi16(g, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0));
+  const __m128i bad = _mm_cmpgt_epi16(p, _mm_setr_epi16(12, 31, 23, 59, 59, 0, 0, 0));
+  if ((okm != 0xFFFFu) | !_mm_testz_si128(bad, bad)) return false;
+  const __m128i q = _mm_madd_epi16(p, _mm_setr_epi16(32, 1, 60, 1, 1, 0, 0, 0));
+  alignas(16) u32 Lbuf[4];
+  _mm_store_si128((__m128i*)Lbuf, q);
+  const u32* L = Lbuf;
+  __asm__("" : "+r"(L));
+  u32 ya;
+  memcpy(&ya, a, 4);
+  const u32 ka = ya == g_ytxt[1];
+  if (!((ya == g_ytxt[0]) | ka)) return false;
+  const i64 da = g_dayms[ka][L[0]];
+  if (da == DAYMS_NONE) return false;
+  ta = da + (i64)(L[1] * 60 + L[2]) * 1000;
+  return true;
+}
+
+// ------------------------------------------------------------------------------------------
 // files
 
 struct MFile {
@@ -990,6 +1100,7 @@ static void load_lookups(const std::string& data) {
   auto fdiv = [](i64 a, i64 b) { return a >= 0 ? a / b : -((-a + b - 1) / b); };
   g_day0 = fdiv(g_ws, DAY);
   g_ndays = (int)(fdiv(g_we - 1, DAY) - g_day0 + 1);
+  init_fast_years(g_ws - WEEK, g_we + 6 * DAY);
 
   auto read_pairs = [&](const std::string& path, std::vector<std::pair<std::string, std::string>>& rows) {
     std::string s = read_small(path);
@@ -1279,49 +1390,125 @@ static inline bool parse_price(const u8* s, u32 n, u32& out) {
 
 static void build_links(std::vector<MFile>& files);
 
-// One chunk of an events file -> R1 records. Everything the per-line code needs is a local of this function,
-// so it is kept in registers across the loop. Returns the number of lines with a non-empty event_id.
+// Event lines are parsed a batch at a time, in three simple loops over the batch instead of one long loop
+// body per line: keys and hashes; timestamps, grouped by the form of `ts` so each group runs one kernel
+// without the form changing under it; validation, record assembly and the scatter.
+struct EvBatch {
+  static constexpr u32 CAP = 64;
+  alignas(32) u32 off[CAP][8];  // field offsets from the chunk base
+  alignas(32) u32 len[CAP][8];  // field lengths
+  u64 eh[CAP], uid[CAP];
+  i64 ts[CAP], ing[CAP];
+  u8 ok[CAP];      // ts is a valid timestamp
+  u8 idx[4][CAP];  // lines by form of ts: 20 bytes, 13 bytes, 25 bytes, other
+};
+
+static NOINLINE void ts_exact(EvBatch& B, u32 i, const u8* base) {
+  const u32* off = B.off[i];
+  const u32* len = B.len[i];
+  B.ok[i] = parse_ts(base + off[2], len[2], B.ts[i]);
+  if (!parse_f1(base + off[3], len[3], B.ing[i])) B.ing[i] = INT64_MAX;
+}
+
+static NOINLINE void process_events(EvBatch& B, const u32 n, const u8* const base, WCScatter<R1>::Cursor& cur_out,
+                                    const u32 p1shift, const i64 ws, const i64 we) {
+  // ---- keys
+  for (u32 i = 0; i < n; i++) {
+    const u32* off = B.off[i];
+    const u32* len = B.len[i];
+    B.eh[i] = mix64(make_key(base + off[0], len[0]));
+    u64 uid = 0;
+    if (__builtin_expect(len[1] != 0, 1)) uid = make_key(base + off[1], len[1]);
+    B.uid[i] = uid;
+  }
+  // ---- timestamps
+  static const u8 CLS[32] = {3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 1, 3, 3, 3, 3, 3, 3, 0, 3, 3, 3, 3, 2, 3, 3, 3, 3, 3, 3};
+  u32 cnt[4] = {0, 0, 0, 0};
+  for (u32 i = 0; i < n; i++) {
+    const u32 n2 = B.len[i][2];
+    const u32 c = CLS[n2 < 31 ? n2 : 31];
+    B.idx[c][cnt[c]++] = (u8)i;
+  }
+  for (u32 j = 0; j < cnt[0]; j++) {  // ts and ingest_ts both F1
+    const u32 i = B.idx[0][j];
+    const u32* off = B.off[i];
+    i64 ta, tb;
+    if (__builtin_expect(B.len[i][3] == 20 && f1_pair(base + off[2], base + off[3], ta, tb), 1)) {
+      B.ts[i] = ta;
+      B.ing[i] = tb;
+      B.ok[i] = 1;
+    } else {
+      ts_exact(B, i, base);
+    }
+  }
+  for (u32 j = 0; j < cnt[1]; j++) {  // ts as 13 digits
+    const u32 i = B.idx[1][j];
+    const u32* off = B.off[i];
+    i64 ta, tb;
+    if (__builtin_expect(B.len[i][3] == 20 && digits13(base + off[2], ta) && f1_one(base + off[3], tb), 1)) {
+      B.ts[i] = ta;
+      B.ing[i] = tb;
+      B.ok[i] = 1;
+    } else {
+      ts_exact(B, i, base);
+    }
+  }
+  for (u32 j = 0; j < cnt[2]; j++) ts_exact(B, B.idx[2][j], base);
+  for (u32 j = 0; j < cnt[3]; j++) ts_exact(B, B.idx[3][j], base);
+  // ---- validation, records, scatter
+  auto cur = cur_out;
+  const u64 wlen = (u64)(we - ws);
+  for (u32 i = 0; i < n; i++) {
+    const u32* off = B.off[i];
+    const u32* len = B.len[i];
+    const i64 ts = B.ts[i], ing = B.ing[i];
+    const u8* s4 = base + off[4];
+    const u32 n4 = len[4];
+    u32 w4;
+    memcpy(&w4, s4, 4);
+    // user and product present, ts valid and in the window, not more than 24 h late (an unparsable
+    // ingest_ts counts as late)
+    bool valid = (B.ok[i] != 0) & (len[1] != 0) & (len[5] != 0) & ((u64)(ts - ws) < wlen) & (ing != INT64_MAX) &
+                 ((i64)((u64)ing - (u64)ts) <= DAY);
+    u32 payload = 0;
+    if (__builtin_expect(!((n4 == 4) & ((w4 == 0x77656976u) | (w4 == 0x74726163u))), 0)) {  // not view / cart
+      u64 w8;
+      memcpy(&w8, s4, 8);
+      u32 price;
+      if (valid && n4 == 8 && w8 == 0x6573616863727570ULL && parse_price(base + off[6], len[6], price))
+        payload = (cat_of(base + off[5], len[5]) << 24) | price;
+      else
+        valid = false;
+    }
+    const u64 tspl = valid ? ((u64)(u32)(ts - ws) | ((u64)payload << 32)) : (u64)TS_INVALID;
+    const u64 eh = B.eh[i];
+    WCScatter<R1>::push32(cur, (u32)(eh >> p1shift),
+                          _mm256_set_epi64x((long long)tspl, (long long)B.uid[i], (long long)ing, (long long)eh));
+  }
+  cur_out = cur;
+}
+
+// One chunk of an events file -> R1 records. Returns the number of lines with a non-empty event_id.
 static NOINLINE u64 parse_event_chunk(const u8* begin, const u8* end, bool skip_header, TL& tl, const u32 p1shift,
                                       const i64 ws, const i64 we) {
+  EvBatch B;
+  u32 n = 0;
   u64 nl = 0;
+  const u8* base = begin;
   auto cur = tl.r1.cursor(tl.arena);
-  scan_chunk<7>(begin, end, skip_header, [&](const u8* sb, const u32* fo, const u32* fl) __attribute__((always_inline)) {
-    if (fl[0] == 0) return;
-    nl++;
-    u64 eid = make_key((sb + fo[0]), fl[0]);
-    i64 ingest = INT64_MAX, ts = 0;
-    bool ts_ok;
-    if (fl[2] == 20 && (sb + fo[2])[19] == 'Z' && fl[3] == 20 && (sb + fo[3])[19] == 'Z') {
-      u32 r = civil19x2((sb + fo[2]), (sb + fo[3]), ts, ingest);
-      if (!(r & 2)) ingest = INT64_MAX;
-      ts_ok = r & 1;
-    } else {
-      if (!parse_f1((sb + fo[3]), fl[3], ingest)) ingest = INT64_MAX;
-      ts_ok = parse_ts((sb + fo[2]), fl[2], ts);
+  scan::scan_lines<7>(begin, end, skip_header, [&](const u8* sb, __m256i st, __m256i ln) __attribute__((always_inline)) {
+    _mm256_store_si256((__m256i*)B.off[n], st);
+    _mm256_store_si256((__m256i*)B.len[n], ln);
+    base = sb;
+    n += (u32)_mm256_cvtsi256_si32(ln) != 0;  // a line with an empty event_id is dropped: its slot is reused
+    if (__builtin_expect(n == EvBatch::CAP, 0)) {
+      process_events(B, n, sb, cur, p1shift, ws, we);
+      nl += n;
+      n = 0;
     }
-    u64 uid = 0, tspl = TS_INVALID;
-    if (fl[1] != 0 && fl[5] != 0 && ts_ok && ts >= ws && ts < we && ingest - ts <= DAY) {
-      int ty = event_type((sb + fo[4]), fl[4]);
-      if (ty >= 0) {
-        bool ok = true;
-        u32 payload = 0;
-        if (ty == 2) {
-          u32 price;
-          if (parse_price((sb + fo[6]), fl[6], price))
-            payload = (cat_of((sb + fo[5]), fl[5]) << 24) | price;
-          else
-            ok = false;
-        }
-        if (ok) {
-          tspl = (u64)(u32)(ts - ws) | ((u64)payload << 32);
-          uid = make_key((sb + fo[1]), fl[1]);
-        }
-      }
-    }
-    const u64 eh = mix64(eid);
-    WCScatter<R1>::push32(cur, (u32)(eh >> p1shift),
-                          _mm256_set_epi64x((long long)tspl, (long long)uid, (long long)ingest, (long long)eh));
   });
+  if (n) process_events(B, n, base, cur, p1shift, ws, we);
+  nl += n;
   tl.r1.close(cur);
   tl.r1.flush(tl.arena);
   return nl;
@@ -2255,7 +2442,64 @@ static int selftest() {
     }
   }
   fprintf(stderr, "selftest: %ld cases, %ld mismatches\n", n, bad);
-  return bad ? 1 : 0;
+  // ---- F1 fast kernels: whatever they accept must equal the reference, and they must accept every valid
+  // F1 timestamp in a candidate year
+  long n2 = 0, bad2 = 0, in_year = 0, accepted = 0;
+  const int year_sets[][2] = {{2027, 2028}, {2028, 2028}, {2024, 2025}, {2099, 2100}, {1999, 2000}, {1969, 1970}};
+  std::vector<u8> pa(64), pb(64);
+  for (const auto& ys : year_sets) {
+    init_fast_years(days_from_civil(ys[0], 12, 20) * DAY, days_from_civil(ys[1], 1, 15) * DAY);
+    for (long it = 0; it < 3000000; it++) {
+      auto gen = [&](u8* dst) {
+        char t[64];
+        int yr = (next() % 16 == 0) ? ys[0] + (int)(next() % 5) - 2 : ys[next() & 1];
+        int mo = 1 + (int)(next() % 12), dd = 1 + (int)(next() % 31), hh = (int)(next() % 24), mi = (int)(next() % 60),
+            se = (int)(next() % 60);
+        if (next() % 40 == 0) mo = (int)(next() % 20);
+        if (next() % 40 == 0) dd = (int)(next() % 40);
+        if (next() % 40 == 0) hh = (int)(next() % 30);
+        if (next() % 40 == 0) mi = (int)(next() % 70);
+        if (next() % 40 == 0) se = (int)(next() % 70);
+        int len = snprintf(t, sizeof t, "%04d-%02d-%02dT%02d:%02d:%02dZ", yr, mo, dd, hh, mi, se);
+        if (next() % 5 == 0) {
+          int pos = (int)(next() % len);
+          t[pos] = alphabet[next() % strlen(alphabet)];
+        }
+        for (int k = 0; k < 64; k++) dst[k] = (u8)("0123456789,\"Z:+-T"[next() % 17]);
+        memcpy(dst, t, len);
+      };
+      gen(pa.data());
+      gen(pb.data());
+      i64 ra = 0, rb = 0, fa = 0, fb = 0, f1 = 0;
+      const bool va = pa[19] == 'Z' && civil19_scalar(pa.data(), ra);
+      const bool vb = pb[19] == 'Z' && civil19_scalar(pb.data(), rb);
+      const bool rp = f1_pair(pa.data(), pb.data(), fa, fb);
+      const bool r1 = f1_one(pa.data(), f1);
+      n2++;
+      bool wrong = false;
+      if (rp && (!va || !vb || fa != ra || fb != rb)) wrong = true;
+      if (r1 && (!va || f1 != ra)) wrong = true;
+      u32 ya, yb;
+      memcpy(&ya, pa.data(), 4);
+      memcpy(&yb, pb.data(), 4);
+      const bool ca = va && (ya == g_ytxt[0] || ya == g_ytxt[1]), cb = vb && (yb == g_ytxt[0] || yb == g_ytxt[1]);
+      if (ca) {
+        in_year++;
+        accepted += r1;
+        if (!r1) wrong = true;
+      }
+      if (ca && cb && !rp) wrong = true;
+      if (wrong) {
+        if (bad2 < 10)
+          fprintf(stderr, "F1 KERNEL MISMATCH a='%.20s' b='%.20s' pair=%d one=%d ref=%d,%d\n", (const char*)pa.data(),
+                  (const char*)pb.data(), rp, r1, va, vb);
+        bad2++;
+      }
+    }
+  }
+  fprintf(stderr, "selftest F1 kernels: %ld cases, %ld mismatches; accepted %ld of %ld valid in-year values\n", n2, bad2,
+          accepted, in_year);
+  return (bad || bad2) ? 1 : 0;
 }
 
 // ------------------------------------------------------------------------------------------

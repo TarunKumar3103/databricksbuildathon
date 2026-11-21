@@ -1,8 +1,10 @@
 // CSV line scanner for the Shopping Sessions dialect.
 //
-// scan_chunk<NF>(begin, end, skip_header, on_line) calls on_line(base, st, ln) for every well-formed line
-// with exactly NF fields: field i is the ln[i] bytes at base + st[i], surrounding quotes removed. A line is
-// well-formed when every field is either free of '"' or is '"' + bytes without '"' + '"' (length >= 2).
+// scan_lines<NF>(begin, end, skip_header, on_vec) calls on_vec(base, st, ln) for every well-formed line
+// with exactly NF fields: st and ln are vectors of eight 32-bit values, and field i is the ln[i] bytes at
+// base + st[i], surrounding quotes removed (elements NF.. are unspecified). scan_chunk is the same with
+// the two vectors stored to arrays: on_line(base, const u32* st, const u32* ln). A line is well-formed when
+// every field is either free of '"' or is '"' + bytes without '"' + '"' (length >= 2).
 // Lines end at '\n' only; the last line may lack it. [begin, end) must start at a line start, and at least
 // 64 bytes after `end` must be readable.
 //
@@ -74,11 +76,11 @@ static inline u32 next_bit(const u64* w, u32 from, u32 limit) {
   }
 }
 
-// Always inlined into its caller, together with on_line: the callback's captured state then lives in
+// Always inlined into its caller, together with on_vec: the callback's captured state then lives in
 // registers instead of being reloaded through the closure after every store.
 template <int NF, class F>
-static inline __attribute__((always_inline)) void scan_chunk(const u8* begin, const u8* end, bool skip_header,
-                                                             F&& on_line) {
+static inline __attribute__((always_inline)) void scan_lines(const u8* begin, const u8* end, bool skip_header,
+                                                             F&& on_vec) {
   static_assert(NF >= 1 && NF <= 8, "fields per line");
   const u8* p = begin;
   if (skip_header) {
@@ -104,7 +106,7 @@ static inline __attribute__((always_inline)) void scan_chunk(const u8* begin, co
   bool line_bad = false;   // the open line touched a flagged block in an earlier window
   u32 carry = 0;           // quote parity since the start of the open line
   u64 prev_top = 1;        // was the byte before this block a separator (or the chunk start)?
-  alignas(32) u32 st[8], ln[8];
+  alignas(32) u32 st[8] = {0, 0, 0, 0, 0, 0, 0, 0}, ln[8] = {0, 0, 0, 0, 0, 0, 0, 0};  // slow paths only
   const u64 PATMASK = (2ULL << NF) - 2;  // entries 1..NF of a line
   const u64 PAT = 1ULL << NF;            // only the last of them is a newline
   const __m256i vc = _mm256_set1_epi8(','), vn = _mm256_set1_epi8('\n'), vq = _mm256_set1_epi8('"');
@@ -218,7 +220,7 @@ static inline __attribute__((always_inline)) void scan_chunk(const u8* begin, co
                 st[f] = (u32)(fs[f] - p);
                 ln[f] = fl[f];
               }
-              on_line(p, (const u32*)st, (const u32*)ln);
+              on_vec(p, _mm256_load_si256((const __m256i*)st), _mm256_load_si256((const __m256i*)ln));
             }
             si += NF;
             continue;
@@ -232,15 +234,8 @@ static inline __attribute__((always_inline)) void scan_chunk(const u8* begin, co
         // qm: -1 where the field starts with a quote
         const __m256i qm = _mm256_cmpeq_epi32(_mm256_and_si256(_mm256_set1_epi32((int)(u32)qbits), BITS), BITS);
         const __m256i t = _mm256_add_epi32(qm, MONE);
-        _mm256_store_si256((__m256i*)st, _mm256_sub_epi32(S0, t));  // separator + 1 (+ 1 if quoted)
-        _mm256_store_si256((__m256i*)ln, _mm256_add_epi32(_mm256_sub_epi32(S1, S0), _mm256_add_epi32(t, qm)));
-        // Hide where the pointers point, so the compiler reads the fields back from memory (one load each);
-        // otherwise it extracts every element from the vector registers, which costs two to three times as
-        // many instructions.
-        const u32* stp = st;
-        const u32* lnp = ln;
-        __asm__("" : "+r"(stp), "+r"(lnp));
-        on_line(p, stp, lnp);
+        on_vec(p, _mm256_sub_epi32(S0, t),  // separator + 1 (+ 1 if quoted)
+               _mm256_add_epi32(_mm256_sub_epi32(S1, S0), _mm256_add_epi32(t, qm)));
         si += NF;
       } else {
         const u64 nlb = nbits & PATMASK;
@@ -299,9 +294,27 @@ static inline __attribute__((always_inline)) void scan_chunk(const u8* begin, co
         st[f] = (u32)(fs[f] - p);
         ln[f] = fl[f];
       }
-      on_line(p, (const u32*)st, (const u32*)ln);
+      on_vec(p, _mm256_load_si256((const __m256i*)st), _mm256_load_si256((const __m256i*)ln));
     }
   }
+}
+
+// The same with the fields in two arrays.
+template <int NF, class F>
+static inline __attribute__((always_inline)) void scan_chunk(const u8* begin, const u8* end, bool skip_header,
+                                                             F&& on_line) {
+  scan_lines<NF>(begin, end, skip_header, [&](const u8* base, __m256i st, __m256i ln) __attribute__((always_inline)) {
+    alignas(32) u32 sta[8], lna[8];
+    _mm256_store_si256((__m256i*)sta, st);
+    _mm256_store_si256((__m256i*)lna, ln);
+    // Hide where the pointers point, so the compiler reads the fields back from memory (one load each);
+    // otherwise it extracts every element from the vector registers, which costs two to three times as
+    // many instructions.
+    const u32* stp = sta;
+    const u32* lnp = lna;
+    __asm__("" : "+r"(stp), "+r"(lnp));
+    on_line(base, stp, lnp);
+  });
 }
 
 }  // namespace scan

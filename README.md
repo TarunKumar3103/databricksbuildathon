@@ -14,10 +14,13 @@ One static C++17 binary (no engine, no runtime dependencies) that reads `/data` 
    scanner (`src/scan.h`) finds commas, newlines and quotes per 64-byte block, validates quote placement
    with bit tricks (blocks with any irregular quote fall back to an exact byte-by-byte check), flattens
    all separator offsets into one array, and splits each well-shaped line into its fields with a few
-   vector operations. Timestamps (all three forms) are parsed with SSE/AVX2 and checked against scalar
-   references in `--selftest`. Parsed input pages are dropped from the mapping as each chunk finishes, so
+   vector operations. Event lines are then processed 64 at a time in three plain loops: keys and hashes;
+   timestamps, grouped by the form of `ts` so each group runs one kernel; validation and the scatter.
+   F1 timestamps in the years the window touches take a fast path (one vector compare, one table
+   lookup); everything else goes through the general parsers. All of them are checked against scalar
+   references in `--selftest`. IDs up to 9 bytes are packed into order-preserving 64-bit keys; longer or
+   non-ASCII IDs are interned. Parsed input pages are dropped from the mapping as each chunk finishes, so
    the kernel does not have to unmap the whole input serially at exit.
-   IDs up to 9 bytes are packed into order-preserving 64-bit keys; longer or non-ASCII IDs are interned.
 4. **Dedup.** Event lines are hash-partitioned by `event_id` (software write-combining with non-temporal
    stores; full lines go through a small queue so no branch depends on which partition filled up). Per
    partition, a bit map with 8+ bits per record finds the IDs that may occur more than once; only those
