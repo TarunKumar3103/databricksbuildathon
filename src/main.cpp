@@ -131,12 +131,14 @@ struct Arena {
   u8* cur = nullptr;
   u8* end = nullptr;
   std::vector<void*> free_blocks;  // recycled BLOCK_BYTES blocks
+  std::vector<std::pair<void*, size_t>> slabs;
   void* alloc(size_t n) {
     n = (n + 63) & ~(size_t)63;
     if ((size_t)(end - cur) < n) {
       size_t sz = std::max(n, (size_t)256 << 20);
       cur = (u8*)vm_alloc(sz);
       end = cur + sz;
+      slabs.push_back({cur, sz});
     }
     void* p = cur;
     cur += n;
@@ -171,6 +173,14 @@ struct Stream {
   inline T* reserve(u32 k, Arena& a) {
     if (__builtin_expect((size_t)(lim - cur) < k, 0)) grow(a);
     return cur;
+  }
+  // n items that need not fit a normal block: they get a block of their own, already counted as full.
+  T* big(size_t n, Arena& a) {
+    if (beg) blocks.push_back({beg, (u32)(cur - beg)});
+    T* p = (T*)a.alloc(n * sizeof(T));
+    blocks.push_back({p, (u32)n});
+    beg = cur = lim = nullptr;
+    return p;
   }
   void grow(Arena& a) {
     if (beg) blocks.push_back({beg, (u32)(cur - beg)});
@@ -1064,16 +1074,23 @@ struct CStat {
   i64 rev;
 };
 
-struct ORow {
-  u64 key;
-  i64 rev;
-  i32 day;
-  u32 sess, evs;
-  u16 top;
-  u16 pad;
-};
-struct OutRows {
-  std::vector<ORow> rows;
+// The columns of user_daily, appended row by row in the form they have in the file (Parquet PLAIN), in
+// blocks that are handed to the writer as they are.
+struct OutCols {
+  Stream<u8> ids;  // user_id: 4-byte length, then the bytes
+  Stream<i32> day;
+  Stream<u32> sess, evs;
+  Stream<i64> rev;
+  Stream<u8> top;  // category, 0xFF: none
+  u64 nrows = 0;
+  void finish() {
+    ids.finish();
+    day.finish();
+    sess.finish();
+    evs.finish();
+    rev.finish();
+    top.finish();
+  }
 };
 
 struct TL {
@@ -1081,7 +1098,7 @@ struct TL {
   WCScatter<R1> r1;
   WCScatter<R2> r2;
   WCScatter<R2C> r2c;
-  OutRows out;
+  OutCols out;
   std::vector<CStat> c_stat;   // ndays x (ncamp + 1): credited sessions, purchasing sessions, revenue
   std::vector<u32> c_assist;   // ndays x (ncamp + 1)
   u64 n_event_lines = 0, n_click_lines = 0;
@@ -2128,7 +2145,7 @@ static void person_phase() {
     u32* dev = S.dev.data();
     i64* drev = S.drev.data();
     i64* catsum = S.catsum.data();
-    OutRows& out = tl.out;
+    OutCols& out = tl.out;
     const u32* posL = S.posL.data();
     const u64* Eall = S.E.data();
     for (u32 lid = 0; lid < np; lid++) {
@@ -2235,12 +2252,34 @@ static void person_phase() {
       S.active.clear();
       // purchases -> category sums per day of their session
       for (const Purch& q : S.purch) catsum[(size_t)bday[q.bucket] * NCAT + q.cat] += q.price;
+      // one output row per day with a session
       const u64 pkey = unhash_id(S.hs[lid]);
-      const size_t nd = S.days.size();
-      const size_t base = out.rows.size();
-      out.rows.resize(base + nd);
-      ORow* orow = out.rows.data() + base;
-      for (size_t di = 0; di < nd; di++) {
+      const u32 nd = (u32)S.days.size();
+      if (__builtin_expect(!is_slow(pkey), 1)) {
+        u8 kb[16];  // the user_id as it stands in the file: length, bytes
+        const u32 klen = fast_key_bytes(pkey, kb + 4);
+        memcpy(kb, &klen, 4);
+        u8* ip = out.ids.reserve(nd * 13 + 16, tl.arena);
+        for (u32 di = 0; di < nd; di++, ip += 4 + klen) memcpy(ip, kb, 16);
+        out.ids.cur = ip;
+      } else {
+        std::string name;
+        key_str(pkey, name);
+        const u32 klen = (u32)name.size();
+        for (u32 di = 0; di < nd; di++) {
+          const bool fits = 4 + (size_t)klen <= Stream<u8>::BLK;
+          u8* ip = fits ? out.ids.reserve(4 + klen, tl.arena) : out.ids.big(4 + (size_t)klen, tl.arena);
+          memcpy(ip, &klen, 4);
+          memcpy(ip + 4, name.data(), klen);
+          if (fits) out.ids.cur = ip + 4 + klen;
+        }
+      }
+      i32* const dayp = out.day.reserve(nd, tl.arena);
+      u32* const sessp = out.sess.reserve(nd, tl.arena);
+      u32* const evsp = out.evs.reserve(nd, tl.arena);
+      i64* const revp = out.rev.reserve(nd, tl.arena);
+      u8* const topp = out.top.reserve(nd, tl.arena);
+      for (u32 di = 0; di < nd; di++) {
         const u32 d = S.days[di];
         u16 top = 0xFFFF;
         if (drev[d] > 0) {
@@ -2257,11 +2296,21 @@ static void person_phase() {
           for (const Purch& q : S.purch)
             if (bday[q.bucket] == d) cs[q.cat] = 0;
         }
-        orow[di] = ORow{pkey, drev[d], (i32)(day0 + d), dsess[d], dev[d], top, 0};
+        dayp[di] = (i32)(day0 + d);
+        sessp[di] = dsess[d];
+        evsp[di] = dev[d];
+        revp[di] = drev[d];
+        topp[di] = (u8)top;  // categories are below 255, so "none" becomes 0xFF
         dsess[d] = 0;
         dev[d] = 0;
         drev[d] = 0;
       }
+      out.day.cur += nd;
+      out.sess.cur += nd;
+      out.evs.cur += nd;
+      out.rev.cur += nd;
+      out.top.cur += nd;
+      out.nrows += nd;
     }
     for (int t = 0; t < NT; t++) {
       g_tl[t].r2.release(p, tl.arena);
@@ -2273,35 +2322,18 @@ static void person_phase() {
 // ------------------------------------------------------------------------------------------
 // output
 
-static inline void put_key(std::vector<u8>& buf, size_t& at, u64 k) {
-  if (is_slow(k)) {
-    std::string s;
-    key_str(k, s);
-    if (buf.size() < at + 4 + s.size()) buf.resize((at + 4 + s.size()) * 2);
-    u32 n = (u32)s.size();
-    memcpy(&buf[at], &n, 4);
-    memcpy(&buf[at + 4], s.data(), n);
-    at += 4 + n;
-    return;
-  }
-  if (buf.size() < at + 16) buf.resize((at + 16) * 2);
-  const u32 n = fast_key_bytes(k, &buf[at + 4]);
-  memcpy(&buf[at], &n, 4);
-  at += 4 + n;
-}
-
 static void write_outputs(const std::string& out) {
   std::string ud = out + "/user_daily", cd = out + "/campaign_daily";
   mkdir(ud.c_str(), 0777);
   mkdir(cd.c_str(), 0777);
   std::atomic<bool> fail{false};
-  size_t total_rows = 0;
-  for (auto& t : g_tl) total_rows += t.out.rows.size();
+  u64 total_rows = 0;
+  for (auto& t : g_tl) total_rows += t.out.nrows;
   parallel_for(NT + 1, [&](int t, int) {
     if (t == NT) {
       // campaign_daily
       const u32 NC = g_ncamp, ND = (u32)g_ndays;
-      size_t sz = (size_t)(NC + 1) * ND;
+      const size_t sz = (size_t)(NC + 1) * ND;
       std::vector<u64> sess(sz, 0), purch(sz, 0), assist(sz, 0);
       std::vector<i64> rev(sz, 0);
       for (auto& tl : g_tl) {
@@ -2326,28 +2358,37 @@ static void write_outputs(const std::string& out) {
       cols[1].is_string = true;
       cols[2].type = pq::T_INT32;
       cols[2].is_date = true;
-      int64_t n = 0;
+      pq::Buf ids, chans;
+      std::vector<i32> days(sz);
+      std::vector<i64> v[4];
+      for (auto& x : v) x.resize(sz);
+      size_t n = 0;
       const std::string org = "organic";
       for (u32 c = 0; c <= NC; c++)
         for (u32 d = 0; d < ND; d++) {
-          size_t i = (size_t)d * (NC + 1) + c;
+          const size_t i = (size_t)d * (NC + 1) + c;
           if (sess[i] == 0 && assist[i] == 0) continue;
           const std::string& id = (c == NC) ? org : g_camp_ids[c];
           const std::string& ch = (c == NC) ? org : g_camp_channel[c];
-          pq::put_str(cols[0].values, id.data(), (u32)id.size());
-          pq::put_str(cols[1].values, ch.data(), (u32)ch.size());
-          pq::put_i32(cols[2].values, (i32)(g_day0 + d));
-          pq::put_i64(cols[3].values, (i64)sess[i]);
-          pq::put_i64(cols[4].values, (i64)purch[i]);
-          pq::put_i64(cols[5].values, rev[i]);
-          pq::put_i64(cols[6].values, (i64)assist[i]);
+          pq::put_str(ids, id.data(), (u32)id.size());
+          pq::put_str(chans, ch.data(), (u32)ch.size());
+          days[n] = (i32)(g_day0 + d);
+          v[0][n] = (i64)sess[i];
+          v[1][n] = (i64)purch[i];
+          v[2][n] = rev[i];
+          v[3][n] = (i64)assist[i];
           n++;
         }
-      if (!pq::write_file(cd + "/part-0.parquet", cols, n)) fail = true;
+      cols[0].body.push_back({ids.data(), ids.size()});
+      cols[1].body.push_back({chans.data(), chans.size()});
+      cols[2].body.push_back({days.data(), n * 4});
+      for (int k = 0; k < 4; k++) cols[3 + k].body.push_back({v[k].data(), n * 8});
+      if (!pq::write_file(cd + "/part-0.parquet", cols, (int64_t)n)) fail = true;
       return;
     }
-    const std::vector<ORow>& o = g_tl[t].out.rows;
-    size_t n = o.size();
+    OutCols& oc = g_tl[t].out;
+    oc.finish();
+    const size_t n = oc.nrows;
     if (n == 0 && !(t == 0 && total_rows == 0)) return;
     std::vector<pq::Column> cols(6);
     cols[0].name = "user_id";
@@ -2369,41 +2410,45 @@ static void write_outputs(const std::string& out) {
     cols[5].use_dict = true;
     for (auto& c : g_cats) pq::put_str(cols[5].dict_values, c.data(), (u32)c.size());
     cols[5].dict_count = (int)g_cats.size();
+    // the plain columns are written straight from their blocks
+    for (auto& b : oc.ids.blocks) cols[0].body.push_back({b.first, b.second});
+    for (auto& b : oc.day.blocks) cols[1].body.push_back({b.first, (size_t)b.second * 4});
+    for (auto& b : oc.sess.blocks) cols[2].body.push_back({b.first, (size_t)b.second * 4});
+    for (auto& b : oc.evs.blocks) cols[3].body.push_back({b.first, (size_t)b.second * 4});
+    for (auto& b : oc.rev.blocks) cols[4].body.push_back({b.first, (size_t)b.second * 8});
+    // top_category: definition levels, then the dictionary indices of the rows that have one
     {
-      std::vector<u8>& b = cols[0].values.d;
-      b.resize(n * 14 + 64);
-      size_t at = 0;
-      for (size_t i = 0; i < n; i++) put_key(b, at, o[i].key);
-      b.resize(at);
-    }
-    cols[1].values.d.resize(n * 4);
-    cols[2].values.d.resize(n * 4);
-    cols[3].values.d.resize(n * 4);
-    cols[4].values.d.resize(n * 8);
-    i32* c1 = (i32*)cols[1].values.d.data();
-    u32* c2 = (u32*)cols[2].values.d.data();
-    u32* c3 = (u32*)cols[3].values.d.data();
-    i64* c4 = (i64*)cols[4].values.d.data();
-    cols[5].defs.resize(n);
-    cols[5].indices.reserve(n / 3 + 16);
-    for (size_t i = 0; i < n; i++) {
-      const ORow& r = o[i];
-      c1[i] = r.day;
-      c2[i] = r.sess;
-      c3[i] = r.evs;
-      c4[i] = r.rev;
-      if (r.top != 0xFFFF) {
-        cols[5].defs[i] = 1;
-        cols[5].indices.push_back(r.top);
-      } else {
-        cols[5].defs[i] = 0;
-        cols[5].num_nulls++;
-      }
+      std::vector<u8> def(n + 8), idx(n + 8);
+      size_t k = 0, m = 0;
+      for (auto& b : oc.top.blocks)
+        for (u32 j = 0; j < b.second; j++) {
+          const u8 c = b.first[j];
+          def[k++] = c != 0xFF;
+          idx[m] = c;
+          m += c != 0xFF;
+        }
+      pq::Buf lv;
+      pq::encode_levels(lv, def.data(), n);
+      cols[5].pre.le32((u32)lv.size());
+      cols[5].pre.bytes(lv.data(), lv.size());
+      int bw = pq::bit_width(cols[5].dict_count > 0 ? (u32)(cols[5].dict_count - 1) : 0);
+      if (bw < 1) bw = 1;
+      cols[5].pre.u8((u8)bw);
+      pq::encode_indices(cols[5].pre, idx.data(), m, bw);
     }
     std::string path = ud + "/part-" + std::to_string(t) + ".parquet";
     if (!pq::write_file(path, cols, (int64_t)n)) fail = true;
   });
   if (fail) die("writing output");
+}
+
+// Everything is written: give the memory back from all threads at once. The kernel would otherwise free it
+// page by page, on one CPU, while the process exits.
+static void release_memory() {
+  parallel_for(NT, [&](int t, int) {
+    for (auto& s : g_tl[t].arena.slabs) madvise(s.first, s.second, MADV_DONTNEED);
+    if (t == 0 && g_H) madvise(g_H, sizeof(HSlot) << g_Hbits, MADV_DONTNEED);
+  });
 }
 
 // ------------------------------------------------------------------------------------------
@@ -2724,9 +2769,11 @@ int main(int argc, char** argv) {
     fprintf(stderr, "user s:");
     for (int i = 1; i < 6; i++) fprintf(stderr, " %s %.3f", g_phase_names[i], g_phase_cycles[i].load() / 1e6);
     fprintf(stderr, " | total %.3f   sys s: total %.3f (parse %.3f)\n", tot, tots, g_phase_sys[2].load() / 1e6);
-    fprintf(stderr, "ABS end %.6f\n", now_s());
   }
-  return 0;
+  release_memory();
+  if (g_log) fprintf(stderr, "ABS end %.6f\n", now_s());
+  fflush(nullptr);
+  _exit(0);  // nothing left to clean up that the kernel does not do anyway
 }
 
 // ------------------------------------------------------------------------------------------

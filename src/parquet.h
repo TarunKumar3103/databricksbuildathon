@@ -1,7 +1,17 @@
-// Minimal Parquet writer: one row group per file, one data page (v1) per column,
-// PLAIN values, optional dictionary pages, no compression. Enough for flat tables of
-// INT32 / INT64 / DATE / STRING columns, required or optional.
+// Minimal Parquet writer: one row group per file, one data page (v1) per column, PLAIN values, optional
+// dictionary pages, no compression. Enough for flat tables of INT32 / INT64 / DATE / STRING columns,
+// required or optional.
+//
+// A column's values are handed over as pieces of memory in their on-disk form (PLAIN encoding is just the
+// values, little-endian; strings as a 4-byte length and the bytes). The pieces are written as they are with
+// writev, so the caller can build them wherever it likes and nothing is copied in user space.
 #pragma once
+#include <fcntl.h>
+#include <immintrin.h>
+#include <sys/uio.h>
+#include <unistd.h>
+
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -13,24 +23,34 @@ namespace pq {
 enum PhysType { T_INT32 = 1, T_INT64 = 2, T_BYTE_ARRAY = 6 };
 enum { ENC_PLAIN = 0, ENC_RLE = 3, ENC_RLE_DICTIONARY = 8 };
 
+// Growable byte buffer. The vector is only storage (its size is the capacity); `n` bytes are in use.
 struct Buf {
   std::vector<uint8_t> d;
-  void u8(uint8_t x) { d.push_back(x); }
-  void bytes(const void* p, size_t n) {
-    const uint8_t* c = (const uint8_t*)p;
-    d.insert(d.end(), c, c + n);
+  size_t n = 0;
+  void need(size_t k) {
+    if (__builtin_expect(n + k > d.size(), 0)) d.resize((n + k) * 2 + 64);
+  }
+  void u8(uint8_t x) {
+    need(1);
+    d[n++] = x;
+  }
+  void bytes(const void* p, size_t k) {
+    need(k);
+    memcpy(d.data() + n, p, k);
+    n += k;
   }
   void varint(uint64_t x) {
     while (x >= 0x80) {
-      d.push_back(uint8_t(x) | 0x80);
+      u8(uint8_t(x) | 0x80);
       x >>= 7;
     }
-    d.push_back(uint8_t(x));
+    u8(uint8_t(x));
   }
   void zz32(int32_t x) { varint((uint32_t)(((uint32_t)x << 1) ^ (uint32_t)(x >> 31))); }
   void zz64(int64_t x) { varint((uint64_t)(((uint64_t)x << 1) ^ (uint64_t)(x >> 63))); }
   void le32(uint32_t x) { bytes(&x, 4); }
-  size_t size() const { return d.size(); }
+  size_t size() const { return n; }
+  const uint8_t* data() const { return d.data(); }
 };
 
 // Thrift compact protocol.
@@ -89,44 +109,68 @@ struct TC {
   void stop() { b.u8(0); }
 };
 
+struct Piece {
+  const void* p;
+  size_t n;
+};
+
 struct Column {
   std::string name;
   int type = T_INT64;
   bool optional = false;
   bool is_string = false;  // UTF8 / STRING
   bool is_date = false;    // DATE on INT32
-  // Plain-encoded non-null values (data page) unless dict is used.
-  Buf values;
-  // Optional dictionary: plain-encoded dictionary values + per-row index (non-null rows).
+  // The data page is `pre` followed by `body`. pre: the definition levels of an optional column and, for a
+  // dictionary column, the bit width and the indices. body: the PLAIN values of the non-null rows.
+  Buf pre;
+  std::vector<Piece> body;
   bool use_dict = false;
-  Buf dict_values;
+  Buf dict_values;  // PLAIN dictionary values
   int dict_count = 0;
-  std::vector<uint32_t> indices;  // one per non-null row
-  // Definition levels (optional columns): one byte (0/1) per row.
-  std::vector<uint8_t> defs;
-  int64_t num_nulls = 0;
 };
 
-inline void put_i32(Buf& b, int32_t v) { b.bytes(&v, 4); }
-inline void put_i64(Buf& b, int64_t v) { b.bytes(&v, 8); }
 inline void put_str(Buf& b, const char* s, uint32_t n) {
   b.le32(n);
   b.bytes(s, n);
 }
 
-// RLE / bit-packed hybrid, bit-packed runs of at most 63 groups of 8 values.
-inline void encode_bitpacked(Buf& out, const uint32_t* vals, size_t n, int bw) {
+inline int bit_width(uint32_t maxv) {
+  int w = 0;
+  while (maxv) {
+    w++;
+    maxv >>= 1;
+  }
+  return w;
+}
+
+// RLE / bit-packed hybrid with bit-packed runs only (at most 63 groups of 8 values each).
+// Width 1, from one byte (0 or 1) per value: definition levels.
+inline void encode_levels(Buf& out, const uint8_t* v01, size_t n) {
+  out.need(n / 8 + n / 504 + 16);
   size_t i = 0;
   while (i < n) {
-    size_t remain = n - i;
-    size_t groups = (remain + 7) / 8;
+    size_t groups = (n - i + 7) / 8;
     if (groups > 63) groups = 63;
     out.u8(uint8_t((groups << 1) | 1));
-    // pack groups*8 values with bit width bw, LSB first
+    for (size_t g = 0; g < groups; g++, i += 8) {
+      uint64_t w = 0;
+      memcpy(&w, v01 + i, i + 8 <= n ? 8 : n - i);
+      out.u8((uint8_t)_pext_u64(w, 0x0101010101010101ULL));
+    }
+  }
+}
+// Width bw (1..8), from one byte per value: dictionary indices.
+inline void encode_indices(Buf& out, const uint8_t* vals, size_t n, int bw) {
+  out.need((n * bw + 7) / 8 + n / 504 + 16);
+  size_t i = 0;
+  while (i < n) {
+    size_t groups = (n - i + 7) / 8;
+    if (groups > 63) groups = 63;
+    out.u8(uint8_t((groups << 1) | 1));
     uint64_t acc = 0;
     int nb = 0;
     for (size_t k = 0; k < groups * 8; k++) {
-      uint32_t v = (i + k < n) ? vals[i + k] : 0;
+      const uint32_t v = (i + k < n) ? vals[i + k] : 0;
       acc |= (uint64_t)v << nb;
       nb += bw;
       while (nb >= 8) {
@@ -138,15 +182,6 @@ inline void encode_bitpacked(Buf& out, const uint32_t* vals, size_t n, int bw) {
     if (nb > 0) out.u8(uint8_t(acc));
     i += groups * 8;
   }
-}
-
-inline int bit_width(uint32_t maxv) {
-  int w = 0;
-  while (maxv) {
-    w++;
-    maxv >>= 1;
-  }
-  return w;
 }
 
 inline void page_header(Buf& out, int page_type, int32_t usize, int32_t csize, int32_t num_values, int encoding,
@@ -178,84 +213,40 @@ struct ChunkMeta {
   int64_t num_values = 0;
 };
 
-// Bit-packed (width 1) runs for 0/1 definition levels.
-inline void encode_defs(Buf& out, const std::vector<uint8_t>& defs) {
-  size_t n = defs.size(), i = 0;
-  out.d.reserve(out.d.size() + n / 8 + n / 504 + 8);
-  while (i < n) {
-    size_t groups = (n - i + 7) / 8;
-    if (groups > 63) groups = 63;
-    out.u8(uint8_t((groups << 1) | 1));
-    for (size_t g = 0; g < groups; g++) {
-      uint8_t byte = 0;
-      for (int b = 0; b < 8; b++) {
-        size_t k = i + g * 8 + b;
-        if (k < n && defs[k]) byte |= uint8_t(1u << b);
-      }
-      out.u8(byte);
-    }
-    i += groups * 8;
-  }
-}
-
-struct Out {
-  FILE* f;
-  int64_t pos = 0;
-  bool ok = true;
-  void put(const void* p, size_t n) {
-    if (n && fwrite(p, 1, n, f) != n) ok = false;
-    pos += (int64_t)n;
-  }
-  void put(const Buf& b) { put(b.d.data(), b.d.size()); }
-};
-
 // Writes a complete file. Returns false on I/O error.
 inline bool write_file(const std::string& path, std::vector<Column>& cols, int64_t nrows) {
-  Out o;
-  o.f = fopen(path.c_str(), "wb");
-  if (!o.f) return false;
-  setvbuf(o.f, nullptr, _IOFBF, 1 << 20);
-  const char magic[4] = {'P', 'A', 'R', '1'};
-  o.put(magic, 4);
+  static const char magic[4] = {'P', 'A', 'R', '1'};
+  std::vector<iovec> iov;
+  int64_t pos = 0;
+  auto add = [&](const void* p, size_t n) {
+    if (n) iov.push_back(iovec{(void*)p, n});
+    pos += (int64_t)n;
+  };
+  std::vector<Buf> heads(cols.size() * 2);  // page headers; never resized, so their addresses hold
+  size_t nheads = 0;
   std::vector<ChunkMeta> metas(cols.size());
+  add(magic, 4);
   for (size_t ci = 0; ci < cols.size() && nrows > 0; ci++) {
     Column& c = cols[ci];
     ChunkMeta& m = metas[ci];
     m.num_values = nrows;
-    int64_t start = o.pos;
+    const int64_t start = pos;
     if (c.use_dict) {
-      Buf h;
+      Buf& h = heads[nheads++];
       page_header(h, 2, (int32_t)c.dict_values.size(), (int32_t)c.dict_values.size(), c.dict_count, ENC_PLAIN, true);
-      m.dict_page_offset = o.pos;
-      o.put(h);
-      o.put(c.dict_values);
+      m.dict_page_offset = pos;
+      add(h.data(), h.size());
+      add(c.dict_values.data(), c.dict_values.size());
     }
-    Buf pre;  // def levels and, for dictionary columns, the index stream
-    if (c.optional) {
-      Buf lv;
-      encode_defs(lv, c.defs);
-      pre.le32((uint32_t)lv.size());
-      pre.bytes(lv.d.data(), lv.size());
-    }
-    int enc = ENC_PLAIN;
-    size_t body = pre.size();
-    if (c.use_dict) {
-      enc = ENC_RLE_DICTIONARY;
-      int bw = bit_width(c.dict_count > 0 ? (uint32_t)(c.dict_count - 1) : 0);
-      if (bw < 1) bw = 1;
-      pre.u8((uint8_t)bw);
-      encode_bitpacked(pre, c.indices.data(), c.indices.size(), bw);
-      body = pre.size();
-    } else {
-      body += c.values.size();
-    }
-    Buf h;
-    page_header(h, 0, (int32_t)body, (int32_t)body, (int32_t)nrows, enc, false);
-    m.data_page_offset = o.pos;
-    o.put(h);
-    o.put(pre);
-    if (!c.use_dict) o.put(c.values);
-    m.total_size = o.pos - start;
+    size_t body = c.pre.size();
+    for (const Piece& pc : c.body) body += pc.n;
+    Buf& h = heads[nheads++];
+    page_header(h, 0, (int32_t)body, (int32_t)body, (int32_t)nrows, c.use_dict ? ENC_RLE_DICTIONARY : ENC_PLAIN, false);
+    m.data_page_offset = pos;
+    add(h.data(), h.size());
+    add(c.pre.data(), c.pre.size());
+    for (const Piece& pc : c.body) add(pc.p, pc.n);
+    m.total_size = pos - start;
   }
   Buf fm;
   {
@@ -331,12 +322,35 @@ inline bool write_file(const std::string& path, std::vector<Column>& cols, int64
     t.str(6, "shopping-sessions native writer");
     t.stop();
   }
-  o.put(fm);
-  uint32_t fl = (uint32_t)fm.size();
-  o.put(&fl, 4);
-  o.put(magic, 4);
-  bool ok = o.ok;
-  if (fclose(o.f) != 0) ok = false;
+  const uint32_t fl = (uint32_t)fm.size();
+  add(fm.data(), fm.size());
+  add(&fl, 4);
+  add(magic, 4);
+
+  const int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+  if (fd < 0) return false;
+  bool ok = true;
+  size_t i = 0;
+  while (i < iov.size()) {
+    const int cnt = (int)(iov.size() - i < 512 ? iov.size() - i : 512);
+    ssize_t w = writev(fd, &iov[i], cnt);
+    if (w < 0) {
+      if (errno == EINTR) continue;
+      ok = false;
+      break;
+    }
+    while (w > 0 && i < iov.size()) {  // a short write ends inside a piece
+      if ((size_t)w >= iov[i].iov_len) {
+        w -= (ssize_t)iov[i].iov_len;
+        i++;
+      } else {
+        iov[i].iov_base = (char*)iov[i].iov_base + w;
+        iov[i].iov_len -= (size_t)w;
+        w = 0;
+      }
+    }
+  }
+  if (close(fd) != 0) ok = false;
   return ok;
 }
 

@@ -42,7 +42,10 @@ One static C++17 binary (no engine, no runtime dependencies) that reads `/data` 
    7-day window gives the credited click (latest, ties to the smallest `click_id`) and the assisting
    campaigns.
 6. **Output.** A small built-in Parquet writer (PLAIN pages, dictionary-encoded `top_category`, `DATE`
-   for `day`), one file per thread.
+   for `day`), one file per thread. The `user_daily` columns are appended row by row, already in their
+   on-disk form, to blocks recycled from the earlier phases, and those blocks go to the file with
+   `writev`: no intermediate rows, no extra copy, no fresh memory. At the end all threads return their
+   memory to the kernel together, so the process exits quickly.
 
 ## Build and test
 
