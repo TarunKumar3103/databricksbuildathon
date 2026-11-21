@@ -3337,6 +3337,7 @@ int main(int argc, char** argv) {
     if (dn::g_on && !dn::recover_event_key(samp)) dn::fail("no key for the event ids");
     if (dn::g_on && (u64)(g_we - g_ws) > 0x7FFFFFF0ULL) dn::fail("window too long");
     if (dn::g_on && g_cats.size() > 255) dn::fail("too many categories");
+    if (dn::g_on && g_ncamp > dn::CK_CAMP) dn::fail("too many campaigns");
     if (dn::g_on && g_ndays > 16) dn::fail("more than 16 days in the window");
     if (dn::g_on) {
       dn::g_ing_base = g_ws - 30 * DAY;
