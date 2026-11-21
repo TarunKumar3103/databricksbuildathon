@@ -1,0 +1,7 @@
+# The builds the bench times: tag, binary in /usr/local/bench, then optional ENV=VALUE settings.
+# The first build also writes the dev output that the rest of the rows are added to.
+a ss-a            # src/ of this branch = v4 77eeb25, built like its Dockerfile (JCC padding)
+n ss-a-nojcc      # the same source without -Wa,-mbranches-within-32B-boundaries
+p ss-4f8cb95      # v4 4f8cb95, submitted Sat 12:41
+b ss-594f757      # v4 594f757, scored 0.51
+c ss-0aeec34      # v3 0aeec34, scored 0.60
