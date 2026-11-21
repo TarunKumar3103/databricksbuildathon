@@ -1105,9 +1105,9 @@ static void parse(std::vector<MFile>& ev, std::vector<MFile>& ck) {
   size_t ev_bytes = 0, ck_bytes = 0;
   for (auto& f : ev) ev_bytes += f.size;
   for (auto& f : ck) ck_bytes += f.size;
-  size_t chunk = std::max<size_t>(1 << 18, std::min<size_t>(8 << 20, (ev_bytes + ck_bytes) / (NT * 24 + 1)));
+  size_t chunk = std::max<size_t>(1 << 16, std::min<size_t>((size_t)g_k_chunk_kb << 10, (ev_bytes + ck_bytes) / (NT * 24 + 1)));
   // The click files come last, so their chunks decide how far apart the threads finish: they are smaller.
-  const size_t chunk_ck = std::max<size_t>(1 << 18, std::min<size_t>(chunk, ck_bytes / (NT * 32 + 1)));
+  const size_t chunk_ck = g_k_ckchunk ? std::max<size_t>(1 << 18, std::min<size_t>(chunk, ck_bytes / (NT * 32 + 1))) : chunk;
   std::vector<Chunk> ce, cc;
   make_chunks(ev, chunk, ce);
   make_chunks(ck, chunk_ck, cc);
