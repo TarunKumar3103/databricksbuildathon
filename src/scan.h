@@ -510,7 +510,25 @@ static inline __attribute__((always_inline)) void scan_cols(const u8* begin, con
     ns += cnt;
   };
   const u32 fast_end = total >= 128 ? total - 127 : 0;  // blocks below it are followed by 64 more bytes
+#ifdef STAGES
+  // (probe builds: stage 1 per window, and stage 2 less the batches it hands on)
+  constexpr bool kI = NF == 7 || NF == 4;
+  constexpr int K1 = NF == 7 ? STG_E_S1 : STG_C_S1;
+  uint64_t s2t_ = 0, s2p_ = 0;
+  bool s2o_ = false;
+  auto s2close = [&](uint64_t now) {
+    if (kI && s2o_) tl_stgp[K1 + 1] += (now - s2t_) - (tl_stgp[K1 + 2] - s2p_);
+    s2o_ = false;
+  };
+#endif
   for (; w < total; w += WB * 64) {
+#ifdef STAGES
+    {
+      const uint64_t n_ = __rdtsc();
+      s2close(n_);
+      s2t_ = n_;
+    }
+#endif
     const u32 wend = (total - w < WB * 64) ? total : w + WB * 64;
     badw = 0;
     // ---------------- stage 1
@@ -549,6 +567,15 @@ static inline __attribute__((always_inline)) void scan_cols(const u8* begin, con
       mq = nmq;
     }
     // ---------------- stage 2
+#ifdef STAGES
+    if (kI) {
+      const uint64_t n_ = __rdtsc();
+      tl_stgp[K1] += n_ - s2t_;
+      s2t_ = n_;
+      s2p_ = tl_stgp[K1 + 2];
+      s2o_ = true;
+    }
+#endif
     u32 si = 0;  // entry of the newline before the current line
     if (skip_open) {
       const u32 k = next_bit(Nw, 0, ns);
@@ -711,6 +738,9 @@ static inline __attribute__((always_inline)) void scan_cols(const u8* begin, con
       Qw[1] = 0;
     }
   }
+#ifdef STAGES
+  s2close(__rdtsc());
+#endif
   // last line without a newline
   if (!skip_open) {
     const u32 lstart = Spos[0] + 1;
