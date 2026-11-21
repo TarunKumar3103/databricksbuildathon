@@ -315,7 +315,9 @@ static void build_links_dense(std::vector<MFile>& files) {
     const Chunk& c = chunks[t];
     const MFile& f = files[c.file];
     size_t b = line_start_at_or_after(f, c.nominal), e = line_start_at_or_after(f, c.nominal_end);
+    STG_T(tk_);
     part[t] = b < e ? parse_link_chunk_dense(f.data + b, f.data + e, b == 0, keep[tid]) : 0;
+    STG_ACC(STG_TASK_L, tk_);
   });
   size_t nlinks = 0, nkept = 0;
   for (size_t c : part) nlinks += c;
@@ -747,6 +749,8 @@ static FORCE_INLINE u64 nonzero64(const u8* f) {
 // One batch. Returns the number of its lines that have an event_id.
 static NOINLINE u32 process_events(EvB& B, const u8* const base, WCScatter<D16>::Cursor& cur_out, TL& tl, int tid, const i64 ws,
                                    const i64 we) {
+  STG_T(sg_);
+  STG_ONLY(const uint64_t sg0_ = sg_;)
   const u32 n = B.n;
   B.pad();
   const u64 nmask = n >= 64 ? ~0ULL : ((1ULL << n) - 1);
@@ -759,6 +763,7 @@ static NOINLINE u32 process_events(EvB& B, const u8* const base, WCScatter<D16>:
     B.pfx[i] = (u8)((s0[0] ^ 'e') | (s1[0] ^ 'u'));
     memcpy(&B.w4[i], base + B.st[4][i], 4);
   }
+  STG_ACC(STG_PE_FETCH, sg_);
   // ---- IDs -> event index, user number; four lines at a time
   u64 irr = nonzero64(B.pfx);  // lines with an ID that is not regular
   {
@@ -778,6 +783,7 @@ static NOINLINE u32 process_events(EvB& B, const u8* const base, WCScatter<D16>:
       irr |= (u64)(be | bu) << i;
     }
   }
+  STG_ACC(STG_PE_IDS, sg_);
   // ---- timestamps: the lines by the form of ts (ingest_ts has to be 20 bytes for the fast forms), then one
   // kernel per form, as in the general pipeline; the ingest_ts also as its code
   u32 cnt[4] = {0, 0, 0, 0};
@@ -793,6 +799,7 @@ static NOINLINE u32 process_events(EvB& B, const u8* const base, WCScatter<D16>:
       cnt[3] += list8(B.lst[3] + cnt[3], live & ~(m0 | m1 | m2), i);
     }
   }
+  STG_ACC(STG_PE_LISTS, sg_);
   for (u32 j = 0; j < cnt[0]; j++) {
     const u32 i = B.lst[0][j];
     i64 ta, tb, cb;
@@ -824,6 +831,7 @@ static NOINLINE u32 process_events(EvB& B, const u8* const base, WCScatter<D16>:
     }
   }
   for (u32 j = 0; j < cnt[3]; j++) ev_ts_exact(B, B.lst[3][j], base);
+  STG_ACC(STG_PE_TS, sg_);
   // ---- the records of plain lines (valid view or cart events of regular IDs), four lines at a time: the
   // checks on the two timestamps come down to a handful of sign bits
   const u64 wlen = (u64)(we - ws);
@@ -856,6 +864,7 @@ static NOINLINE u32 process_events(EvB& B, const u8* const base, WCScatter<D16>:
       _mm_store_si128((__m128i*)(B.part + i), low32x4(_mm256_srli_epi64(idx, KE)));
     }
   }
+  STG_ACC(STG_PE_REC, sg_);
   // ---- which lines are plain: a user and a product, the type view or cart; eight lines at a time. (purch:
   // the same with a type that starts "purc" in 8 bytes, the candidates for a purchase.)
   u64 plain = 0, kept = 0, purch = 0;  // kept: the line has an event_id (a line without one is dropped)
@@ -875,6 +884,7 @@ static NOINLINE u32 process_events(EvB& B, const u8* const base, WCScatter<D16>:
   kept &= nmask;
   plain &= kept & ~(irr | bad);
   purch &= kept & ~(irr | bad);
+  STG_ACC(STG_PE_MASK, sg_);
   // ---- the scatter
   auto cur = cur_out;
   // (c: a copy of the cursor whose address never escapes, so that the compiler keeps it in registers;
@@ -884,6 +894,7 @@ static NOINLINE u32 process_events(EvB& B, const u8* const base, WCScatter<D16>:
     const u32 i = (u32)_tzcnt_u64(m);
     WCScatter<D16>::push16(c, B.part[i], _mm_load_si128((const __m128i*)&B.rec[i]));
   }
+  STG_ACC(STG_PE_SCAT, sg_);
   // purchases with a valid price whose category and price fit the record: the plain record and the payload.
   // Anything else about them (a bad price, a payload that does not fit) is left to ev_slow, as before.
   for (u64 m = purch; m; m = _blsr_u64(m)) {
@@ -905,6 +916,8 @@ static NOINLINE u32 process_events(EvB& B, const u8* const base, WCScatter<D16>:
   }
   cur_out = cur;
   B.n = 0;
+  STG_ACC(STG_PE_PUR, sg_);
+  STG_ADD(STG_E_PE, sg_ - sg0_);
   return (u32)_mm_popcnt_u64(kept);
 }
 
@@ -990,6 +1003,8 @@ static NOINLINE void ck_slow(TL& tl, CkB& B, u32 i, const u8* base, u32 rel, u32
 // One batch. Returns the number of its lines that have a click_id and a user_id.
 static NOINLINE u32 process_clicks(CkB& B, const u8* const base, WCScatter<C16>::Cursor& cur_out, TL& tl, const i64 cws,
                                    const i64 we) {
+  STG_T(sg_);
+  STG_ONLY(const uint64_t sg0_ = sg_;)
   const u32 n = B.n;
   B.pad();
   const u64 nmask = n >= 64 ? ~0ULL : ((1ULL << n) - 1);
@@ -1005,6 +1020,7 @@ static NOINLINE u32 process_clicks(CkB& B, const u8* const base, WCScatter<C16>:
     B.pfx[i] = (u8)((s0[0] ^ 'k') | (s1[0] ^ 'u'));
     B.cpx[i] = (u8)(c2 != 0x5F63);  // "c_"
   }
+  STG_ACC(STG_PC_FETCH, sg_);
   u64 irr = nonzero64(B.pfx);
   u64 cslow = nonzero64(B.cpx);  // campaign IDs that are not "c_" + a canonical number: camp_of decides
   {
@@ -1026,6 +1042,7 @@ static NOINLINE u32 process_clicks(CkB& B, const u8* const base, WCScatter<C16>:
       cslow |= (u64)bc << i;
     }
   }
+  STG_ACC(STG_PC_IDS, sg_);
   u32 cnt[4] = {0, 0, 0, 0};
   u64 kept = 0;  // the line has a click_id and a user_id
   {
@@ -1043,6 +1060,7 @@ static NOINLINE u32 process_clicks(CkB& B, const u8* const base, WCScatter<C16>:
       cnt[3] += list8(B.lst[3] + cnt[3], live & ~(m0 | m1 | m2), i);
     }
   }
+  STG_ACC(STG_PC_LISTS, sg_);
   {
     u32 j = 0;
     for (; j + 2 <= cnt[0]; j += 2) {  // F1, two lines at a time
@@ -1075,6 +1093,7 @@ static NOINLINE u32 process_clicks(CkB& B, const u8* const base, WCScatter<C16>:
       ck_ts_exact(B, i, base);
   }
   for (u32 j = 0; j < cnt[3]; j++) ck_ts_exact(B, B.lst[3][j], base);
+  STG_ACC(STG_PC_TS, sg_);
   const u64 wlen = (u64)(we - cws);
   static const i32 no_camp = -1;  // (the table can be empty)
   const u64 ncamp_tab = g_camp_by_num.size();
@@ -1090,6 +1109,7 @@ static NOINLINE u32 process_clicks(CkB& B, const u8* const base, WCScatter<C16>:
     const u32 i = (u32)_tzcnt_u64(m);
     B.camp[i] = camp_of(base + B.st[2][i], B.ln[2][i]);
   }
+  STG_ACC(STG_PC_CAMP, sg_);
   // the records, four lines at a time; a line is good when its ts is in the click window and it has a campaign
   u64 good = 0;
   {
@@ -1110,6 +1130,7 @@ static NOINLINE u32 process_clicks(CkB& B, const u8* const base, WCScatter<C16>:
     }
   }
   good &= kept;
+  STG_ACC(STG_PC_REC, sg_);
   auto cur = cur_out;
   for (u64 m = good & ~irr; m; m = _blsr_u64(m)) {
     const u32 i = (u32)_tzcnt_u64(m);
@@ -1121,6 +1142,8 @@ static NOINLINE u32 process_clicks(CkB& B, const u8* const base, WCScatter<C16>:
   }
   cur_out = cur;
   B.n = 0;
+  STG_ACC(STG_PC_SCAT, sg_);
+  STG_ADD(STG_C_PC, sg_ - sg0_);
   return (u32)_mm_popcnt_u64(kept);
 }
 
@@ -1166,15 +1189,21 @@ static void parse(std::vector<MFile>& ev, std::vector<MFile>& ck) {
       const MFile& f = ev[c.file];
       size_t b = line_start_at_or_after(f, c.nominal), e = line_start_at_or_after(f, c.nominal_end);
       if (b >= e) return;
+      STG_T(tk_);
       tl.n_event_lines += dn::parse_event_chunk(f.data + b, f.data + e, b == 0, tl, tid, ws, we);
+      STG_ACC(STG_TASK_E, tk_);
       drop_parsed(f, c.nominal, c.nominal_end);
+      STG_ACC(STG_DROP, tk_);
     } else {
       const Chunk& c = cc[t - ce.size()];
       const MFile& f = ck[c.file];
       size_t b = line_start_at_or_after(f, c.nominal), e = line_start_at_or_after(f, c.nominal_end);
       if (b >= e) return;
+      STG_T(tk_);
       tl.n_click_lines += dn::parse_click_chunk(f.data + b, f.data + e, b == 0, tl, cws, we);
+      STG_ACC(STG_TASK_C, tk_);
       drop_parsed(f, c.nominal, c.nominal_end);
+      STG_ACC(STG_DROP, tk_);
     }
   });
   parallel_for(NT, [&](int t, int) {
@@ -1868,6 +1897,7 @@ struct SegStat {
 // after the one before. Everything else is done per person once all its events are in: its sessions' days,
 // revenue, credited campaign and assists, and its rows.
 static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegStat& st) {
+  STG_T(tseg_);
   TL& tl = g_tl[tid];
   const u32 NC = g_ncamp, ORG = NC;
   const u32 NB = (u32)(((u64)(g_we - g_ws - 1) >> BSHIFT) + 1);
@@ -1969,7 +1999,7 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
     }
   };
   // All events of the open person are in: its sessions, its rows.
-  auto close_person = [&]() {
+  auto close_person_body = [&]() {
     if (ps.cur_p == NONE) return;
     if (ps.x_next != NONE) feed_extras(NONE - 1);
     const u32 p = ps.cur_p, cnt = ps.cur_cnt, ns = ps.ns;
@@ -1994,7 +2024,11 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
     vmax_e = _mm256_max_epu32(vmax_e, _mm256_max_epu32(D.v0, D.v1));
     // ---- its clicks: the keys of its index in the click partition
     const u32 cp = p >> KC;
-    if (__builtin_expect(cp != S.cp, 0)) load_clicks(S, cp, c2c, p2shift);
+    if (__builtin_expect(cp != S.cp, 0)) {
+      STG_T(tl_);
+      load_clicks(S, cp, c2c, p2shift);
+      STG_ACC(STG_LCLK, tl_);
+    }
     const u32 c0 = S.coff[p & ((1u << KC) - 1)];
     const u32 mc0 = S.cpos[p & ((1u << KC) - 1)] - c0;  // its clicks in the partition
     u32 mc = mc0;                                             // ... and with its extra clicks
@@ -2027,7 +2061,9 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
     u16* const lines = S.lines16;
     __m256i cr = _mm256_setzero_si256();  // credited sessions per day
     if (mc) {
+      STG_T(ts_);
       const u32 any_tie = sort_click_keys(keys, mc, sk, S.rtmp);
+      STG_ACC(STG_SORT, ts_);
       // Among clicks of one time the one with the smallest click_id counts: it goes last of them. (About one
       // click in twenty has the time of another click of the person, and most of those are one click that
       // is in the data twice: with one campaign there is nothing to choose.)
@@ -2185,6 +2221,11 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
     out.top.cur += nrow;
     out.nrows += nrow;
   };
+  auto close_person = [&]() {
+    STG_T(tc_);
+    close_person_body();
+    STG_ACC(STG_CLOSE, tc_);
+  };
   u32 last_un = NONE;  // (the general person of the last such user, kept for runs of the same one)
   u64 last_ph = 0;
   auto emit_general = [&](const u32 un, const u32 ts, const u32 cat, const u32 price) {
@@ -2292,7 +2333,10 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
   __asm__("" : "+x"(k_ord), "+x"(k_sh1), "+x"(k_m31), "+x"(k_min30), "+x"(k_price));
   alignas(32) u32 pbuf[16];
   for (u32 j = pb; j < pe && !g_fail.load(std::memory_order_relaxed); j++) {
+    STG_T(tp_);
     if (!place(j, T, S)) continue;
+    STG_ACC(STG_PLACE, tp_);
+    STG_ONLY(const uint64_t cl0_ = tl_stgp[STG_CLOSE];)
     DN_VEC();
     for (u32 i = 0; i < ESLOTS; i += 8) {
       u32 done = 0;  // the slots of the group that are dealt with
@@ -2358,7 +2402,15 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
         if (done == 0xFF) break;
       }
     }
+#ifdef STAGES
+    {
+      const uint64_t n_ = __rdtsc();
+      tl_stgp[STG_SLOTS] += (n_ - tp_) - (tl_stgp[STG_CLOSE] - cl0_);
+      tp_ = n_;
+    }
+#endif
     memset(T, 0, sizeof(D16) * ESLOTS);
+    STG_ACC(STG_MEMSET, tp_);
   }
 #undef DN_SLOT
 #undef DN_VEC
@@ -2367,6 +2419,7 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
   // nothing to do: no dense person at all in our partitions (then the first one out there was already the
   // first one here, and the thread before us has it), and only the one we left to the thread before, if
   // that one is still going on out there.
+  STG_T(ta_);
   if (pb == 0 || !skipping || q_skip != NONE) {
     bool taken = false;  // the first dense person out there has come
     for (u32 j = pe; j < g_PE && !g_fail.load(std::memory_order_relaxed); j++) {
@@ -2416,6 +2469,7 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
       if (stop) break;
     }
   }
+  STG_ACC(STG_AHEAD, ta_);
   DN_OUT();
 #undef DN_OUT
 #undef DN_IN
@@ -2437,6 +2491,7 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
   st.n_persons = n_persons;
   st.n_events = n_events;
   st.n_general = n_general;
+  STG_ACC(STG_SEG, tseg_);
 }
 
 static void scan_all() {
