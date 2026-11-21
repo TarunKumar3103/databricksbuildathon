@@ -31,16 +31,20 @@ One static C++17 binary (no engine, no runtime dependencies) that reads `/data` 
    stores; full lines go through a small queue so no branch depends on which partition filled up). Per
    partition, a bit map with 8+ bits per record finds the IDs that may occur more than once; only those
    go into a small exact table, which keeps the copy with the smallest `ingest_ts` *before* validation.
-   Every other record is the only copy of its event. Survivors look up their person in batches (split
+   Every other record is the only copy of its event; the pass that separates the two kinds has no
+   data-dependent branch. Survivors look up their person in batches (split
    by the Bloom filter without branching, then probe the table for the flagged ones) and are
    re-partitioned by person.
    Clicks look up their person while they are parsed and are partitioned by person directly (copies are
    identical, so click dedup cannot change any result).
 5. **Sessions.** Per person partition, events are counting-sorted by (person, 2^20 ms time bucket). A
    bucket spans less than 30 minutes, so each bucket lies in one session and gaps only need checking
-   between consecutive buckets: no comparison sort. Clicks per person are sorted by time; a sliding
-   7-day window gives the credited click (latest, ties to the smallest `click_id`) and the assisting
-   campaigns.
+   between consecutive buckets: no comparison sort. A person's clicks are put in time order by counting
+   each click's rank with vector compares (a radix sort for long lists). The credited click of a
+   session (latest in the 7 days before it, ties to the smallest `click_id`) is found by counting the
+   clicks up to the session start. Assists are counted from the click's side: a click assists a run of
+   the person's sessions, and the part of the run not already covered by an earlier click of the same
+   campaign is added per day.
 6. **Output.** A small built-in Parquet writer (PLAIN pages, dictionary-encoded `top_category`, `DATE`
    for `day`), one file per thread. The `user_daily` columns are appended row by row, already in their
    on-disk form, to blocks recycled from the earlier phases, and those blocks go to the file with

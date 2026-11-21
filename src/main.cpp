@@ -1817,28 +1817,31 @@ static void dedup_and_route() {
       WCScatter<R2>::push16(c, (u32)(ph >> p2shift), _mm_set_epi64x((long long)tp, (long long)ph));
     };
     Router<u64, R2, decltype(emit)> router(cur, emit);
-    auto route = [&](const R1& r) __attribute__((always_inline)) {
+    // Hands a record to the router, which keeps it only if `keep` is 1 (no branch on the data).
+    auto route_if = [&](const R1& r, u32 keep) __attribute__((always_inline)) {
       u64 tp;
       memcpy(&tp, &r.ts, 8);
-      router.add(r.uid, tp);
+      router.add_if(r.uid, tp, keep);
     };
     if (nids == 0) {
       // ---- every ID is unique
       for (int t = 0; t < NT; t++)
         for (auto& b : g_tl[t].r1.blocks[p]) {
           const R1* rec = b.first;
-          for (u32 j = 0; j < b.second; j++)
-            if (rec[j].ts != TS_INVALID) route(rec[j]);
+          for (u32 j = 0; j < b.second; j++) route_if(rec[j], rec[j].ts != TS_INVALID);
         }
     } else {
-      // ---- exact table of the candidate IDs (and a bit map of them, to skip the table for most records)
+      // ---- exact table of the candidate IDs (and a bit map of them, to skip the table for most records).
+      // Every slot starts with NONE as its best copy: later than any real ingest_ts and not a valid event,
+      // so neither the comparisons nor the final sweep need to ask whether a slot is in use.
+      static const R1 NONE = {0, INT64_MAX, 0, TS_INVALID, 0};
       u64* cand = S.cand.data();
       memset(cand, 0, words * 8);
       const u32 tbits = ceil_log2(nids * 2 + 8);
       const size_t tsz = (size_t)1 << tbits;
       if (S.tab.size() < tsz) S.tab.resize(tsz);
       DSlot* tab = S.tab.data();
-      memset(tab, 0, tsz * sizeof(DSlot));
+      for (size_t q = 0; q < tsz; q++) tab[q] = DSlot{0, &NONE};
       const u64 tmask = tsz - 1;
       const u32 tshift = 64 - tbits;
       for (size_t k = 0; k < nids; k++) {
@@ -1849,26 +1852,33 @@ static void dedup_and_route() {
         while (tab[q].eid != e && tab[q].eid != 0) q = (q + 1) & tmask;
         tab[q].eid = e;  // eid is a bijective hash of a non-empty key; 0 would need key 0, which no ID has
       }
+      const R1* cl[WCScatter<R1>::BLK];  // the records of a block whose ID may be in the table
       for (int t = 0; t < NT; t++)
         for (auto& b : g_tl[t].r1.blocks[p]) {
           const R1* rec = b.first;
+          u32 nc = 0;
           for (u32 j = 0; j < b.second; j++) {
             const R1& r = rec[j];
+            const u64 i = (r.eid << P1bits) >> ishift;
+            const u32 c = (u32)(cand[i >> 6] >> (i & 63)) & 1;
+            cl[nc] = &r;
+            nc += c;
+            route_if(r, (u32)(r.ts != TS_INVALID) & (c ^ 1));  // the only copy of its event
+          }
+          for (u32 k = 0; k < nc; k++) {
+            const R1& r = *cl[k];
             const u64 e = r.eid;
-            const u64 i = (e << P1bits) >> ishift;
-            if (__builtin_expect((cand[i >> 6] >> (i & 63)) & 1, 0)) {
-              u64 q = (e << P1bits) >> tshift;
-              while (tab[q].eid != e && tab[q].eid != 0) q = (q + 1) & tmask;
-              if (tab[q].eid == e) {
-                if (tab[q].best == nullptr || r.ingest < tab[q].best->ingest) tab[q].best = &r;
-                continue;
-              }
+            u64 q = (e << P1bits) >> tshift;
+            while (tab[q].eid != e && tab[q].eid != 0) q = (q + 1) & tmask;
+            if (__builtin_expect(tab[q].eid == e, 1)) {
+              const R1* best = tab[q].best;  // the first copy with the smallest ingest_ts stays
+              tab[q].best = r.ingest < best->ingest ? &r : best;
+            } else {
+              route_if(r, r.ts != TS_INVALID);  // the bit map was wrong about it
             }
-            if (r.ts != TS_INVALID) route(r);
           }
         }
-      for (size_t q = 0; q < tsz; q++)
-        if (tab[q].best != nullptr && tab[q].best->ts != TS_INVALID) route(*tab[q].best);
+      for (size_t q = 0; q < tsz; q++) route_if(*tab[q].best, tab[q].best->ts != TS_INVALID);
     }
     router.run();
     tl.r2.close(cur);
@@ -1898,54 +1908,82 @@ struct XRec {
   u32 pad;
 };
 
-struct CRec {
-  u32 ts;
-  u32 camp;
-  u64 click;
-};
-
 static inline bool click_less(u64 a, u64 b) {  // byte-wise order of click ids
   if (!is_slow(a) && !is_slow(b)) return a < b;
   return key_cmp(a, b) < 0;
 }
 
-static void sort_clicks(CRec* a, size_t n, std::vector<CRec>& tmp) {
-  if (n < 2) return;
-  if (n > 12 && n <= 1024) {
-    std::sort(a, a + n, [](const CRec& x, const CRec& y) { return x.ts < y.ts; });
-    return;
+// Number of entries <= x in nv vectors of timestamps (padding entries are 0xFFFFFFFF; x is below that).
+static FORCE_INLINE u32 count_le(const u32* ts, u32 nv, u32 x) {
+  const __m256i vx = _mm256_set1_epi32((int)x);
+  u32 c = 0;
+  for (u32 v = 0; v < nv; v++) {
+    const __m256i t = _mm256_loadu_si256((const __m256i*)(ts + 8 * v));
+    c += (u32)__builtin_popcount(
+        (u32)_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(_mm256_max_epu32(t, vx), vx))));
   }
-  if (n <= 12) {
-    for (size_t i = 1; i < n; i++) {
-      CRec x = a[i];
-      size_t j = i;
-      while (j > 0 && a[j - 1].ts > x.ts) {
-        a[j] = a[j - 1];
-        j--;
+  return c;
+}
+
+// One person's clicks (n > 0: ts / camp / click, in any order) into time order: sts / scamp / sclick, with
+// 0xFFFFFFFF in sts[n .. n + 8). Equal timestamps keep their order. tin is scratch for n + 16 entries; at
+// least 7 entries after ts[n - 1] must be readable.
+//
+// Up to RANK_MAX clicks, the rank of each one is counted with vector compares against all of them: no
+// data-dependent branch, and most persons have only a few clicks. Beyond that, a radix sort.
+static constexpr u32 RANK_MAX = 64;
+static NOINLINE void sort_person_clicks(const u32* ts, const u32* camp, const u64* click, const u32 n, u32* tin,
+                                        u32* sts, u32* scamp, u64* sclick, std::vector<u64>& tmp) {
+  const __m256i ones = _mm256_set1_epi32(-1);
+  if (n <= RANK_MAX) {
+    const u32 nv = (n + 7) / 8;
+    for (u32 v = 0; v < nv; v++)
+      _mm256_storeu_si256((__m256i*)(tin + 8 * v), _mm256_loadu_si256((const __m256i*)(ts + 8 * v)));
+    _mm256_storeu_si256((__m256i*)(tin + n), ones);
+    const __m256i iota = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    for (u32 i = 0; i < n; i++) {
+      const __m256i vi = _mm256_set1_epi32((int)tin[i]);
+      __m256i before = _mm256_cmpgt_epi32(_mm256_set1_epi32((int)i), iota);  // lanes of entries earlier than i
+      u32 r = 0;
+      for (u32 v = 0; v < nv; v++) {
+        const __m256i tj = _mm256_loadu_si256((const __m256i*)(tin + 8 * v));
+        const __m256i ge = _mm256_cmpeq_epi32(_mm256_max_epu32(tj, vi), tj);  // tj >= ti (and the padding)
+        const __m256i eqb = _mm256_and_si256(_mm256_cmpeq_epi32(tj, vi), before);
+        r += 8 - (u32)__builtin_popcount((u32)_mm256_movemask_ps(_mm256_castsi256_ps(ge))) +
+             (u32)__builtin_popcount((u32)_mm256_movemask_ps(_mm256_castsi256_ps(eqb)));
+        before = _mm256_cmpgt_epi32(_mm256_set1_epi32((int)i - 8 * (int)(v + 1)), iota);
       }
-      a[j] = x;
+      sts[r] = tin[i];
+      scamp[r] = camp[i];
+      sclick[r] = click[i];
     }
-    return;
-  }
-  // LSD radix sort on ts (11 + 11 + 10 bits)
-  if (tmp.size() < n) tmp.resize(n);
-  CRec* src = a;
-  CRec* dst = tmp.data();
-  const int shifts[3] = {0, 11, 22};
-  for (int pass = 0; pass < 3; pass++) {
-    u32 cnt[2048] = {0};
-    int sh = shifts[pass];
-    for (size_t i = 0; i < n; i++) cnt[(src[i].ts >> sh) & 2047]++;
-    u32 sum = 0;
-    for (int b = 0; b < 2048; b++) {
-      u32 c = cnt[b];
-      cnt[b] = sum;
-      sum += c;
+  } else {
+    // LSD radix sort of (ts, index), 8 bits a pass
+    if (tmp.size() < 2 * (size_t)n) tmp.resize(2 * (size_t)n);
+    u64* a = tmp.data();
+    u64* b = a + n;
+    for (u32 i = 0; i < n; i++) a[i] = ((u64)ts[i] << 32) | i;
+    for (int pass = 0; pass < 4; pass++) {
+      const int sh = 32 + 8 * pass;
+      u32 cnt[256] = {0};
+      for (u32 i = 0; i < n; i++) cnt[(a[i] >> sh) & 255]++;
+      u32 sum = 0;
+      for (int k = 0; k < 256; k++) {
+        const u32 c = cnt[k];
+        cnt[k] = sum;
+        sum += c;
+      }
+      for (u32 i = 0; i < n; i++) b[cnt[(a[i] >> sh) & 255]++] = a[i];
+      std::swap(a, b);
     }
-    for (size_t i = 0; i < n; i++) dst[cnt[(src[i].ts >> sh) & 2047]++] = src[i];
-    std::swap(src, dst);
+    for (u32 i = 0; i < n; i++) {
+      const u32 idx = (u32)a[i];
+      sts[i] = (u32)(a[i] >> 32);
+      scamp[i] = camp[idx];
+      sclick[i] = click[idx];
+    }
   }
-  if (src != a) memcpy(a, src, n * sizeof(CRec));
+  _mm256_storeu_si256((__m256i*)(sts + n), ones);
 }
 
 static void person_phase() {
@@ -1986,9 +2024,14 @@ static void person_phase() {
     std::vector<u32> cntL, posL, cntC, offC;
     std::vector<XRec> X;
     std::vector<u64> E;
-    std::vector<CRec> C, Ctmp;
+    std::vector<u32> Cts, Ccamp;  // clicks grouped by person, in any order
+    std::vector<u64> Cclick;
+    std::vector<u32> tin, sts, scamp;  // one person's clicks in time order
+    std::vector<u64> sclick, rtmp;
     std::vector<u32> lidC;
-    std::vector<u32> ccnt, cpos, active;
+    std::vector<u32> cov;     // per campaign: the person's sessions below this index are already counted for it
+    std::vector<u32> sstart;  // start of each session of the person (padded like the click times)
+    std::vector<u32> dstart;  // first session of each of the person's days
     std::vector<BAgg> agg;
     std::vector<u64> bitmap;
     std::vector<u16> bday;
@@ -2006,9 +2049,10 @@ static void person_phase() {
     if (n_e == 0) return;
     Scratch& S = scr[tid];
     TL& tl = g_tl[tid];
-    if (S.ccnt.size() < NC + 1) {
-      S.ccnt.assign(NC + 1, 0);
-      S.cpos.assign(NC + 1, 0);
+    if (S.cov.size() < NC + 1) {
+      S.cov.assign(NC + 1, 0);
+      S.sstart.assign((size_t)NB + 16, 0);
+      S.dstart.assign((size_t)ND + 2, 0);
       S.agg.assign(NB, BAgg{0xFFFFFFFFu, 0, 0, 0, 0});
       S.bitmap.assign(NW, 0);
       S.bday.assign(NB, 0);
@@ -2113,28 +2157,42 @@ static void person_phase() {
     }
     S.offC.resize(np + 2);
     {
-      u32 sum = 0;
+      u32 sum = 0, mcmax = 0;
       for (u32 l = 0; l <= np; l++) {
         S.offC[l] = sum;
         sum += S.cntC[l];
+        if (l < np) mcmax = std::max(mcmax, S.cntC[l]);
       }
       S.offC[np + 1] = sum;
-      S.C.resize(sum);
+      if (S.Cts.size() < (size_t)sum + 16) {
+        S.Cts.resize((size_t)sum + 16);
+        S.Ccamp.resize((size_t)sum + 16);
+        S.Cclick.resize((size_t)sum + 16);
+      }
+      if (S.sts.size() < (size_t)mcmax + 16) {
+        S.tin.resize((size_t)mcmax + 16);
+        S.sts.resize((size_t)mcmax + 16);
+        S.scamp.resize((size_t)mcmax + 16);
+        S.sclick.resize((size_t)mcmax + 16);
+      }
       u32* pos = S.cntC.data();
       for (u32 l = 0; l <= np; l++) pos[l] = S.offC[l];
+      u32* Cts = S.Cts.data();
+      u32* Ccamp = S.Ccamp.data();
+      u64* Cclick = S.Cclick.data();
       size_t kk = 0;
       for (int t = 0; t < NT; t++)
         for (auto& b : g_tl[t].r2c.blocks[p]) {
           const R2C* r = b.first;
           for (u32 j = 0; j < b.second; j++) {
-            u32 lid = S.lidC[kk++];
-            S.C[pos[lid]++] = CRec{r[j].ts, r[j].camp, r[j].click};
+            const u32 q = pos[S.lidC[kk++]]++;
+            Cts[q] = r[j].ts;
+            Ccamp[q] = r[j].camp;
+            Cclick[q] = r[j].click;
           }
         }
     }
     // ---- per person
-    u32* ccnt = S.ccnt.data();
-    u32* cpos = S.cpos.data();
     CStat* c_stat = tl.c_stat.data();  // both indexed [day][campaign]
     u32* c_assist = tl.c_assist.data();
     const size_t NC1 = (size_t)NC + 1;
@@ -2145,17 +2203,27 @@ static void person_phase() {
     u32* dev = S.dev.data();
     i64* drev = S.drev.data();
     i64* catsum = S.catsum.data();
+    u32* cov = S.cov.data();
+    u32* sstart = S.sstart.data();
+    u32* dstart = S.dstart.data();
+    const u32* const sts = S.sts.data();
+    const u32* const scamp = S.scamp.data();
+    const u64* const sclick = S.sclick.data();
     OutCols& out = tl.out;
     const u32* posL = S.posL.data();
     const u64* Eall = S.E.data();
     for (u32 lid = 0; lid < np; lid++) {
       const u32 eend = posL[lid], ebeg = eend - S.cntL[lid];
-      CRec* C = S.C.data() + S.offC[lid];
-      const size_t mc = S.offC[lid + 1] - S.offC[lid];
-      sort_clicks(C, mc, S.Ctmp);
-      // bucket aggregates
+      // this person's clicks, in time order
+      const u32 c0 = S.offC[lid], mc = S.offC[lid + 1] - c0;
+      if (mc)
+        sort_person_clicks(S.Cts.data() + c0, S.Ccamp.data() + c0, S.Cclick.data() + c0, mc, S.tin.data(), S.sts.data(),
+                           S.scamp.data(), S.sclick.data(), S.rtmp);
+      const u32 nv = (mc + 7) / 8;
+      // bucket aggregates; `summary` has a bit for every word of the bit map that is in use
       S.purch.clear();
-      u32 wlo = NW, whi = 0;
+      u64 summary = 0;
+      u32 ncell = 0;
       for (u32 i = ebeg; i < eend; i++) {
         const u64 e = Eall[i];
         const u32 ts = (u32)(e >> 32), pl = (u32)e;
@@ -2164,73 +2232,69 @@ static void person_phase() {
         // so the first event of a bucket needs no special case
         BAgg& a = agg[b];
         bitmap[b >> 6] |= 1ULL << (b & 63);
+        summary |= 1ULL << (b >> 6);
+        ncell += a.cnt == 0;
         a.mn = ts < a.mn ? ts : a.mn;
         a.mx = ts > a.mx ? ts : a.mx;
         a.cnt++;
-        wlo = std::min(wlo, b >> 6);
-        whi = std::max(whi, b >> 6);
         if (pl) {
           a.rev += pl & 0xFFFFFF;
           S.purch.push_back(Purch{b, pl >> 24, pl & 0xFFFFFF});
         }
       }
       // sessions over the buckets in time order
-      size_t lo = 0, hi = 0;
+      u32 ns = 0;  // sessions of this person so far
+      u32 hi = 0;  // (for a long click list: the clicks up to the current session start)
       bool open = false;
       u32 s_start = 0, s_max = 0, s_nev = 0, s_day = 0;
       i64 s_rev = 0;
       S.days.clear();
       auto close_session = [&]() {
-        const u64 upper = (u64)s_start + (u64)WEEK;
-        while (hi < mc && (u64)C[hi].ts <= upper) {
-          u32 c = C[hi].camp;
-          if (ccnt[c]++ == 0) {
-            cpos[c] = (u32)S.active.size();
-            S.active.push_back(c);
-          }
-          hi++;
-        }
-        while (lo < hi && C[lo].ts < s_start) {
-          u32 c = C[lo].camp;
-          if (--ccnt[c] == 0) {
-            u32 ps = cpos[c];
-            u32 last = S.active.back();
-            S.active[ps] = last;
-            cpos[last] = ps;
-            S.active.pop_back();
-          }
-          lo++;
-        }
+        // credit: the latest click in the 7 days up to the session start, the smallest click_id among equal
+        // times (click times count from 7 days before the window, session times from the window start)
         u32 credit = ORG;
-        if (hi > lo) {
-          size_t bi = hi - 1;
-          u32 tsmax = C[bi].ts;
-          for (size_t q = bi; q > lo && C[q - 1].ts == tsmax;) {
-            q--;
-            if (click_less(C[q].click, C[bi].click)) bi = q;
+        if (mc) {
+          const u32 upper = s_start + (u32)WEEK;
+          if (mc <= 32)
+            hi = count_le(sts, nv, upper);
+          else
+            while (hi < mc && sts[hi] <= upper) hi++;
+          if (hi > 0 && sts[hi - 1] >= s_start) {
+            u32 bi = hi - 1;
+            const u32 tsmax = sts[bi];
+            for (u32 q = bi; q > 0 && sts[q - 1] == tsmax;) {
+              q--;
+              if (click_less(sclick[q], sclick[bi])) bi = q;
+            }
+            credit = scamp[bi];
           }
-          credit = C[bi].camp;
         }
         CStat& cs = c_stat[(size_t)s_day * NC1 + credit];
         cs.sess++;
         cs.purch += (s_rev > 0);
         cs.rev += s_rev;
-        {
-          u32* row = c_assist + (size_t)s_day * NC1;  // one day's row: 4 bytes per campaign
-          const u32* act = S.active.data();
-          const size_t na = S.active.size();
-          for (size_t k = 0; k < na; k++) row[act[k]]++;
+        if (dsess[s_day]++ == 0) {  // the person's next day: its sessions start here
+          dstart[S.days.size()] = ns;
+          S.days.push_back(s_day);
         }
-        if (dsess[s_day]++ == 0) S.days.push_back(s_day);
+        sstart[ns++] = s_start;
         dev[s_day] += s_nev;
         drev[s_day] += s_rev;
       };
-      for (u32 wi = wlo; wi <= whi && wi < NW; wi++) {
-        u64 w = bitmap[wi];
-        bitmap[wi] = 0;
-        while (w) {
-          const u32 b = wi * 64 + (u32)__builtin_ctzll(w);
-          w &= w - 1;
+      {
+        u64 w = 0;  // what is left of the current word of the bit map
+        u32 wi = 0;
+        for (u32 k = 0; k < ncell; k++) {
+          // the next bucket in use; moving on to the next word of the bit map without a branch
+          const u64 adv = 0 - (u64)(w == 0);
+          const u32 wnext = (u32)_tzcnt_u64(summary) & 63;
+          wi = (u32)((wi & ~adv) | (wnext & adv));
+          summary = (summary & ~adv) | (_blsr_u64(summary) & adv);
+          const u64 wl = bitmap[wi];
+          bitmap[wi] = 0;
+          w = (w & ~adv) | (wl & adv);
+          const u32 b = wi * 64 + (u32)_tzcnt_u64(w);
+          w = _blsr_u64(w);
           const BAgg a = agg[b];
           if (!open || a.mn - s_max > (u32)MIN30) {
             if (open) close_session();
@@ -2248,8 +2312,36 @@ static void person_phase() {
         }
       }
       if (open) close_session();
-      for (u32 c : S.active) ccnt[c] = 0;
-      S.active.clear();
+      // Assists. A click assists the sessions that start in the 7 days after it: a run [a, b) of the person's
+      // sessions. Going through the clicks in time order, the runs of one campaign only move forward, so the
+      // part of a run that an earlier click of the campaign has not covered is [max(a, cov), b). Its sessions
+      // are counted per day from where each day's sessions start, with the same few steps for every click.
+      if (mc) {
+        const u32 ndays = (u32)S.days.size();
+        dstart[ndays] = ns;
+        _mm256_storeu_si256((__m256i*)(sstart + ns), _mm256_set1_epi32(-1));
+        const u32 nsv = (ns + 7) / 8;
+        u32* rows[64];  // assist counters of the person's days (a window has at most 50 days)
+        for (u32 j = 0; j < ndays; j++) rows[j] = c_assist + (size_t)S.days[j] * NC1;
+        u32 a = 0, b = 0;  // (two pointers for a long session list)
+        for (u32 k = 0; k < mc; k++) {
+          const u32 t = sts[k], c = scamp[k];
+          if (ns <= 32) {
+            b = count_le(sstart, nsv, t);
+            a = t > (u32)WEEK ? count_le(sstart, nsv, t - (u32)WEEK - 1) : 0;
+          } else {
+            while (b < ns && sstart[b] <= t) b++;
+            while (a < b && (u64)sstart[a] + (u64)WEEK < t) a++;
+          }
+          const u32 x = std::max(a, cov[c]);
+          cov[c] = std::max(cov[c], b);
+          for (u32 j = 0; j < ndays; j++) {
+            const i32 n = (i32)std::min(b, dstart[j + 1]) - (i32)std::max(x, dstart[j]);
+            rows[j][c] += (u32)(n > 0 ? n : 0);
+          }
+        }
+        for (u32 k = 0; k < mc; k++) cov[scamp[k]] = 0;
+      }
       // purchases -> category sums per day of their session
       for (const Purch& q : S.purch) catsum[(size_t)bday[q.bucket] * NCAT + q.cat] += q.price;
       // one output row per day with a session
