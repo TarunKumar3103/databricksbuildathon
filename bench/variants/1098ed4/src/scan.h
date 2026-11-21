@@ -92,6 +92,10 @@ template <int NF, class F>
 static inline __attribute__((always_inline)) void scan_lines(const u8* begin, const u8* end, bool skip_header,
                                                              F&& on_vec) {
   static_assert(NF >= 1 && NF <= 8, "fields per line");
+  // Separators flattened per round of the unrolled loop below. A 64-byte block of generated data holds 3 to 7
+  // separators (event lines are 77 bytes with 7, click lines 45 bytes with 4, link lines 20 bytes with 2), so
+  // one round of 7 (6 for 4-field lines) covers every regular block, one slot fewer than a round of 8.
+  constexpr u32 FLAT = NF == 4 ? 6 : 7;
   const u8* p = begin;
   if (skip_header) {
     const u8* nl = (const u8*)memchr(p, '\n', (size_t)(end - p));
@@ -193,13 +197,13 @@ static inline __attribute__((always_inline)) void scan_lines(const u8* begin, co
     {
       u64 m = sep;
       u32* o = Spos + (size_t)ns;
-      for (u32 done = 0;; done += 8) {
+      for (u32 done = 0;; done += FLAT) {
 #pragma GCC unroll 8
-        for (int j = 0; j < 8; j++) {
+        for (u32 j = 0; j < FLAT; j++) {
           o[done + j] = off + tz64(m);
           m = _blsr_u64(m);
         }
-        if (done + 8 >= cnt) break;
+        if (done + FLAT >= cnt) break;
       }
     }
     ns += cnt;
@@ -364,6 +368,10 @@ template <int NF, class G, class F>
 static inline __attribute__((always_inline)) void scan_cols(const u8* begin, const u8* end, bool skip_header,
                                                             G&& on_group, F&& on_vec) {
   static_assert(NF >= 1 && NF <= 7, "fields per line");
+  // Separators flattened per round of the unrolled loop below. A 64-byte block of generated data holds 3 to 7
+  // separators (event lines are 77 bytes with 7, click lines 45 bytes with 4, link lines 20 bytes with 2), so
+  // one round of 7 (6 for 4-field lines) covers every regular block, one slot fewer than a round of 8.
+  constexpr u32 FLAT = NF == 4 ? 6 : 7;
   const u8* p = begin;
   if (skip_header) {
     const u8* nl = (const u8*)memchr(p, '\n', (size_t)(end - p));
@@ -472,13 +480,13 @@ static inline __attribute__((always_inline)) void scan_cols(const u8* begin, con
     {
       u64 m = sep;
       u32* o = Spos + (size_t)ns;
-      for (u32 done = 0;; done += 8) {
+      for (u32 done = 0;; done += FLAT) {
 #pragma GCC unroll 8
-        for (int j = 0; j < 8; j++) {
+        for (u32 j = 0; j < FLAT; j++) {
           o[done + j] = off + tz64(m);
           m = _blsr_u64(m);
         }
-        if (done + 8 >= cnt) break;
+        if (done + FLAT >= cnt) break;
       }
     }
     ns += cnt;

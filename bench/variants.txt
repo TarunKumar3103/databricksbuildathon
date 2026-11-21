@@ -1,11 +1,7 @@
 # Written by bench/mkbench.py. tag, binary in /usr/local/bench, then ENV=VALUE settings.
 # The first build also writes the dev output that the report rows are added to.
-e ss-e1eb3d1-f0   # e1eb3d1 -Wa,-mbranches-within-32B-boundaries: v4 head, new link phase (baseline)
-a ss-77eeb25-f1   # 77eeb25 -Wa,-mbranches-within-32B-boundaries: its parent
-k13 ss-f2023b5-f2   # f2023b5 -Wa,-mbranches-within-32B-boundaries: a-ke13: event partitions of 2^13 indexes
-k12 ss-ca31a92-f3   # ca31a92 -Wa,-mbranches-within-32B-boundaries: a-ke12: 2^12
-c10 ss-7deef7a-f4   # 7deef7a -Wa,-mbranches-within-32B-boundaries: a-kc10: click partitions of 2^10 persons
-c8 ss-d02bc98-f5   # d02bc98 -Wa,-mbranches-within-32B-boundaries: a-kc8: 2^8
-pin ss-f258112-f6   # f258112 -Wa,-mbranches-within-32B-boundaries: a-pin: workers pinned to CPUs
-L ss-e1eb3d1-clang18-O2   # e1eb3d1 with clang 18.1.3 -O2 -fno-vectorize -fno-slp-vectorize, built in chat C's sandbox (bench/prebuilt); = branch c-clang 3ecb331
-K ss-e1eb3d1-clang-built  # e1eb3d1 with clang 18 installed from Ubuntu's archive on the build machine, as c-clang's Dockerfile does; missing if that failed
+v ss-4a23ea7-f0   # 4a23ea7 -Wa,-mbranches-within-32B-boundaries: v4 head: B scanner + A scan rewrite, gcc as its Dockerfile
+s ss-48d15a9-f1   # 48d15a9 -Wa,-mbranches-within-32B-boundaries: b-slots-v4: v4 + B slot loop, gcc
+sc ss-48d15a9-clang18                # b-slots-v4 with clang 18, no profile (prebuilt in chat C's sandbox)
+sp ss-1098ed4-built                  # b-slots-v4-pgo 1098ed4: clang 18 + its profile, built on the build machine like its Dockerfile; missing if that failed
+s8p ss-1098ed4-kc8-clang18-pgo       # 1098ed4 with click partitions of 2^8 persons (KC = 8, as a-kc8), same profile (prebuilt)

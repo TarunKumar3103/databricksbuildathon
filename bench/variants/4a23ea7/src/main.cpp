@@ -2110,46 +2110,59 @@ static FORCE_INLINE u32 count_le(const u32* ts, u32 nv, u32 x) {
 static constexpr u32 RANK_MAX = 64;
 static NOINLINE void sort_person_clicks(const u32* ts, const u32* camp, const u64* click, const u32 n, u32* tin,
                                         u32* sts, u32* scamp, u64* sclick, std::vector<u64>& tmp) {
+  (void)tin;
   const __m256i ones = _mm256_set1_epi32(-1);
   if (n <= RANK_MAX) {
-    const u32 nv = (n + 7) / 8;
-    for (u32 v = 0; v < nv; v++)
-      _mm256_storeu_si256((__m256i*)(tin + 8 * v), _mm256_loadu_si256((const __m256i*)(ts + 8 * v)));
-    _mm256_storeu_si256((__m256i*)(tin + n), ones);
-    const __m256i iota = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    // Keys that all differ: the time, then the position. The rank of a key is the number of keys below it,
+    // counted for four keys at once against each key in turn. (Signed compares: the top bit is flipped.)
+    alignas(32) u64 key[RANK_MAX + 8];
+    __m256i cnt[RANK_MAX / 4];
+    const u32 ng = (n + 3) / 4;
+    const __m256i flip = _mm256_set1_epi64x((long long)0x8000000000000000ULL);
+    __m256i pos = _mm256_setr_epi64x(0, 1, 2, 3);
+    for (u32 g = 0; g < ng; g++) {
+      const __m256i t = _mm256_cvtepu32_epi64(_mm_loadu_si128((const __m128i*)(ts + 4 * g)));
+      _mm256_store_si256((__m256i*)(key + 4 * g), _mm256_xor_si256(_mm256_or_si256(_mm256_slli_epi64(t, 32), pos), flip));
+      pos = _mm256_add_epi64(pos, _mm256_set1_epi64x(4));
+      cnt[g] = _mm256_setzero_si256();
+    }
+    for (u32 k = 0; k < n; k++) {
+      const __m256i vk = _mm256_set1_epi64x((long long)key[k]);
+      for (u32 g = 0; g < ng; g++)
+        cnt[g] = _mm256_sub_epi64(cnt[g], _mm256_cmpgt_epi64(_mm256_load_si256((const __m256i*)(key + 4 * g)), vk));
+    }
+    for (u32 g = 0; g < ng; g++) _mm256_store_si256((__m256i*)(key + 4 * g), cnt[g]);  // (the keys are done with)
     for (u32 i = 0; i < n; i++) {
-      const __m256i vi = _mm256_set1_epi32((int)tin[i]);
-      __m256i before = _mm256_cmpgt_epi32(_mm256_set1_epi32((int)i), iota);  // lanes of entries earlier than i
-      u32 r = 0;
-      for (u32 v = 0; v < nv; v++) {
-        const __m256i tj = _mm256_loadu_si256((const __m256i*)(tin + 8 * v));
-        const __m256i ge = _mm256_cmpeq_epi32(_mm256_max_epu32(tj, vi), tj);  // tj >= ti (and the padding)
-        const __m256i eqb = _mm256_and_si256(_mm256_cmpeq_epi32(tj, vi), before);
-        r += 8 - (u32)__builtin_popcount((u32)_mm256_movemask_ps(_mm256_castsi256_ps(ge))) +
-             (u32)__builtin_popcount((u32)_mm256_movemask_ps(_mm256_castsi256_ps(eqb)));
-        before = _mm256_cmpgt_epi32(_mm256_set1_epi32((int)i - 8 * (int)(v + 1)), iota);
-      }
-      sts[r] = tin[i];
+      const u32 r = (u32)key[i];
+      sts[r] = ts[i];
       scamp[r] = camp[i];
       sclick[r] = click[i];
     }
   } else {
-    // LSD radix sort of (ts, index), 8 bits a pass
+    // LSD radix sort of (ts, index), 8 bits a pass; the counts of all four passes are taken in one go
     if (tmp.size() < 2 * (size_t)n) tmp.resize(2 * (size_t)n);
     u64* a = tmp.data();
     u64* b = a + n;
-    for (u32 i = 0; i < n; i++) a[i] = ((u64)ts[i] << 32) | i;
+    u32 cnt[4][256];
+    memset(cnt, 0, sizeof cnt);
+    for (u32 i = 0; i < n; i++) {
+      const u32 t = ts[i];
+      a[i] = ((u64)t << 32) | i;
+      cnt[0][t & 255]++;
+      cnt[1][(t >> 8) & 255]++;
+      cnt[2][(t >> 16) & 255]++;
+      cnt[3][t >> 24]++;
+    }
     for (int pass = 0; pass < 4; pass++) {
-      const int sh = 32 + 8 * pass;
-      u32 cnt[256] = {0};
-      for (u32 i = 0; i < n; i++) cnt[(a[i] >> sh) & 255]++;
+      u32* const c = cnt[pass];
       u32 sum = 0;
       for (int k = 0; k < 256; k++) {
-        const u32 c = cnt[k];
-        cnt[k] = sum;
-        sum += c;
+        const u32 x = c[k];
+        c[k] = sum;
+        sum += x;
       }
-      for (u32 i = 0; i < n; i++) b[cnt[(a[i] >> sh) & 255]++] = a[i];
+      const int sh = 32 + 8 * pass;
+      for (u32 i = 0; i < n; i++) b[c[(a[i] >> sh) & 255]++] = a[i];
       std::swap(a, b);
     }
     for (u32 i = 0; i < n; i++) {
@@ -3016,6 +3029,10 @@ static int selftest() {
     g_camp_by_num.assign(5000, -1);
     for (u32 i = 0; i < 5000; i += 3) g_camp_by_num[i] = (i32)(i * 7 + 1);
     u8 t[40];
+    alignas(32) u64 q4raw[4];
+    alignas(16) u32 q4ln[4];
+    bool q4pre[4];
+    u8 q4s[4][40];
     for (long it = 0; it < 4000000; it++) {
       for (int k = 0; k < 40; k++) t[k] = (u8)("0123456789,\"c_ /:9a"[next() % 19]);
       const u32 nd = 1 + (u32)(next() % 8);
@@ -3048,6 +3065,32 @@ static int selftest() {
       if (camp_fast(t, (u32)len) != camp_of(t, (u32)len)) {
         if (bad3 < 10) fprintf(stderr, "CAMPAIGN MISMATCH '%.*s'\n", len, c);
         bad3++;
+      }
+      // the same through the four-lane decoder of the dense click parse and its table rule
+      {
+        const u32 j = (u32)(it & 3);
+        memcpy(&q4raw[j], t + 2, 8);
+        q4ln[j] = (u32)len;
+        q4pre[j] = t[0] == 'c' && t[1] == '_';
+        memcpy(q4s[j], t, sizeof t);
+        if (j == 3) {
+          __m256i val;
+          const u32 bad = dn::dec10x4(q4raw, q4ln, val);
+          alignas(32) u64 vv[4];
+          _mm256_store_si256((__m256i*)vv, val);
+          for (u32 k = 0; k < 4; k++) {
+            i32 got;
+            if (((bad >> k) & 1) || !q4pre[k])
+              got = camp_of(q4s[k], q4ln[k]);
+            else
+              got = vv[k] < g_camp_by_num.size() ? g_camp_by_num[vv[k]] : -1;
+            n3++;
+            if (got != camp_of(q4s[k], q4ln[k])) {
+              if (bad3 < 10) fprintf(stderr, "CAMPAIGN x4 MISMATCH '%.*s'\n", (int)q4ln[k], (const char*)q4s[k]);
+              bad3++;
+            }
+          }
+        }
       }
     }
     g_camp_by_num = saved_num;
@@ -3167,6 +3210,7 @@ int main(int argc, char** argv) {
     if (dn::g_on && !dn::recover_event_key(samp)) dn::fail("no key for the event ids");
     if (dn::g_on && (u64)(g_we - g_ws) > 0x7FFFFFF0ULL) dn::fail("window too long");
     if (dn::g_on && g_cats.size() > 255) dn::fail("too many categories");
+    if (dn::g_on && g_ndays > 16) dn::fail("more than 16 days in the window");
     if (dn::g_on) {
       dn::g_ing_base = g_ws - 30 * DAY;
       dn::init_daycode();
