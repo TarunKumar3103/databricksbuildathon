@@ -126,18 +126,22 @@ static void* vm_alloc(size_t bytes) {
   return p;
 }
 
-static constexpr size_t BLOCK_BYTES = 16384;
+// Records are kept in blocks of one page. Every thread has an open block per partition, on average half
+// full at the end, and all of that memory has to be zeroed by the kernel first: small blocks keep it small.
+static constexpr size_t BLOCK_BYTES = 4096;
 
 struct Arena {
   u8* cur = nullptr;
   u8* end = nullptr;
   std::vector<void*> free_blocks;  // recycled BLOCK_BYTES blocks
+  std::vector<std::pair<void*, size_t>> slabs;
   void* alloc(size_t n) {
     n = (n + 63) & ~(size_t)63;
     if ((size_t)(end - cur) < n) {
       size_t sz = std::max(n, (size_t)256 << 20);
       cur = (u8*)vm_alloc(sz);
       end = cur + sz;
+      slabs.push_back({cur, sz});
     }
     void* p = cur;
     cur += n;
@@ -172,6 +176,14 @@ struct Stream {
   inline T* reserve(u32 k, Arena& a) {
     if (__builtin_expect((size_t)(lim - cur) < k, 0)) grow(a);
     return cur;
+  }
+  // n items that need not fit a normal block: they get a block of their own, already counted as full.
+  T* big(size_t n, Arena& a) {
+    if (beg) blocks.push_back({beg, (u32)(cur - beg)});
+    T* p = (T*)a.alloc(n * sizeof(T));
+    blocks.push_back({p, (u32)n});
+    beg = cur = lim = nullptr;
+    return p;
   }
   void grow(Arena& a) {
     if (beg) blocks.push_back({beg, (u32)(cur - beg)});
@@ -717,8 +729,10 @@ static void init_fast_years(i64 lo_ms, i64 hi_ms) {
 }
 
 // Two F1 timestamps at once. True iff both are valid F1 in a candidate year; then ta / tb are their values.
-// Needs 20 readable bytes at a and at b.
-static FORCE_INLINE bool f1_pair(const u8* a, const u8* b, i64& ta, i64& tb) {
+// Needs 20 readable bytes at a and at b. OKM: the positions (bytes 4..19 of a, then of b) that are checked;
+// leaving out bit 15 accepts any byte in place of a's 'Z'.
+template <u32 OKM>
+static FORCE_INLINE bool f1_pair_m(const u8* a, const u8* b, i64& ta, i64& tb) {
   // bytes 4..19 of both: "-MM-DDTHH:MM:SSZ"
   const __m256i v = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128((const __m128i*)(a + 4))),
                                             _mm_loadu_si128((const __m128i*)(b + 4)), 1);
@@ -736,7 +750,7 @@ static FORCE_INLINE bool f1_pair(const u8* a, const u8* b, i64& ta, i64& tb) {
                           0, 0, 0, 0));  // month, day, hour, minute, second
   // upper bounds (they also keep month * 32 + day inside the table); month 0 / day 0 are not in the table
   const __m256i bad = _mm256_cmpgt_epi16(p, _mm256_setr_epi16(12, 31, 23, 59, 59, 0, 0, 0, 12, 31, 23, 59, 59, 0, 0, 0));
-  if ((okm != 0xFFFFFFFFu) | !_mm256_testz_si256(bad, bad)) return false;
+  if (((okm & OKM) != OKM) | !_mm256_testz_si256(bad, bad)) return false;
   const __m256i q = _mm256_madd_epi16(p, _mm256_setr_epi16(32, 1, 60, 1, 1, 0, 0, 0, 32, 1, 60, 1, 1, 0, 0, 0));
   alignas(32) u32 Lbuf[8];  // month * 32 + day, hour * 60 + minute, second, 0
   _mm256_store_si256((__m256i*)Lbuf, q);
@@ -754,8 +768,13 @@ static FORCE_INLINE bool f1_pair(const u8* a, const u8* b, i64& ta, i64& tb) {
   return true;
 }
 
-// One F1 timestamp. Needs 20 readable bytes at a.
-static FORCE_INLINE bool f1_one(const u8* a, i64& ta) {
+static FORCE_INLINE bool f1_pair(const u8* a, const u8* b, i64& ta, i64& tb) {
+  return f1_pair_m<0xFFFFFFFFu>(a, b, ta, tb);
+}
+
+// One F1 timestamp. Needs 20 readable bytes at a. OKM as above (16 bits).
+template <u32 OKM>
+static FORCE_INLINE bool f1_one_m(const u8* a, i64& ta) {
   const __m128i v = _mm_loadu_si128((const __m128i*)(a + 4));
   const __m128i d = _mm_sub_epi8(v, _mm_set1_epi8('0'));
   const __m128i isdig = _mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d);
@@ -765,7 +784,7 @@ static FORCE_INLINE bool f1_one(const u8* a, i64& ta) {
   const __m128i g = _mm_shuffle_epi8(d, _mm_setr_epi8(1, 2, 4, 5, 7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1));
   const __m128i p = _mm_maddubs_epi16(g, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0));
   const __m128i bad = _mm_cmpgt_epi16(p, _mm_setr_epi16(12, 31, 23, 59, 59, 0, 0, 0));
-  if ((okm != 0xFFFFu) | !_mm_testz_si128(bad, bad)) return false;
+  if (((okm & OKM) != OKM) | !_mm_testz_si128(bad, bad)) return false;
   const __m128i q = _mm_madd_epi16(p, _mm_setr_epi16(32, 1, 60, 1, 1, 0, 0, 0));
   alignas(16) u32 Lbuf[4];
   _mm_store_si128((__m128i*)Lbuf, q);
@@ -778,6 +797,42 @@ static FORCE_INLINE bool f1_one(const u8* a, i64& ta) {
   const i64 da = g_dayms[ka][L[0]];
   if (da == DAYMS_NONE) return false;
   ta = da + (i64)(L[1] * 60 + L[2]) * 1000;
+  return true;
+}
+static FORCE_INLINE bool f1_one(const u8* a, i64& ta) { return f1_one_m<0xFFFFu>(a, ta); }
+
+// The UTC offset of a 25-byte timestamp "YYYY-MM-DDTHH:MM:SS+HH:MM" at a (bytes 19..24: a sign, then HH:MM
+// with HH <= 23 and MM <= 59), as the milliseconds to add to its civil time: negative for '+'. False if
+// those six bytes are anything else.
+static FORCE_INLINE bool f3_offset(const u8* a, i64& add_ms) {
+  u64 x;
+  memcpy(&x, a + 17, 8);  // S S sign H H : M M
+  const u32 sg = (u32)(x >> 16) & 0xFF;
+  const u64 t = (x >> 24) ^ 0x30303A3030ULL;  // the digits as values, the colon as 0
+  // a digit byte is fine iff it is <= 9, the colon byte iff it is 0: adding 0x76 / 0x7F sets the top bit of
+  // any other value below 0x80, and a value from 0x80 has its top bit set to begin with
+  const u64 bad = ((t + 0x76767F7676ULL) | t) & 0x8080808080ULL;
+  const u64 u = t * 0x0A01;  // byte 1: HH, byte 4: MM
+  const u32 oh = (u32)(u >> 8) & 0xFF, om = (u32)(u >> 32) & 0xFF;
+  if ((bad != 0) | (((sg - 0x2B) & ~2u) != 0) | (oh > 23) | (om > 59)) return false;  // sign: '+' 0x2B or '-' 0x2D
+  add_ms = (i64)((i32)sg - 0x2C) * (i64)((oh * 60 + om) * 60000u);
+  return true;
+}
+
+// A 25-byte timestamp with a UTC offset (a) and an F1 timestamp (b) at once: true iff both are valid and
+// their civil years are candidate years. Needs 25 readable bytes at a and 20 at b.
+static FORCE_INLINE bool f3f1_pair(const u8* a, const u8* b, i64& ta, i64& tb) {
+  i64 add;
+  if (!f3_offset(a, add) || !f1_pair_m<0xFFFF7FFFu>(a, b, ta, tb)) return false;
+  ta += add;
+  return true;
+}
+
+// One 25-byte timestamp with a UTC offset. Needs 25 readable bytes at a.
+static FORCE_INLINE bool f3_one(const u8* a, i64& ta) {
+  i64 add;
+  if (!f3_offset(a, add) || !f1_one_m<0x7FFFu>(a, ta)) return false;
+  ta += add;
   return true;
 }
 
@@ -1068,16 +1123,23 @@ struct CStat {
   i64 rev;
 };
 
-struct ORow {
-  u64 key;
-  i64 rev;
-  i32 day;
-  u32 sess, evs;
-  u16 top;
-  u16 pad;
-};
-struct OutRows {
-  std::vector<ORow> rows;
+// The columns of user_daily, appended row by row in the form they have in the file (Parquet PLAIN), in
+// blocks that are handed to the writer as they are.
+struct OutCols {
+  Stream<u8> ids;  // user_id: 4-byte length, then the bytes
+  Stream<i32> day;
+  Stream<u32> sess, evs;
+  Stream<i64> rev;
+  Stream<u8> top;  // category, 0xFF: none
+  u64 nrows = 0;
+  void finish() {
+    ids.finish();
+    day.finish();
+    sess.finish();
+    evs.finish();
+    rev.finish();
+    top.finish();
+  }
 };
 
 struct TL {
@@ -1085,7 +1147,7 @@ struct TL {
   WCScatter<R1> r1;
   WCScatter<R2> r2;
   WCScatter<R2C> r2c;
-  OutRows out;
+  OutCols out;
   std::vector<CStat> c_stat;   // ndays x (ncamp + 1): credited sessions, purchasing sessions, revenue
   std::vector<u32> c_assist;   // ndays x (ncamp + 1)
   u64 n_event_lines = 0, n_click_lines = 0;
@@ -1553,7 +1615,17 @@ static NOINLINE void process_events(EvBatch& B, const u32 n, const u8* const bas
       ts_exact(B, i, base);
     }
   }
-  for (u32 j = 0; j < cnt[2]; j++) ts_exact(B, B.idx[2][j], base);
+  for (u32 j = 0; j < cnt[2]; j++) {  // ts with a UTC offset
+    const u32 i = B.idx[2][j];
+    const u32* off = B.off[i];
+    i64 ta, tb;
+    if (__builtin_expect(B.len[i][3] == 20 && f3f1_pair(base + off[2], base + off[3], ta, tb), 1)) {
+      B.ts[i] = ta;
+      B.ing[i] = tb;
+    } else {
+      ts_exact(B, i, base);
+    }
+  }
   for (u32 j = 0; j < cnt[3]; j++) ts_exact(B, B.idx[3][j], base);
   // ---- validation, records, scatter
   auto cur = cur_out;
@@ -1662,7 +1734,14 @@ static NOINLINE void process_clicks(CkBatch& B, const u32 n, const u8* const bas
     else
       ck_ts_exact(B, i, base);
   }
-  for (u32 j = 0; j < cnt[2]; j++) ck_ts_exact(B, B.idx[2][j], base);
+  for (u32 j = 0; j < cnt[2]; j++) {  // with a UTC offset
+    const u32 i = B.idx[2][j];
+    i64 t;
+    if (__builtin_expect(f3_one(base + B.off[i][3], t), 1))
+      B.ts[i] = t;
+    else
+      ck_ts_exact(B, i, base);
+  }
   for (u32 j = 0; j < cnt[3]; j++) ck_ts_exact(B, B.idx[3][j], base);
   // ---- keys and campaign; every line is handed to the router, which keeps the valid ones
   const u64 wlen = (u64)(we - cws);
@@ -1809,28 +1888,31 @@ static void dedup_and_route() {
       WCScatter<R2>::push16(c, (u32)(ph >> p2shift), _mm_set_epi64x((long long)tp, (long long)ph));
     };
     Router<u64, R2, decltype(emit)> router(cur, emit);
-    auto route = [&](const R1& r) __attribute__((always_inline)) {
+    // Hands a record to the router, which keeps it only if `keep` is 1 (no branch on the data).
+    auto route_if = [&](const R1& r, u32 keep) __attribute__((always_inline)) {
       u64 tp;
       memcpy(&tp, &r.ts, 8);
-      router.add(r.uid, tp);
+      router.add_if(r.uid, tp, keep);
     };
     if (nids == 0) {
       // ---- every ID is unique
       for (int t = 0; t < NT; t++)
         for (auto& b : g_tl[t].r1.blocks[p]) {
           const R1* rec = b.first;
-          for (u32 j = 0; j < b.second; j++)
-            if (rec[j].ts != TS_INVALID) route(rec[j]);
+          for (u32 j = 0; j < b.second; j++) route_if(rec[j], rec[j].ts != TS_INVALID);
         }
     } else {
-      // ---- exact table of the candidate IDs (and a bit map of them, to skip the table for most records)
+      // ---- exact table of the candidate IDs (and a bit map of them, to skip the table for most records).
+      // Every slot starts with NONE as its best copy: later than any real ingest_ts and not a valid event,
+      // so neither the comparisons nor the final sweep need to ask whether a slot is in use.
+      static const R1 NONE = {0, INT64_MAX, 0, TS_INVALID, 0};
       u64* cand = S.cand.data();
       memset(cand, 0, words * 8);
       const u32 tbits = ceil_log2(nids * 2 + 8);
       const size_t tsz = (size_t)1 << tbits;
       if (S.tab.size() < tsz) S.tab.resize(tsz);
       DSlot* tab = S.tab.data();
-      memset(tab, 0, tsz * sizeof(DSlot));
+      for (size_t q = 0; q < tsz; q++) tab[q] = DSlot{0, &NONE};
       const u64 tmask = tsz - 1;
       const u32 tshift = 64 - tbits;
       for (size_t k = 0; k < nids; k++) {
@@ -1841,26 +1923,33 @@ static void dedup_and_route() {
         while (tab[q].eid != e && tab[q].eid != 0) q = (q + 1) & tmask;
         tab[q].eid = e;  // eid is a bijective hash of a non-empty key; 0 would need key 0, which no ID has
       }
+      const R1* cl[WCScatter<R1>::BLK];  // the records of a block whose ID may be in the table
       for (int t = 0; t < NT; t++)
         for (auto& b : g_tl[t].r1.blocks[p]) {
           const R1* rec = b.first;
+          u32 nc = 0;
           for (u32 j = 0; j < b.second; j++) {
             const R1& r = rec[j];
+            const u64 i = (r.eid << P1bits) >> ishift;
+            const u32 c = (u32)(cand[i >> 6] >> (i & 63)) & 1;
+            cl[nc] = &r;
+            nc += c;
+            route_if(r, (u32)(r.ts != TS_INVALID) & (c ^ 1));  // the only copy of its event
+          }
+          for (u32 k = 0; k < nc; k++) {
+            const R1& r = *cl[k];
             const u64 e = r.eid;
-            const u64 i = (e << P1bits) >> ishift;
-            if (__builtin_expect((cand[i >> 6] >> (i & 63)) & 1, 0)) {
-              u64 q = (e << P1bits) >> tshift;
-              while (tab[q].eid != e && tab[q].eid != 0) q = (q + 1) & tmask;
-              if (tab[q].eid == e) {
-                if (tab[q].best == nullptr || r.ingest < tab[q].best->ingest) tab[q].best = &r;
-                continue;
-              }
+            u64 q = (e << P1bits) >> tshift;
+            while (tab[q].eid != e && tab[q].eid != 0) q = (q + 1) & tmask;
+            if (__builtin_expect(tab[q].eid == e, 1)) {
+              const R1* best = tab[q].best;  // the first copy with the smallest ingest_ts stays
+              tab[q].best = r.ingest < best->ingest ? &r : best;
+            } else {
+              route_if(r, r.ts != TS_INVALID);  // the bit map was wrong about it
             }
-            if (r.ts != TS_INVALID) route(r);
           }
         }
-      for (size_t q = 0; q < tsz; q++)
-        if (tab[q].best != nullptr && tab[q].best->ts != TS_INVALID) route(*tab[q].best);
+      for (size_t q = 0; q < tsz; q++) route_if(*tab[q].best, tab[q].best->ts != TS_INVALID);
     }
     router.run();
     tl.r2.close(cur);
@@ -1890,54 +1979,82 @@ struct XRec {
   u32 pad;
 };
 
-struct CRec {
-  u32 ts;
-  u32 camp;
-  u64 click;
-};
-
 static inline bool click_less(u64 a, u64 b) {  // byte-wise order of click ids
   if (!is_slow(a) && !is_slow(b)) return a < b;
   return key_cmp(a, b) < 0;
 }
 
-static void sort_clicks(CRec* a, size_t n, std::vector<CRec>& tmp) {
-  if (n < 2) return;
-  if (n > 12 && n <= 1024) {
-    std::sort(a, a + n, [](const CRec& x, const CRec& y) { return x.ts < y.ts; });
-    return;
+// Number of entries <= x in nv vectors of timestamps (padding entries are 0xFFFFFFFF; x is below that).
+static FORCE_INLINE u32 count_le(const u32* ts, u32 nv, u32 x) {
+  const __m256i vx = _mm256_set1_epi32((int)x);
+  u32 c = 0;
+  for (u32 v = 0; v < nv; v++) {
+    const __m256i t = _mm256_loadu_si256((const __m256i*)(ts + 8 * v));
+    c += (u32)__builtin_popcount(
+        (u32)_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(_mm256_max_epu32(t, vx), vx))));
   }
-  if (n <= 12) {
-    for (size_t i = 1; i < n; i++) {
-      CRec x = a[i];
-      size_t j = i;
-      while (j > 0 && a[j - 1].ts > x.ts) {
-        a[j] = a[j - 1];
-        j--;
+  return c;
+}
+
+// One person's clicks (n > 0: ts / camp / click, in any order) into time order: sts / scamp / sclick, with
+// 0xFFFFFFFF in sts[n .. n + 8). Equal timestamps keep their order. tin is scratch for n + 16 entries; at
+// least 7 entries after ts[n - 1] must be readable.
+//
+// Up to RANK_MAX clicks, the rank of each one is counted with vector compares against all of them: no
+// data-dependent branch, and most persons have only a few clicks. Beyond that, a radix sort.
+static constexpr u32 RANK_MAX = 64;
+static NOINLINE void sort_person_clicks(const u32* ts, const u32* camp, const u64* click, const u32 n, u32* tin,
+                                        u32* sts, u32* scamp, u64* sclick, std::vector<u64>& tmp) {
+  const __m256i ones = _mm256_set1_epi32(-1);
+  if (n <= RANK_MAX) {
+    const u32 nv = (n + 7) / 8;
+    for (u32 v = 0; v < nv; v++)
+      _mm256_storeu_si256((__m256i*)(tin + 8 * v), _mm256_loadu_si256((const __m256i*)(ts + 8 * v)));
+    _mm256_storeu_si256((__m256i*)(tin + n), ones);
+    const __m256i iota = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    for (u32 i = 0; i < n; i++) {
+      const __m256i vi = _mm256_set1_epi32((int)tin[i]);
+      __m256i before = _mm256_cmpgt_epi32(_mm256_set1_epi32((int)i), iota);  // lanes of entries earlier than i
+      u32 r = 0;
+      for (u32 v = 0; v < nv; v++) {
+        const __m256i tj = _mm256_loadu_si256((const __m256i*)(tin + 8 * v));
+        const __m256i ge = _mm256_cmpeq_epi32(_mm256_max_epu32(tj, vi), tj);  // tj >= ti (and the padding)
+        const __m256i eqb = _mm256_and_si256(_mm256_cmpeq_epi32(tj, vi), before);
+        r += 8 - (u32)__builtin_popcount((u32)_mm256_movemask_ps(_mm256_castsi256_ps(ge))) +
+             (u32)__builtin_popcount((u32)_mm256_movemask_ps(_mm256_castsi256_ps(eqb)));
+        before = _mm256_cmpgt_epi32(_mm256_set1_epi32((int)i - 8 * (int)(v + 1)), iota);
       }
-      a[j] = x;
+      sts[r] = tin[i];
+      scamp[r] = camp[i];
+      sclick[r] = click[i];
     }
-    return;
-  }
-  // LSD radix sort on ts (11 + 11 + 10 bits)
-  if (tmp.size() < n) tmp.resize(n);
-  CRec* src = a;
-  CRec* dst = tmp.data();
-  const int shifts[3] = {0, 11, 22};
-  for (int pass = 0; pass < 3; pass++) {
-    u32 cnt[2048] = {0};
-    int sh = shifts[pass];
-    for (size_t i = 0; i < n; i++) cnt[(src[i].ts >> sh) & 2047]++;
-    u32 sum = 0;
-    for (int b = 0; b < 2048; b++) {
-      u32 c = cnt[b];
-      cnt[b] = sum;
-      sum += c;
+  } else {
+    // LSD radix sort of (ts, index), 8 bits a pass
+    if (tmp.size() < 2 * (size_t)n) tmp.resize(2 * (size_t)n);
+    u64* a = tmp.data();
+    u64* b = a + n;
+    for (u32 i = 0; i < n; i++) a[i] = ((u64)ts[i] << 32) | i;
+    for (int pass = 0; pass < 4; pass++) {
+      const int sh = 32 + 8 * pass;
+      u32 cnt[256] = {0};
+      for (u32 i = 0; i < n; i++) cnt[(a[i] >> sh) & 255]++;
+      u32 sum = 0;
+      for (int k = 0; k < 256; k++) {
+        const u32 c = cnt[k];
+        cnt[k] = sum;
+        sum += c;
+      }
+      for (u32 i = 0; i < n; i++) b[cnt[(a[i] >> sh) & 255]++] = a[i];
+      std::swap(a, b);
     }
-    for (size_t i = 0; i < n; i++) dst[cnt[(src[i].ts >> sh) & 2047]++] = src[i];
-    std::swap(src, dst);
+    for (u32 i = 0; i < n; i++) {
+      const u32 idx = (u32)a[i];
+      sts[i] = (u32)(a[i] >> 32);
+      scamp[i] = camp[idx];
+      sclick[i] = click[idx];
+    }
   }
-  if (src != a) memcpy(a, src, n * sizeof(CRec));
+  _mm256_storeu_si256((__m256i*)(sts + n), ones);
 }
 
 static void person_phase() {
@@ -1978,9 +2095,14 @@ static void person_phase() {
     std::vector<u32> cntL, posL, cntC, offC;
     std::vector<XRec> X;
     std::vector<u64> E;
-    std::vector<CRec> C, Ctmp;
+    std::vector<u32> Cts, Ccamp;  // clicks grouped by person, in any order
+    std::vector<u64> Cclick;
+    std::vector<u32> tin, sts, scamp;  // one person's clicks in time order
+    std::vector<u64> sclick, rtmp;
     std::vector<u32> lidC;
-    std::vector<u32> ccnt, cpos, active;
+    std::vector<u32> cov;     // per campaign: the person's sessions below this index are already counted for it
+    std::vector<u32> sstart;  // start of each session of the person (padded like the click times)
+    std::vector<u32> dstart;  // first session of each of the person's days
     std::vector<BAgg> agg;
     std::vector<u64> bitmap;
     std::vector<u16> bday;
@@ -1998,9 +2120,10 @@ static void person_phase() {
     if (n_e == 0) return;
     Scratch& S = scr[tid];
     TL& tl = g_tl[tid];
-    if (S.ccnt.size() < NC + 1) {
-      S.ccnt.assign(NC + 1, 0);
-      S.cpos.assign(NC + 1, 0);
+    if (S.cov.size() < NC + 1) {
+      S.cov.assign(NC + 1, 0);
+      S.sstart.assign((size_t)NB + 16, 0);
+      S.dstart.assign((size_t)ND + 2, 0);
       S.agg.assign(NB, BAgg{0xFFFFFFFFu, 0, 0, 0, 0});
       S.bitmap.assign(NW, 0);
       S.bday.assign(NB, 0);
@@ -2105,28 +2228,42 @@ static void person_phase() {
     }
     S.offC.resize(np + 2);
     {
-      u32 sum = 0;
+      u32 sum = 0, mcmax = 0;
       for (u32 l = 0; l <= np; l++) {
         S.offC[l] = sum;
         sum += S.cntC[l];
+        if (l < np) mcmax = std::max(mcmax, S.cntC[l]);
       }
       S.offC[np + 1] = sum;
-      S.C.resize(sum);
+      if (S.Cts.size() < (size_t)sum + 16) {
+        S.Cts.resize((size_t)sum + 16);
+        S.Ccamp.resize((size_t)sum + 16);
+        S.Cclick.resize((size_t)sum + 16);
+      }
+      if (S.sts.size() < (size_t)mcmax + 16) {
+        S.tin.resize((size_t)mcmax + 16);
+        S.sts.resize((size_t)mcmax + 16);
+        S.scamp.resize((size_t)mcmax + 16);
+        S.sclick.resize((size_t)mcmax + 16);
+      }
       u32* pos = S.cntC.data();
       for (u32 l = 0; l <= np; l++) pos[l] = S.offC[l];
+      u32* Cts = S.Cts.data();
+      u32* Ccamp = S.Ccamp.data();
+      u64* Cclick = S.Cclick.data();
       size_t kk = 0;
       for (int t = 0; t < NT; t++)
         for (auto& b : g_tl[t].r2c.blocks[p]) {
           const R2C* r = b.first;
           for (u32 j = 0; j < b.second; j++) {
-            u32 lid = S.lidC[kk++];
-            S.C[pos[lid]++] = CRec{r[j].ts, r[j].camp, r[j].click};
+            const u32 q = pos[S.lidC[kk++]]++;
+            Cts[q] = r[j].ts;
+            Ccamp[q] = r[j].camp;
+            Cclick[q] = r[j].click;
           }
         }
     }
     // ---- per person
-    u32* ccnt = S.ccnt.data();
-    u32* cpos = S.cpos.data();
     CStat* c_stat = tl.c_stat.data();  // both indexed [day][campaign]
     u32* c_assist = tl.c_assist.data();
     const size_t NC1 = (size_t)NC + 1;
@@ -2137,17 +2274,27 @@ static void person_phase() {
     u32* dev = S.dev.data();
     i64* drev = S.drev.data();
     i64* catsum = S.catsum.data();
-    OutRows& out = tl.out;
+    u32* cov = S.cov.data();
+    u32* sstart = S.sstart.data();
+    u32* dstart = S.dstart.data();
+    const u32* const sts = S.sts.data();
+    const u32* const scamp = S.scamp.data();
+    const u64* const sclick = S.sclick.data();
+    OutCols& out = tl.out;
     const u32* posL = S.posL.data();
     const u64* Eall = S.E.data();
     for (u32 lid = 0; lid < np; lid++) {
       const u32 eend = posL[lid], ebeg = eend - S.cntL[lid];
-      CRec* C = S.C.data() + S.offC[lid];
-      const size_t mc = S.offC[lid + 1] - S.offC[lid];
-      sort_clicks(C, mc, S.Ctmp);
-      // bucket aggregates
+      // this person's clicks, in time order
+      const u32 c0 = S.offC[lid], mc = S.offC[lid + 1] - c0;
+      if (mc)
+        sort_person_clicks(S.Cts.data() + c0, S.Ccamp.data() + c0, S.Cclick.data() + c0, mc, S.tin.data(), S.sts.data(),
+                           S.scamp.data(), S.sclick.data(), S.rtmp);
+      const u32 nv = (mc + 7) / 8;
+      // bucket aggregates; `summary` has a bit for every word of the bit map that is in use
       S.purch.clear();
-      u32 wlo = NW, whi = 0;
+      u64 summary = 0;
+      u32 ncell = 0;
       for (u32 i = ebeg; i < eend; i++) {
         const u64 e = Eall[i];
         const u32 ts = (u32)(e >> 32), pl = (u32)e;
@@ -2156,73 +2303,69 @@ static void person_phase() {
         // so the first event of a bucket needs no special case
         BAgg& a = agg[b];
         bitmap[b >> 6] |= 1ULL << (b & 63);
+        summary |= 1ULL << (b >> 6);
+        ncell += a.cnt == 0;
         a.mn = ts < a.mn ? ts : a.mn;
         a.mx = ts > a.mx ? ts : a.mx;
         a.cnt++;
-        wlo = std::min(wlo, b >> 6);
-        whi = std::max(whi, b >> 6);
         if (pl) {
           a.rev += pl & 0xFFFFFF;
           S.purch.push_back(Purch{b, pl >> 24, pl & 0xFFFFFF});
         }
       }
       // sessions over the buckets in time order
-      size_t lo = 0, hi = 0;
+      u32 ns = 0;  // sessions of this person so far
+      u32 hi = 0;  // (for a long click list: the clicks up to the current session start)
       bool open = false;
       u32 s_start = 0, s_max = 0, s_nev = 0, s_day = 0;
       i64 s_rev = 0;
       S.days.clear();
       auto close_session = [&]() {
-        const u64 upper = (u64)s_start + (u64)WEEK;
-        while (hi < mc && (u64)C[hi].ts <= upper) {
-          u32 c = C[hi].camp;
-          if (ccnt[c]++ == 0) {
-            cpos[c] = (u32)S.active.size();
-            S.active.push_back(c);
-          }
-          hi++;
-        }
-        while (lo < hi && C[lo].ts < s_start) {
-          u32 c = C[lo].camp;
-          if (--ccnt[c] == 0) {
-            u32 ps = cpos[c];
-            u32 last = S.active.back();
-            S.active[ps] = last;
-            cpos[last] = ps;
-            S.active.pop_back();
-          }
-          lo++;
-        }
+        // credit: the latest click in the 7 days up to the session start, the smallest click_id among equal
+        // times (click times count from 7 days before the window, session times from the window start)
         u32 credit = ORG;
-        if (hi > lo) {
-          size_t bi = hi - 1;
-          u32 tsmax = C[bi].ts;
-          for (size_t q = bi; q > lo && C[q - 1].ts == tsmax;) {
-            q--;
-            if (click_less(C[q].click, C[bi].click)) bi = q;
+        if (mc) {
+          const u32 upper = s_start + (u32)WEEK;
+          if (mc <= 32)
+            hi = count_le(sts, nv, upper);
+          else
+            while (hi < mc && sts[hi] <= upper) hi++;
+          if (hi > 0 && sts[hi - 1] >= s_start) {
+            u32 bi = hi - 1;
+            const u32 tsmax = sts[bi];
+            for (u32 q = bi; q > 0 && sts[q - 1] == tsmax;) {
+              q--;
+              if (click_less(sclick[q], sclick[bi])) bi = q;
+            }
+            credit = scamp[bi];
           }
-          credit = C[bi].camp;
         }
         CStat& cs = c_stat[(size_t)s_day * NC1 + credit];
         cs.sess++;
         cs.purch += (s_rev > 0);
         cs.rev += s_rev;
-        {
-          u32* row = c_assist + (size_t)s_day * NC1;  // one day's row: 4 bytes per campaign
-          const u32* act = S.active.data();
-          const size_t na = S.active.size();
-          for (size_t k = 0; k < na; k++) row[act[k]]++;
+        if (dsess[s_day]++ == 0) {  // the person's next day: its sessions start here
+          dstart[S.days.size()] = ns;
+          S.days.push_back(s_day);
         }
-        if (dsess[s_day]++ == 0) S.days.push_back(s_day);
+        sstart[ns++] = s_start;
         dev[s_day] += s_nev;
         drev[s_day] += s_rev;
       };
-      for (u32 wi = wlo; wi <= whi && wi < NW; wi++) {
-        u64 w = bitmap[wi];
-        bitmap[wi] = 0;
-        while (w) {
-          const u32 b = wi * 64 + (u32)__builtin_ctzll(w);
-          w &= w - 1;
+      {
+        u64 w = 0;  // what is left of the current word of the bit map
+        u32 wi = 0;
+        for (u32 k = 0; k < ncell; k++) {
+          // the next bucket in use; moving on to the next word of the bit map without a branch
+          const u64 adv = 0 - (u64)(w == 0);
+          const u32 wnext = (u32)_tzcnt_u64(summary) & 63;
+          wi = (u32)((wi & ~adv) | (wnext & adv));
+          summary = (summary & ~adv) | (_blsr_u64(summary) & adv);
+          const u64 wl = bitmap[wi];
+          bitmap[wi] = 0;
+          w = (w & ~adv) | (wl & adv);
+          const u32 b = wi * 64 + (u32)_tzcnt_u64(w);
+          w = _blsr_u64(w);
           const BAgg a = agg[b];
           if (!open || a.mn - s_max > (u32)MIN30) {
             if (open) close_session();
@@ -2240,16 +2383,67 @@ static void person_phase() {
         }
       }
       if (open) close_session();
-      for (u32 c : S.active) ccnt[c] = 0;
-      S.active.clear();
+      // Assists. A click assists the sessions that start in the 7 days after it: a run [a, b) of the person's
+      // sessions. Going through the clicks in time order, the runs of one campaign only move forward, so the
+      // part of a run that an earlier click of the campaign has not covered is [max(a, cov), b). Its sessions
+      // are counted per day from where each day's sessions start, with the same few steps for every click.
+      if (mc) {
+        const u32 ndays = (u32)S.days.size();
+        dstart[ndays] = ns;
+        _mm256_storeu_si256((__m256i*)(sstart + ns), _mm256_set1_epi32(-1));
+        const u32 nsv = (ns + 7) / 8;
+        u32* rows[64];  // assist counters of the person's days (a window has at most 50 days)
+        for (u32 j = 0; j < ndays; j++) rows[j] = c_assist + (size_t)S.days[j] * NC1;
+        u32 a = 0, b = 0;  // (two pointers for a long session list)
+        for (u32 k = 0; k < mc; k++) {
+          const u32 t = sts[k], c = scamp[k];
+          if (ns <= 32) {
+            b = count_le(sstart, nsv, t);
+            a = t > (u32)WEEK ? count_le(sstart, nsv, t - (u32)WEEK - 1) : 0;
+          } else {
+            while (b < ns && sstart[b] <= t) b++;
+            while (a < b && (u64)sstart[a] + (u64)WEEK < t) a++;
+          }
+          const u32 x = std::max(a, cov[c]);
+          cov[c] = std::max(cov[c], b);
+          for (u32 j = 0; j < ndays; j++) {
+            const i32 n = (i32)std::min(b, dstart[j + 1]) - (i32)std::max(x, dstart[j]);
+            rows[j][c] += (u32)(n > 0 ? n : 0);
+          }
+        }
+        for (u32 k = 0; k < mc; k++) cov[scamp[k]] = 0;
+      }
       // purchases -> category sums per day of their session
       for (const Purch& q : S.purch) catsum[(size_t)bday[q.bucket] * NCAT + q.cat] += q.price;
-      const u64 pkey = unhash_id(S.hs[lid]);
-      const size_t nd = S.days.size();
-      const size_t base = out.rows.size();
-      out.rows.resize(base + nd);
-      ORow* orow = out.rows.data() + base;
-      for (size_t di = 0; di < nd; di++) {
+      // one output row per day with a session
+      u64 pkey = unhash_id(S.hs[lid]);
+      if (g_rep > 1) pkey = (pkey & 0x00FFFFFFFFFFFFFFULL) | (0x75ULL << 56);
+      const u32 nd = (u32)S.days.size();
+      if (__builtin_expect(!is_slow(pkey), 1)) {
+        u8 kb[16];  // the user_id as it stands in the file: length, bytes
+        const u32 klen = fast_key_bytes(pkey, kb + 4);
+        memcpy(kb, &klen, 4);
+        u8* ip = out.ids.reserve(nd * 13 + 16, tl.arena);
+        for (u32 di = 0; di < nd; di++, ip += 4 + klen) memcpy(ip, kb, 16);
+        out.ids.cur = ip;
+      } else {
+        std::string name;
+        key_str(pkey, name);
+        const u32 klen = (u32)name.size();
+        for (u32 di = 0; di < nd; di++) {
+          const bool fits = 4 + (size_t)klen <= Stream<u8>::BLK;
+          u8* ip = fits ? out.ids.reserve(4 + klen, tl.arena) : out.ids.big(4 + (size_t)klen, tl.arena);
+          memcpy(ip, &klen, 4);
+          memcpy(ip + 4, name.data(), klen);
+          if (fits) out.ids.cur = ip + 4 + klen;
+        }
+      }
+      i32* const dayp = out.day.reserve(nd, tl.arena);
+      u32* const sessp = out.sess.reserve(nd, tl.arena);
+      u32* const evsp = out.evs.reserve(nd, tl.arena);
+      i64* const revp = out.rev.reserve(nd, tl.arena);
+      u8* const topp = out.top.reserve(nd, tl.arena);
+      for (u32 di = 0; di < nd; di++) {
         const u32 d = S.days[di];
         u16 top = 0xFFFF;
         if (drev[d] > 0) {
@@ -2266,11 +2460,21 @@ static void person_phase() {
           for (const Purch& q : S.purch)
             if (bday[q.bucket] == d) cs[q.cat] = 0;
         }
-        orow[di] = ORow{pkey, drev[d], (i32)(day0 + d), dsess[d], dev[d], top, 0};
+        dayp[di] = (i32)(day0 + d);
+        sessp[di] = dsess[d];
+        evsp[di] = dev[d];
+        revp[di] = drev[d];
+        topp[di] = (u8)top;  // categories are below 255, so "none" becomes 0xFF
         dsess[d] = 0;
         dev[d] = 0;
         drev[d] = 0;
       }
+      out.day.cur += nd;
+      out.sess.cur += nd;
+      out.evs.cur += nd;
+      out.rev.cur += nd;
+      out.top.cur += nd;
+      out.nrows += nd;
     }
     for (int t = 0; t < NT; t++) {
       g_tl[t].r2.release(p, tl.arena);
@@ -2282,35 +2486,18 @@ static void person_phase() {
 // ------------------------------------------------------------------------------------------
 // output
 
-static inline void put_key(std::vector<u8>& buf, size_t& at, u64 k) {
-  if (is_slow(k)) {
-    std::string s;
-    key_str(k, s);
-    if (buf.size() < at + 4 + s.size()) buf.resize((at + 4 + s.size()) * 2);
-    u32 n = (u32)s.size();
-    memcpy(&buf[at], &n, 4);
-    memcpy(&buf[at + 4], s.data(), n);
-    at += 4 + n;
-    return;
-  }
-  if (buf.size() < at + 16) buf.resize((at + 16) * 2);
-  const u32 n = fast_key_bytes(k, &buf[at + 4]);
-  memcpy(&buf[at], &n, 4);
-  at += 4 + n;
-}
-
 static void write_outputs(const std::string& out) {
   std::string ud = out + "/user_daily", cd = out + "/campaign_daily";
   mkdir(ud.c_str(), 0777);
   mkdir(cd.c_str(), 0777);
   std::atomic<bool> fail{false};
-  size_t total_rows = 0;
-  for (auto& t : g_tl) total_rows += t.out.rows.size();
+  u64 total_rows = 0;
+  for (auto& t : g_tl) total_rows += t.out.nrows;
   parallel_for(NT + 1, [&](int t, int) {
     if (t == NT) {
       // campaign_daily
       const u32 NC = g_ncamp, ND = (u32)g_ndays;
-      size_t sz = (size_t)(NC + 1) * ND;
+      const size_t sz = (size_t)(NC + 1) * ND;
       std::vector<u64> sess(sz, 0), purch(sz, 0), assist(sz, 0);
       std::vector<i64> rev(sz, 0);
       for (auto& tl : g_tl) {
@@ -2335,28 +2522,37 @@ static void write_outputs(const std::string& out) {
       cols[1].is_string = true;
       cols[2].type = pq::T_INT32;
       cols[2].is_date = true;
-      int64_t n = 0;
+      pq::Buf ids, chans;
+      std::vector<i32> days(sz);
+      std::vector<i64> v[4];
+      for (auto& x : v) x.resize(sz);
+      size_t n = 0;
       const std::string org = "organic";
       for (u32 c = 0; c <= NC; c++)
         for (u32 d = 0; d < ND; d++) {
-          size_t i = (size_t)d * (NC + 1) + c;
+          const size_t i = (size_t)d * (NC + 1) + c;
           if (sess[i] == 0 && assist[i] == 0) continue;
           const std::string& id = (c == NC) ? org : g_camp_ids[c];
           const std::string& ch = (c == NC) ? org : g_camp_channel[c];
-          pq::put_str(cols[0].values, id.data(), (u32)id.size());
-          pq::put_str(cols[1].values, ch.data(), (u32)ch.size());
-          pq::put_i32(cols[2].values, (i32)(g_day0 + d));
-          pq::put_i64(cols[3].values, (i64)sess[i]);
-          pq::put_i64(cols[4].values, (i64)purch[i]);
-          pq::put_i64(cols[5].values, rev[i]);
-          pq::put_i64(cols[6].values, (i64)assist[i]);
+          pq::put_str(ids, id.data(), (u32)id.size());
+          pq::put_str(chans, ch.data(), (u32)ch.size());
+          days[n] = (i32)(g_day0 + d);
+          v[0][n] = (i64)sess[i];
+          v[1][n] = (i64)purch[i];
+          v[2][n] = rev[i];
+          v[3][n] = (i64)assist[i];
           n++;
         }
-      if (!pq::write_file(cd + "/part-0.parquet", cols, n)) fail = true;
+      cols[0].body.push_back({ids.data(), ids.size()});
+      cols[1].body.push_back({chans.data(), chans.size()});
+      cols[2].body.push_back({days.data(), n * 4});
+      for (int k = 0; k < 4; k++) cols[3 + k].body.push_back({v[k].data(), n * 8});
+      if (!pq::write_file(cd + "/part-0.parquet", cols, (int64_t)n)) fail = true;
       return;
     }
-    const std::vector<ORow>& o = g_tl[t].out.rows;
-    size_t n = o.size();
+    OutCols& oc = g_tl[t].out;
+    oc.finish();
+    const size_t n = oc.nrows;
     if (n == 0 && !(t == 0 && total_rows == 0)) return;
     std::vector<pq::Column> cols(6);
     cols[0].name = "user_id";
@@ -2378,41 +2574,45 @@ static void write_outputs(const std::string& out) {
     cols[5].use_dict = true;
     for (auto& c : g_cats) pq::put_str(cols[5].dict_values, c.data(), (u32)c.size());
     cols[5].dict_count = (int)g_cats.size();
+    // the plain columns are written straight from their blocks
+    for (auto& b : oc.ids.blocks) cols[0].body.push_back({b.first, b.second});
+    for (auto& b : oc.day.blocks) cols[1].body.push_back({b.first, (size_t)b.second * 4});
+    for (auto& b : oc.sess.blocks) cols[2].body.push_back({b.first, (size_t)b.second * 4});
+    for (auto& b : oc.evs.blocks) cols[3].body.push_back({b.first, (size_t)b.second * 4});
+    for (auto& b : oc.rev.blocks) cols[4].body.push_back({b.first, (size_t)b.second * 8});
+    // top_category: definition levels, then the dictionary indices of the rows that have one
     {
-      std::vector<u8>& b = cols[0].values.d;
-      b.resize(n * 14 + 64);
-      size_t at = 0;
-      for (size_t i = 0; i < n; i++) put_key(b, at, o[i].key);
-      b.resize(at);
-    }
-    cols[1].values.d.resize(n * 4);
-    cols[2].values.d.resize(n * 4);
-    cols[3].values.d.resize(n * 4);
-    cols[4].values.d.resize(n * 8);
-    i32* c1 = (i32*)cols[1].values.d.data();
-    u32* c2 = (u32*)cols[2].values.d.data();
-    u32* c3 = (u32*)cols[3].values.d.data();
-    i64* c4 = (i64*)cols[4].values.d.data();
-    cols[5].defs.resize(n);
-    cols[5].indices.reserve(n / 3 + 16);
-    for (size_t i = 0; i < n; i++) {
-      const ORow& r = o[i];
-      c1[i] = r.day;
-      c2[i] = r.sess;
-      c3[i] = r.evs;
-      c4[i] = r.rev;
-      if (r.top != 0xFFFF) {
-        cols[5].defs[i] = 1;
-        cols[5].indices.push_back(r.top);
-      } else {
-        cols[5].defs[i] = 0;
-        cols[5].num_nulls++;
-      }
+      std::vector<u8> def(n + 8), idx(n + 8);
+      size_t k = 0, m = 0;
+      for (auto& b : oc.top.blocks)
+        for (u32 j = 0; j < b.second; j++) {
+          const u8 c = b.first[j];
+          def[k++] = c != 0xFF;
+          idx[m] = c;
+          m += c != 0xFF;
+        }
+      pq::Buf lv;
+      pq::encode_levels(lv, def.data(), n);
+      cols[5].pre.le32((u32)lv.size());
+      cols[5].pre.bytes(lv.data(), lv.size());
+      int bw = pq::bit_width(cols[5].dict_count > 0 ? (u32)(cols[5].dict_count - 1) : 0);
+      if (bw < 1) bw = 1;
+      cols[5].pre.u8((u8)bw);
+      pq::encode_indices(cols[5].pre, idx.data(), m, bw);
     }
     std::string path = ud + "/part-" + std::to_string(t) + ".parquet";
     if (!pq::write_file(path, cols, (int64_t)n)) fail = true;
   });
   if (fail) die("writing output");
+}
+
+// Everything is written: give the memory back from all threads at once. The kernel would otherwise free it
+// page by page, on one CPU, while the process exits.
+static void release_memory() {
+  parallel_for(NT, [&](int t, int) {
+    for (auto& s : g_tl[t].arena.slabs) madvise(s.first, s.second, MADV_DONTNEED);
+    if (t == 0 && g_H) madvise(g_H, sizeof(HSlot) << g_Hbits, MADV_DONTNEED);
+  });
 }
 
 // ------------------------------------------------------------------------------------------
@@ -2557,6 +2757,70 @@ static int selftest() {
   }
   fprintf(stderr, "selftest F1 kernels: %ld cases, %ld mismatches; accepted %ld of %ld valid in-year values\n", n2, bad2,
           accepted, in_year);
+  // ---- kernels for timestamps with a UTC offset: the same two requirements, against parse_ts_ref
+  long n5 = 0, bad5 = 0, in_year5 = 0, accepted5 = 0;
+  for (const auto& ys : year_sets) {
+    init_fast_years(days_from_civil(ys[0], 12, 20) * DAY, days_from_civil(ys[1], 1, 15) * DAY);
+    for (long it = 0; it < 3000000; it++) {
+      auto gen = [&](u8* dst, bool offset) {
+        char t[64];
+        int yr = (next() % 16 == 0) ? ys[0] + (int)(next() % 5) - 2 : ys[next() & 1];
+        int mo = 1 + (int)(next() % 12), dd = 1 + (int)(next() % 31), hh = (int)(next() % 24), mi = (int)(next() % 60),
+            se = (int)(next() % 60), oh = (int)(next() % 24), om = (int)(next() % 60);
+        if (next() % 40 == 0) mo = (int)(next() % 20);
+        if (next() % 40 == 0) dd = (int)(next() % 40);
+        if (next() % 40 == 0) hh = (int)(next() % 30);
+        if (next() % 40 == 0) mi = (int)(next() % 70);
+        if (next() % 40 == 0) se = (int)(next() % 70);
+        if (next() % 20 == 0) oh = (int)(next() % 100);
+        if (next() % 20 == 0) om = (int)(next() % 100);
+        int len = snprintf(t, sizeof t, "%04d-%02d-%02dT%02d:%02d:%02d", yr, mo, dd, hh, mi, se);
+        if (offset)
+          len += snprintf(t + len, sizeof t - len, "%c%02d:%02d", "+-+-+-+-+-+-+-Z,"[next() % 16], oh, om);
+        else
+          len += snprintf(t + len, sizeof t - len, "Z");
+        if (next() % 5 == 0) {
+          int pos = (int)(next() % len);
+          t[pos] = alphabet[next() % strlen(alphabet)];
+        }
+        if (next() % 16 == 0) {
+          int pos = 17 + (int)(next() % (len - 17));
+          t[pos] = (char)(next() % 256);
+        }
+        for (int k = 0; k < 64; k++) dst[k] = (u8)("0123456789,\"Z:+-T"[next() % 17]);
+        memcpy(dst, t, len);
+      };
+      gen(pa.data(), true);
+      gen(pb.data(), false);
+      i64 ra = 0, rb = 0, fa = 0, fb = 0, f3 = 0;
+      const bool va = parse_ts_ref(pa.data(), 25, ra) && pa[4] == '-';  // the 25-byte form (not 25 digits)
+      const bool vb = pb[19] == 'Z' && civil19_scalar(pb.data(), rb);
+      const bool rp = f3f1_pair(pa.data(), pb.data(), fa, fb);
+      const bool r1 = f3_one(pa.data(), f3);
+      n5++;
+      bool wrong = false;
+      if (rp && (!va || !vb || fa != ra || fb != rb)) wrong = true;
+      if (r1 && (!va || f3 != ra)) wrong = true;
+      u32 ya, yb;
+      memcpy(&ya, pa.data(), 4);
+      memcpy(&yb, pb.data(), 4);
+      const bool ca = va && (ya == g_ytxt[0] || ya == g_ytxt[1]), cb = vb && (yb == g_ytxt[0] || yb == g_ytxt[1]);
+      if (ca) {
+        in_year5++;
+        accepted5 += r1;
+        if (!r1) wrong = true;
+      }
+      if (ca && cb && !rp) wrong = true;
+      if (wrong) {
+        if (bad5 < 10)
+          fprintf(stderr, "OFFSET KERNEL MISMATCH a='%.25s' b='%.20s' pair=%d one=%d ref=%d,%d\n", (const char*)pa.data(),
+                  (const char*)pb.data(), rp, r1, va, vb);
+        bad5++;
+      }
+    }
+  }
+  fprintf(stderr, "selftest offset kernels: %ld cases, %ld mismatches; accepted %ld of %ld valid in-year values\n", n5,
+          bad5, accepted5, in_year5);
   // ---- digits_le8 and camp_fast against the loops
   long n3 = 0, bad3 = 0;
   {
@@ -2640,7 +2904,7 @@ static int selftest() {
     }
   }
   fprintf(stderr, "selftest keys: %ld cases (%ld fast), %ld mismatches\n", n4, nfast, bad4);
-  return (bad || bad2 || bad3 || bad4) ? 1 : 0;
+  return (bad || bad2 || bad3 || bad4 || bad5) ? 1 : 0;
 }
 
 // ------------------------------------------------------------------------------------------
@@ -2648,7 +2912,7 @@ static int selftest() {
 static int bench_parse(const char* data, const char* file, int reps);
 static double g_bench_best = 1e30;
 static int g_p1_adj = 0, g_p2_adj = 0;
-#include "probe2.h"
+#include "probe3.h"
 
 int main(int argc, char** argv) {
   g_t0 = now_s();
@@ -2680,22 +2944,11 @@ int main(int argc, char** argv) {
   int probe_wfd = -1;   // >= 0: this process is a child that runs one pipeline variant and reports it
   int probe_slot = -1;
   std::string probe_tag, probe_dir;
+  bool probe_full = true;
   const double probe_t0 = now_s();
   {
     g_log = true;  // per-phase CPU accounting
     probe::calibrate_tsc();
-    {  // how long ago the container was set up: files Docker writes at creation, and the cgroup
-      struct timespec nowts;
-      clock_gettime(CLOCK_REALTIME, &nowts);
-      const double start_real = nowts.tv_sec + nowts.tv_nsec / 1e9 - (now_s() - g_t0);
-      struct stat st;
-      const char* fs[] = {"/etc/hostname", "/etc/resolv.conf", "/sys/fs/cgroup", "/proc/self", "/tmp"};
-      const char* nm[] = {"hn", "rc", "cg", "ps", "tmp"};
-      for (int i = 0; i < 5; i++)
-        if (stat(fs[i], &st) == 0)
-          probe::put(8, "%s=%.0f", nm[i], (start_real - (st.st_mtim.tv_sec + st.st_mtim.tv_nsec / 1e9)) * 1e3);
-      probe::put(8, "(ms from that file's mtime to main)");
-    }
     size_t mxf = 0;
     const std::string bigf = probe::largest_file(data + "/events", mxf);
     size_t evb = 0;
@@ -2703,24 +2956,7 @@ int main(int argc, char** argv) {
       struct stat st;
       if (stat(f.c_str(), &st) == 0) evb += st.st_size;
     }
-    // machine, memory, files, scan kernels
-    probe::in_child([&] {
-      probe::identity();
-      probe::frequency();
-      probe::scaling();
-      probe::memory();
-      probe::files(data, out);
-      probe::scan_kernels(data);
-    });
-    // single-thread event parse of the largest file (TSC ticks per line)
-    probe::in_child([&] {
-      if (!bigf.empty()) {
-        g_log = false;
-        bench_parse(data.c_str(), bigf.c_str(), 4);
-        probe::put(7, "pb=%.1ft/l", g_bench_best);
-      }
-    });
-    // the whole pipeline in child processes. x1: the data as it is. xN: N salted passes, about 20M events.
+    // the whole pipeline in child processes. xN: N salted passes, about 20M events; x3N: about 60M.
     const int repn = (int)std::max<size_t>(1, std::min<size_t>(40, (20000000 + evb / 140) / (evb / 70 + 1)));
     struct Var {
       int slot;
@@ -2729,25 +2965,29 @@ int main(int argc, char** argv) {
       bool thp;
       int p1, p2;
       double cost;  // expected duration, in units of the xN run
-    } vars[] = {{3, "x1", 1, NT, true, 0, 0, 0},
-                {4, "xN", repn, NT, true, 0, 0, 1},
-                {5, "xN-nohuge", repn, NT, false, 0, 0, 1.4},
-                {8, "x3N", repn * 3, NT, true, 0, 0, 3.3},
-                {6, "xN-half", repn, std::max(1, NT / 2), true, 0, 0, 1.9},
-                {9, "xN-p2x4", repn, NT, true, 0, 2, 1.1}};
-    double unit = 1.0;  // seconds the xN run took (a guess until it has run)
+      bool full;
+    } vars[] = {{0, "xN", repn, NT, true, 0, 0, 1, true},
+                {2, "xN:p1-1", repn, NT, true, -1, 0, 1, false},
+                {2, "p2-1", repn, NT, true, 0, -1, 1, false},
+                {0, "x3N", repn * 3, NT, true, 0, 0, 3.2, true},
+                {1, "x3N:p1-1", repn * 3, NT, true, -1, 0, 3.2, false},
+                {1, "p2-1", repn * 3, NT, true, 0, -1, 3.2, false},
+                {1, "p1+1", repn * 3, NT, true, 1, 0, 3.2, false},
+                {1, "same", repn * 3, NT, true, 0, 0, 3.2, false},
+                {2, "p1+1", repn, NT, true, 1, 0, 1, false},
+                {2, "same", repn, NT, true, 0, 0, 1, false}};
+    double unit = 0.6;  // seconds the xN run took (a guess until it has run)
     for (auto& v : vars) {
       // keep the whole thing short: a variant starts only if it should be done 8.5 s after the start
-      if (now_s() - probe_t0 + v.cost * unit > 8.5) continue;
+      if (now_s() - probe_t0 + v.cost * unit > 9.5) continue;
       const double tv0 = now_s();
       int rfd, wfd;
       pid_t pid = probe::spawn(rfd, wfd);
       if (pid == 0) {
         probe_wfd = wfd;
         probe_slot = v.slot;
-        char tg[64];
-        snprintf(tg, sizeof tg, "%s(rep%d,%dT)", v.tag, v.rep, v.threads);
-        probe_tag = tg;
+        probe_tag = v.tag;
+        probe_full = v.full;
         g_rep = v.rep;
         NT = v.threads;
         g_thp = v.thp;
@@ -2759,11 +2999,31 @@ int main(int argc, char** argv) {
         break;
       }
       const double td = probe::collect(pid, rfd);
-      probe::put(v.slot, "td=%.1f", td);
+      if (v.full) probe::put(v.slot, "td=%.1f;", td);
       probe::remove_tree(out + "/.probe_" + std::to_string(v.slot));
-      if (v.cost == 1) unit = now_s() - tv0;
+      if (v.cost == 1 && unit == 0.6) unit = now_s() - tv0;
     }
-    if (probe_wfd < 0) probe::put(8, "probe=%.1fs", now_s() - probe_t0);
+    if (probe_wfd < 0) {
+      // scan kernels and the single-thread event parse (TSC ticks per line), last: they matter least
+      probe::in_child([&] {
+        probe::populate_test(data, 3);
+        probe::scan_kernels(data, 3);
+        if (!bigf.empty()) {
+          g_log = false;
+          bench_parse(data.c_str(), bigf.c_str(), 4);
+          probe::put(3, "pb=%.1ft/l", g_bench_best);
+        }
+      });
+      struct timespec nowts;
+      clock_gettime(CLOCK_REALTIME, &nowts);
+      const double start_real = nowts.tv_sec + nowts.tv_nsec / 1e9 - (now_s() - g_t0);
+      struct stat st;
+      if (stat("/etc/hostname", &st) == 0)
+        probe::put(3, "hn=%.0fms", (start_real - (st.st_mtim.tv_sec + st.st_mtim.tv_nsec / 1e9)) * 1e3);
+      if (stat("/sys/fs/cgroup", &st) == 0)
+        probe::put(3, "cg=%.0fms", (start_real - (st.st_mtim.tv_sec + st.st_mtim.tv_nsec / 1e9)) * 1e3);
+      probe::put(3, "rep=%d probe=%.1fs", repn, now_s() - probe_t0);
+    }
   }
   probe::T[0] = now_s();
   // ================= end of probe =================
@@ -2819,20 +3079,28 @@ int main(int argc, char** argv) {
   person_phase();
   LOG("person phase done");
   probe::T[4] = now_s();
-  if (probe_wfd >= 0) {
-    // salted person hashes do not turn back into real IDs: give every key an ordinary first byte
-    if (g_rep > 1)
-      for (auto& t : g_tl)
-        for (auto& r : t.out.rows) r.key = (r.key & 0x00FFFFFFFFFFFFFFULL) | (0x75ULL << 56);
-  } else {
-    // the report: five extra rows in user_daily
-    for (int r = 0; r < 5; r++) {
+  probe::hp_peak_kb = probe::anon_huge_kb();
+  if (probe_wfd < 0) {
+    // the report: extra rows in user_daily (only as many as there is text for)
+    for (int r = 0; r < 2; r++) {
+      if (probe::S[2 * r].empty() && probe::S[2 * r + 1].empty()) continue;
       std::string uid = "!" + std::to_string(r + 1) + " " + probe::S[2 * r];
       std::string cat = probe::S[2 * r + 1].empty() ? std::string("-") : probe::S[2 * r + 1];
       g_cats.push_back(cat);
-      ORow row{g_intern.get((const u8*)uid.data(), (u32)uid.size()), (i64)cat.size(), (i32)g_day0, (u32)(r + 1),
-               (u32)uid.size(), (u16)(g_cats.size() - 1), 0};
-      g_tl[0].out.rows.push_back(row);
+      OutCols& oc = g_tl[0].out;
+      Arena& ar = g_tl[0].arena;
+      const u32 len = (u32)uid.size();
+      const bool fits = 4 + (size_t)len <= Stream<u8>::BLK;
+      u8* ip = fits ? oc.ids.reserve(4 + len, ar) : oc.ids.big(4 + (size_t)len, ar);
+      memcpy(ip, &len, 4);
+      memcpy(ip + 4, uid.data(), len);
+      if (fits) oc.ids.cur = ip + 4 + len;
+      *oc.day.slot(ar) = (i32)g_day0;
+      *oc.sess.slot(ar) = (u32)(r + 1);
+      *oc.evs.slot(ar) = len;
+      *oc.rev.slot(ar) = (i64)cat.size();
+      *oc.top.slot(ar) = (u8)(g_cats.size() - 1);
+      oc.nrows++;
       fprintf(stderr, "PROBE row %d: %s || %s\n", r + 1, uid.c_str(), cat.c_str());
     }
   }
@@ -2841,7 +3109,9 @@ int main(int argc, char** argv) {
   LOG("output written");
   probe::T[5] = now_s();
   if (probe_wfd >= 0) {
-    probe::pipeline_report(probe_slot, probe_tag.c_str());
+    release_memory();
+    probe::T[6] = now_s();
+    probe::pipeline_report(probe_slot, probe_tag.c_str(), probe_full);
     probe::child_finish(probe_wfd);
   }
   if (g_log) {
@@ -2853,9 +3123,11 @@ int main(int argc, char** argv) {
     fprintf(stderr, "user s:");
     for (int i = 1; i < 6; i++) fprintf(stderr, " %s %.3f", g_phase_names[i], g_phase_cycles[i].load() / 1e6);
     fprintf(stderr, " | total %.3f   sys s: total %.3f (parse %.3f)\n", tot, tots, g_phase_sys[2].load() / 1e6);
-    fprintf(stderr, "ABS end %.6f\n", now_s());
   }
-  return 0;
+  release_memory();
+  if (g_log) fprintf(stderr, "ABS end %.6f\n", now_s());
+  fflush(nullptr);
+  _exit(0);  // nothing left to clean up that the kernel does not do anyway
 }
 
 // ------------------------------------------------------------------------------------------

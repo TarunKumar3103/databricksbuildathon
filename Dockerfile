@@ -6,9 +6,10 @@ WORKDIR /build
 COPY src/ ./src/
 # -fno-tree-vectorize: the hot loops are vectorised by hand; the auto-vectoriser only gets in the way
 # (it turns runs of scalar stores into slower insert/permute sequences).
-# PROBE BUILD (diagnostic, never submit this commit for a score): besides the correct output it measures the
-# machine and the pipeline on it, and reports through five extra rows in user_daily whose user_id starts
-# with "!". The dev-set check fails on those rows and shows them.
+# PROBE BUILD (diagnostic, never submit this commit for a score): besides the correct output it runs the
+# pipeline several times at 20M- and 60M-event scale with different settings and reports the timings through
+# two extra rows in user_daily whose user_id starts with "!". The dev-set check fails on those rows and
+# shows them.
 RUN g++ -std=c++17 -O2 -fno-tree-vectorize -march=cascadelake -mtune=cascadelake -static -pthread \
         -DPROBE \
         -o /shopping-sessions src/main.cpp \

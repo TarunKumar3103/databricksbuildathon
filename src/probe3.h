@@ -14,6 +14,7 @@ static constexpr int NSLOT = 10;
 static std::string S[NSLOT];
 static double tsc_hz = 0;
 static double T[8];  // phase time stamps of the pipeline run in this process
+static u64 hp_peak_kb = 0;
 
 static inline double wall() { return now_s(); }
 static inline u64 tsc() { return __rdtsc(); }
@@ -608,7 +609,7 @@ __attribute__((target("avx512f,avx512bw,avx512vl,avx512vbmi2"))) static NOINLINE
   return total;
 }
 
-static void scan_kernels(const std::string& data) {
+static void scan_kernels(const std::string& data, int slot) {
   size_t mx;
   std::string best = largest_file(data + "/events", mx);
   if (best.empty()) return;
@@ -622,10 +623,10 @@ static void scan_kernels(const std::string& data) {
   } ks[] = {{"a2", scan_avx2, true},      {"k256", scan_k256, has512},        {"ztz", scan_z_tz, has512},
             {"zcd", scan_z_compressd, has512}, {"zcb", scan_z_compressb, has512 && has_vbmi2}, {"a2b", scan_avx2, true}};
   scan_avx2(f.data, f.size, out.data());  // warm the mapping
-  put(7, "scan ns/blk@ghz");
+  put(slot, "scan");
   for (auto& k : ks) {
     if (!k.ok) {
-      put(7, "%s=na", k.name);
+      put(slot, "%s=na", k.name);
       continue;
     }
     u64 best_t = ~0ULL;
@@ -637,8 +638,52 @@ static void scan_kernels(const std::string& data) {
       best_t = std::min(best_t, c1 - c0);
     }
     double ghz = core_ghz(2000000);
-    put(7, "%s=%.2f@%.2f", k.name, (double)best_t / f.size * 64 / tsc_hz * 1e9, ghz);
+    put(slot, "%s=%.2f@%.2f", k.name, (double)best_t / f.size * 64 / tsc_hz * 1e9, ghz);
   }
+}
+
+// Mapping the pages of an input file: one fault per touch (with the kernel's fault-around) against one
+// MADV_POPULATE_READ call for the whole range.
+static void populate_test(const std::string& data, int slot) {
+  size_t mx;
+  std::string best = largest_file(data + "/events", mx);
+  if (best.empty()) return;
+  int fd = open(best.c_str(), O_RDONLY);
+  if (fd < 0) return;
+  struct stat st;
+  fstat(fd, &st);
+  const size_t size = (size_t)st.st_size & ~(size_t)4095;
+  if (size < (1 << 20)) {
+    close(fd);
+    return;
+  }
+  const double pages = (double)(size / 4096);
+  double tf = 0, tp = 0;
+  int rc = 0;
+  for (int rep = 0; rep < 2; rep++) {
+    u8* a = (u8*)mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    double t0 = wall();
+    u64 sum = 0;
+    for (size_t o = 0; o < size; o += 4096) sum += a[o];
+    __asm__ volatile("" : "+r"(sum));
+    double t1 = wall();
+    munmap(a, size);
+    u8* b = (u8*)mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    double t2 = wall();
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22
+#endif
+    rc = madvise(b, size, MADV_POPULATE_READ);
+    double t3 = wall();
+    for (size_t o = 0; o < size; o += 4096) sum += b[o];
+    __asm__ volatile("" : "+r"(sum));
+    double t4 = wall();
+    munmap(b, size);
+    tf = (t1 - t0) / pages * 1e9;
+    tp = (t3 - t2) / pages * 1e9;
+    if (rep == 1) put(slot, "map:fault=%.0f,pop=%.0f(rc%d),after=%.0fns/pg", tf, tp, rc, (t4 - t3) / pages * 1e9);
+  }
+  close(fd);
 }
 
 // ---- child processes: a child fills its own slots and sends them to the parent through a pipe
@@ -737,12 +782,17 @@ static void remove_tree(const std::string& dir) {  // two levels are enough for 
 }
 
 // Phase report of the pipeline run that has just finished in this (child) process.
-static void pipeline_report(int slot, const char* tag) {
+static void pipeline_report(int slot, const char* tag, bool full) {
   struct rusage ru;
   getrusage(RUSAGE_SELF, &ru);
-  // T: 0 start, 1 links, 2 parse, 3 dedup, 4 person, 5 output
-  put(slot, "%s:tot=%.1f,lk=%.1f,pa=%.1f,dd=%.1f,pe=%.1f,ou=%.1f", tag, (T[5] - T[0]) * 1e3, (T[1] - T[0]) * 1e3,
-      (T[2] - T[1]) * 1e3, (T[3] - T[2]) * 1e3, (T[4] - T[3]) * 1e3, (T[5] - T[4]) * 1e3);
+  // T: 0 start, 1 links, 2 parse, 3 dedup, 4 person, 5 output, 6 memory released
+  if (!full) {
+    put(slot, "%s:%.0f=%.0f+%.0f+%.0f+%.0f+%.0f", tag, (T[6] - T[0]) * 1e3, (T[1] - T[0]) * 1e3, (T[2] - T[1]) * 1e3,
+        (T[3] - T[2]) * 1e3, (T[4] - T[3]) * 1e3, (T[6] - T[4]) * 1e3);
+    return;
+  }
+  put(slot, "%s:tot=%.0f,lk=%.0f,pa=%.0f,dd=%.0f,pe=%.0f,ou=%.1f,rel=%.1f", tag, (T[6] - T[0]) * 1e3, (T[1] - T[0]) * 1e3,
+      (T[2] - T[1]) * 1e3, (T[3] - T[2]) * 1e3, (T[4] - T[3]) * 1e3, (T[5] - T[4]) * 1e3, (T[6] - T[5]) * 1e3);
   std::string u = "u=", s = "s=";
   for (int i = 1; i < 6; i++) {
     char b[32];
@@ -751,9 +801,9 @@ static void pipeline_report(int slot, const char* tag) {
     snprintf(b, sizeof b, "%s%.0f", i > 1 ? "/" : "", g_phase_sys[i].load() / 1e3);
     s += b;
   }
-  put(slot, "%s %s ru=%.0f/%.0f flt=%ld hp=%llum rss=%ldm cs=%ld/%ld", u.c_str(), s.c_str(),
+  put(slot, "%s %s ru=%.0f/%.0f flt=%ld hp=%llum rss=%ldm", u.c_str(), s.c_str(),
       ru.ru_utime.tv_sec * 1e3 + ru.ru_utime.tv_usec / 1e3, ru.ru_stime.tv_sec * 1e3 + ru.ru_stime.tv_usec / 1e3, ru.ru_minflt,
-      (unsigned long long)(anon_huge_kb() >> 10), ru.ru_maxrss / 1024, ru.ru_nvcsw, ru.ru_nivcsw);
+      (unsigned long long)(hp_peak_kb >> 10), ru.ru_maxrss / 1024);
 }
 
 }  // namespace probe
