@@ -1,7 +1,11 @@
 # Written by bench/mkbench.py. tag, binary in /usr/local/bench, then ENV=VALUE settings.
 # The first build also writes the dev output that the report rows are added to.
-v ss-4a23ea7-f0   # 4a23ea7 -Wa,-mbranches-within-32B-boundaries: v4 head: B scanner + A scan rewrite, gcc as its Dockerfile
-s ss-48d15a9-f1   # 48d15a9 -Wa,-mbranches-within-32B-boundaries: b-slots-v4: v4 + B slot loop, gcc
-sc ss-48d15a9-clang18                # b-slots-v4 with clang 18, no profile (prebuilt in chat C's sandbox)
-sp ss-1098ed4-built                  # b-slots-v4-pgo 1098ed4: clang 18 + its profile, built on the build machine like its Dockerfile; missing if that failed
-s8p ss-1098ed4-kc8-clang18-pgo       # 1098ed4 with click partitions of 2^8 persons (KC = 8, as a-kc8), same profile (prebuilt)
+v ss-4a23ea7-f0   # 4a23ea7 -Wa,-mbranches-within-32B-boundaries: v4 4a23ea7, gcc as its Dockerfile: scored 0.43 at 15:26
+s ss-48d15a9-f1   # 48d15a9 -Wa,-mbranches-within-32B-boundaries: b-slots-v4: 4a23ea7 + B slot loop, gcc
+sc  ss-48d15a9-clang18          # b-slots-v4 with clang 18, no profile
+sp  ss-1098ed4-clang18-pgo      # b-slots-v4-pgo 1098ed4: clang 18 + its profile
+s8p ss-1098ed4-kc8-clang18-pgo  # 1098ed4 with KC = 8, same profile
+t   ss-13dbfd7-clang18-pgo      # v4 13dbfd7: 1098ed4 + KC = 8 + A's trims, own profile
+d   ss-de5f26c-clang18-pgo      # v4 de5f26c: 13dbfd7 + segments without a look-back, own profile
+bp  ss-0c9b0b7-clang18-pgo      # b-purch-v4 0c9b0b7: 13dbfd7 + B's two parse commits, own profile
+db  ss-83b5604-clang18-pgo      # c-db 83b5604: de5f26c + B's two parse commits, own profile
