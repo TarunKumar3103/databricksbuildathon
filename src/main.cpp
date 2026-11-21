@@ -13,6 +13,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <immintrin.h>
+#include <sched.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -88,6 +89,21 @@ static inline void thread_times(u64& user_us, u64& sys_us) {
 static int g_phase = 0;
 static const char* g_phase_names[16] = {"init", "links", "parse", "dedup", "person", "output"};
 
+// Each worker on its own CPU of the set the process may use, when there are enough of them: no migrations.
+static int g_pin_cpu[256];
+static int g_npin = 0;
+static cpu_set_t g_all_cpus;
+static inline void pin_worker(int tid) {
+  if (g_npin == 0) return;
+  cpu_set_t s;
+  CPU_ZERO(&s);
+  CPU_SET(g_pin_cpu[tid % g_npin], &s);
+  sched_setaffinity(0, sizeof s, &s);
+}
+static inline void unpin_thread() {
+  if (g_npin) sched_setaffinity(0, sizeof g_all_cpus, &g_all_cpus);
+}
+
 template <class F>
 static void parallel_for(int ntasks, F&& f) {
   if (ntasks <= 0) return;
@@ -98,6 +114,7 @@ static void parallel_for(int ntasks, F&& f) {
   std::atomic<int> next{0};
   const int phase = g_phase;
   auto worker = [&](int tid) {
+    if (tid) pin_worker(tid);
     u64 u0 = 0, s0 = 0, u1, s1;
     if (g_log) thread_times(u0, s0);
     for (;;) {
@@ -3125,6 +3142,15 @@ int main(int argc, char** argv) {
     if (v > 0) NT = v;
   }
   NT = std::max(1, std::min(NT, 256));
+  if (sched_getaffinity(0, sizeof g_all_cpus, &g_all_cpus) == 0 && !getenv("SS_NOPIN")) {
+    int n = 0;
+    for (int c = 0; c < CPU_SETSIZE && n < 256; c++)
+      if (CPU_ISSET(c, &g_all_cpus)) g_pin_cpu[n++] = c;
+    if (n >= NT) {
+      g_npin = n;
+      pin_worker(0);
+    }
+  }
   init_years();
 
   std::vector<std::string> evp = list_csv(data + "/events"), ckp = list_csv(data + "/clicks"),
@@ -3163,6 +3189,7 @@ int main(int argc, char** argv) {
       (unsigned long long)dn::g_ukey);
   // The lookups and the per-thread state are not needed for the links: set them up on the side meanwhile.
   std::thread setup([&] {
+    unpin_thread();  // (it starts with the main thread's CPU)
     load_lookups(data);
     if (dn::g_on && !dn::recover_event_key(samp)) dn::fail("no key for the event ids");
     if (dn::g_on && (u64)(g_we - g_ws) > 0x7FFFFFF0ULL) dn::fail("window too long");
