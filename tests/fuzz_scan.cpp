@@ -36,7 +36,7 @@ static long run(long iters) {
     buf.assign(len + 128, 0);
     // generate either random soup or near-valid lines
     size_t i = 0;
-    int soup = nxt() % 6;
+    int soup = nxt() % 8;  // (6, 7: clean lines only, so that whole groups of eight form)
     while (i < len) {
       if (soup == 0) {
         const char* alph = "ab,,\"\n\r x";
@@ -56,6 +56,16 @@ static long run(long iters) {
           if (q && i < len) buf[i++] = '"';
         }
         if (i < len) buf[i++] = '\n';
+      } else if (soup >= 6) {
+        for (int f = 0; f < NF && i < len; f++) {
+          if (f) buf[i++] = ',';
+          bool q = nxt() % 5 == 0;
+          int flen = nxt() % 12;
+          if (q && i < len) buf[i++] = '"';
+          for (int k = 0; k < flen && i < len; k++) buf[i++] = (u8)('a' + nxt() % 26);
+          if (q && i < len) buf[i++] = '"';
+        }
+        if (i < len) buf[i++] = (soup == 7 && nxt() % 300 == 0) ? ',' : '\n';
       } else {
         // a line of NF fields, random quoting, occasional corruption
         int nf = NF + ((nxt() % 20 == 0) ? (int)(nxt() % 3) - 1 : 0);
@@ -81,6 +91,40 @@ static long run(long iters) {
     ref_scan<NF>(buf.data(), buf.data() + len, skip, a);
     scan_chunk<NF>(buf.data(), buf.data() + len, skip, [&](const u8* sb, const u32* fo, const u32* fl) {
       std::string r; for (int k = 0; k < NF; k++) { r.append((const char*)(sb + fo[k]), fl[k]); r.push_back('|'); } b.push_back(r); });
+    // the same through scan_cols: groups of eight lines as columns, the rest one by one
+    std::vector<std::string> c;
+    scan_cols<NF>(
+        buf.data(), buf.data() + len, skip,
+        [&](const u8* sb, const __m256i* C, const u32* q) {
+          alignas(32) u32 col[8][8];
+          for (int k = 0; k <= NF; k++) _mm256_store_si256((__m256i*)col[k], C[k]);
+          for (int j = 0; j < 8; j++) {
+            std::string r;
+            for (int k = 0; k < NF; k++) {
+              const u32 quoted = (q[k] >> j) & 1;
+              const u32 a0 = col[k][j] + 1 + quoted, a1 = col[k + 1][j] - quoted;
+              r.append((const char*)(sb + a0), a1 - a0);
+              r.push_back('|');
+            }
+            c.push_back(r);
+          }
+        },
+        [&](const u8* sb, __m256i st, __m256i ln) {
+          alignas(32) u32 fo[8], fl[8];
+          _mm256_store_si256((__m256i*)fo, st);
+          _mm256_store_si256((__m256i*)fl, ln);
+          std::string r;
+          for (int k = 0; k < NF; k++) { r.append((const char*)(sb + fo[k]), fl[k]); r.push_back('|'); }
+          c.push_back(r);
+        });
+    if (a != c) {
+      if (bad < 3) {
+        fprintf(stderr, "NF=%d scan_cols mismatch len=%zu skip=%d: ref %zu lines, cols %zu lines\n", NF, len, skip, a.size(), c.size());
+        size_t m = std::min(a.size(), c.size());
+        for (size_t k = 0; k < m; k++) if (a[k] != c[k]) { fprintf(stderr, "  first diff at %zu: ref [%s] cols [%s]\n", k, a[k].c_str(), c[k].c_str()); break; }
+      }
+      bad++;
+    }
     if (a != b) {
       if (bad < 3) {
         fprintf(stderr, "NF=%d mismatch len=%zu skip=%d: ref %zu lines, fast %zu lines\n", NF, len, skip, a.size(), b.size());

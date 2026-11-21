@@ -18,8 +18,12 @@ invertible mixing function with one secret key per kind of ID. The keys are foun
 - A user number is (person index << 9) + alias. The link phase works out, per person index, whether its link
   set is exactly the aliases 0..n-1 of that index and nothing else. Such persons are grouped and named by
   index alone; their clicks are partitioned by person index and joined in the same scan.
-- IDs are decoded four at a time with vector code (digits, range and leading-zero checks, the two
-  multiplications of the inverse mixing).
+- The CSV scanner hands the lines over eight at a time as columns (an 8 x 8 transpose of the separator
+  offsets), so the per-line work that follows is vector work on columns: IDs are gathered and decoded four at
+  a time (digits, range and leading-zero checks, the two multiplications of the inverse mixing), the lines
+  are sorted by the form of their timestamp with compress-stores, the window and lateness checks are sign
+  bits of a few 64-bit lanes, and what remains per line is the timestamp kernel and one store into the
+  partition's staging line.
 
 Nothing of this is taken on trust. Any key is a bijection on the ID numbers, so a wrong key cannot produce a
 wrong answer, only sparse indexes. Records that do not fit (IDs of another form, link sets that mix person
