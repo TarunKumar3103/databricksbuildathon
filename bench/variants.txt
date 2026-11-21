@@ -1,7 +1,9 @@
 # The builds the bench times: tag, binary in /usr/local/bench, then optional ENV=VALUE settings.
-# The first build also writes the dev output that the rest of the rows are added to.
-a ss-a            # src/ of this branch = v4 77eeb25, built like its Dockerfile (JCC padding)
-n ss-a-nojcc      # the same source without -Wa,-mbranches-within-32B-boundaries
-p ss-4f8cb95      # v4 4f8cb95, submitted Sat 12:41
-b ss-594f757      # v4 594f757, scored 0.51
-c ss-0aeec34      # v3 0aeec34, scored 0.60
+# The first build also writes the dev output that the report rows are added to.
+a ss-77eeb25-f0                  # v4 77eeb25 with gcc 13, as its Dockerfile builds it (JCC padding)
+L ss-77eeb25-clang18-O2          # the same source, clang 18.1.3 -O2 -fno-vectorize -fno-slp-vectorize; built in chat C's sandbox, in bench/bin
+M ss-77eeb25-clang18-O3          # the same at -O3
+K ss-77eeb25-clang-built         # clang 18 installed from Ubuntu's archive and run on the build machine; missing if that failed
+p ss-4f8cb95                     # v4 4f8cb95 with gcc 13, as in bench 1, to tie the two benches together
+t ss-77eeb25-f0 SS_THREADS=12    # build a with 12 threads on the 8 vCPUs
+d ss-77eeb25-f0 SS_NODROP=1      # build a without dropping parsed input pages

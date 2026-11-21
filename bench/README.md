@@ -49,7 +49,12 @@ whole bench in seconds.
 ## Changing what it compares
 
 Put each build's sources under `bench/variants/<name>/src/`, add its compile line to the `Dockerfile`, and add
-a line to `variants.txt`. Builds are compared fairly only within one run of the bench.
+a line to `variants.txt`; `bench/mkbench.py PLAN` does all three for gcc builds of any commits. A binary built
+elsewhere can sit in `bench/bin/`, which is copied as it is. A build whose binary is not in the image (an
+optional build stage that could not run) is reported as `tag=missing`. Builds are compared fairly only within
+one run of the bench.
+
+Phase splits are medians over the rounds (bench 1 used means).
 
 ## Testing it locally
 

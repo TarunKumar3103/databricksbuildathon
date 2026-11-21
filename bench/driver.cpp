@@ -532,6 +532,7 @@ int main() {
           r = z.rounds;
           break;
         }
+        if (access(vs[vi].bin.c_str(), X_OK) != 0) continue;
         rm_rf(odir);
         mkdir(odir.c_str(), 0777);
         std::vector<std::string> e = {"DATA_DIR=" + gdir, "OUTPUT_DIR=" + odir, "SS_LOG=1"};
@@ -560,12 +561,15 @@ int main() {
     long long ud0 = -2, cd0 = -2;
     bool agree = true;
     for (size_t vi = 0; vi < vs.size(); vi++) {
+      if (access(vs[vi].bin.c_str(), X_OK) != 0) {
+        a += fmt(" %s=missing", vs[vi].tag.c_str());
+        continue;
+      }
       std::vector<double> w, us, ss, ip, fl;
       long rss = 0;
       char route = '?';
       int bad = 0;
-      double ph[5] = {0, 0, 0, 0, 0};
-      int nph = 0;
+      std::vector<double> ph[5];
       for (auto& u : res[vi]) {
         if (!u.ok) {
           bad++;
@@ -578,10 +582,8 @@ int main() {
         fl.push_back((double)u.minflt);
         rss = std::max(rss, u.rss_mb);
         route = u.route;
-        if (u.ph[0] >= 0) {
-          for (int i = 0; i < 5; i++) ph[i] += u.ph[i];
-          nph++;
-        }
+        if (u.ph[0] >= 0)
+          for (int i = 0; i < 5; i++) ph[i].push_back(u.ph[i]);
         if (ud0 == -2) {
           ud0 = u.ud;
           cd0 = u.cd;
@@ -592,9 +594,10 @@ int main() {
       if (vi < 3) med3[vi] = (long long)mw;
       a += fmt(" %s=%.0f/%.0f,u%.2f,s%.2f,%ldM,f%.0fk,%c%zu%s", vs[vi].tag.c_str(), mw, mn, median(us), median(ss), rss,
                median(fl) / 1000, route, w.size(), bad ? fmt("!%d", bad).c_str() : "");
-      if (nph)
+      if (!ph[0].empty())
         b += fmt("%s%s:%.0f=%.0f+%.0f+%.0f+%.0f+%.0f", b.empty() ? "" : " ", vs[vi].tag.c_str(), median(ip),
-                 ph[0] / nph * 1000, ph[1] / nph * 1000, ph[2] / nph * 1000, ph[3] / nph * 1000, ph[4] / nph * 1000);
+                 median(ph[0]) * 1000, median(ph[1]) * 1000, median(ph[2]) * 1000, median(ph[3]) * 1000,
+                 median(ph[4]) * 1000);
     }
     a += fmt(" rows=%lld/%lld%s", ud0, cd0, agree ? "" : ",DIFFER");
     rows.push_back(Row{a, b.empty() ? "-" : b, med3[0], med3[1], med3[2]});

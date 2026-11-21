@@ -2,7 +2,8 @@
 
 > **This branch (`c-bench`) is a bench build, not an entry. Never submit it for a score.** Its image times
 > several builds at 20M and 60M events on the scorer and reports through extra `user_daily` rows that the dev
-> check rejects. See `bench/README.md`. The pipeline in `src/` is v4 `77eeb25`, unchanged.
+> check rejects. See `bench/README.md`. The pipeline in `src/` is v4 `77eeb25`, unchanged; the builds the bench
+> times are listed in `bench/variants.txt`.
 
 One static C++17 binary (no engine, no runtime dependencies) that reads `/data` and writes
 `/output/user_daily/` and `/output/campaign_daily/` as Parquet, following `rules.md` exactly.
