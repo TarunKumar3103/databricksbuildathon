@@ -592,12 +592,12 @@ int main() {
       }
       const double mw = median(w), mn = w.empty() ? -1 : *std::min_element(w.begin(), w.end());
       if (vi < 3) med3[vi] = (long long)mw;
-      a += fmt(" %s=%.0f/%.0f,u%.2f,s%.2f,%ldM,f%.0fk,%c%zu%s", vs[vi].tag.c_str(), mw, mn, median(us), median(ss), rss,
-               median(fl) / 1000, route, w.size(), bad ? fmt("!%d", bad).c_str() : "");
-      if (!ph[0].empty())
-        b += fmt("%s%s:%.0f=%.0f+%.0f+%.0f+%.0f+%.0f", b.empty() ? "" : " ", vs[vi].tag.c_str(), median(ip),
-                 median(ph[0]) * 1000, median(ph[1]) * 1000, median(ph[2]) * 1000, median(ph[3]) * 1000,
-                 median(ph[4]) * 1000);
+      (void)mn;  // (bench 1 printed the best wall time too: a=512/498,...)
+      a += fmt(" %s=%.0f,u%.2f,s%.2f,%ldM,%c%zu%s", vs[vi].tag.c_str(), mw, median(us), median(ss), rss, route, w.size(),
+               bad ? fmt("!%d", bad).c_str() : "");
+      if (!ph[0].empty())  // CPU ms of links, parse, dedup or scan (the person phase and the output are a few ms)
+        b += fmt("%s%s:%.0f+%.0f+%.0f", b.empty() ? "" : " ", vs[vi].tag.c_str(), median(ph[0]) * 1000,
+                 median(ph[1]) * 1000, median(ph[2]) * 1000);
     }
     a += fmt(" rows=%lld/%lld%s", ud0, cd0, agree ? "" : ",DIFFER");
     rows.push_back(Row{a, b.empty() ? "-" : b, med3[0], med3[1], med3[2]});

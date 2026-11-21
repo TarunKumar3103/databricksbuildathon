@@ -130,67 +130,220 @@ static NOINLINE void fail(const char* why) {
 static u64 g_ukey = 0, g_ekey = 0;
 static u64 g_ne_cap = 0;  // regular event indexes are below this
 static u32 g_nu_cap = 0;  // regular person indexes are below this (at most 2^23, so a user number fits 32 bits)
-static constexpr u32 KE = 14, KC = 9;  // event indexes per event partition, person indexes per click partition
+static constexpr u32 KE = 12, KC = 9;  // event indexes per event partition, person indexes per click partition
 static constexpr u32 ESLOTS = 1u << KE, ELOM = ESLOTS - 1;
 static u32 g_PE = 0, g_PC = 0;
 static i64 g_ing_base = 0;  // ingest_ts is kept as whole seconds since this, plus 1, in 24 bits
 static constexpr u64 ING_SPAN = 0xFFFFFEULL * 1000;
 static constexpr u32 ING_NOCODE = 0xFFFFFF;  // an ingest_ts that does not parse: later than all others
 
-// Per person index, filled in by the link phase. A linked ID x "counts" for its index if x is a regular user
-// ID and the name of its link set (the set's smallest ID) is a regular user ID of the same index:
-//   bits 0..9    how many IDs count
-//   bits 10..27  the sum of their aliases
-//   bits 28..37  how many of them are the name of their set (so: how many sets they are in)
-//   bit 46       alias 0 counts
-//   bit 63       some ID of this index is in a set with an ID that is not a regular ID of this index
+// Per person index, a word that the link phase fills in (g_acc). Nearly every link line joins two aliases of
+// one person index, and such a line only changes this word: it never reaches the general link table H.
+//   bits 0..39   four bits per alias a < KA: the smallest alias of the link set a is in (0 while a is in none)
+//   bits 40..49  the aliases that occur in a link (also in one to themselves)
+//   bits 52..55  set when all links are read: how many aliases the dense person of the index has (see dense_cnt)
 //   bit 62       the person has events or clicks kept outside the partitions (g_extra)
-static constexpr u64 ACC_POISON = 1ULL << 63, ACC_EXTRA = 1ULL << 62, ACC_HAS0 = 1ULL << 46;
+//   bit 63       the index has no dense person. During the link phase: one of its IDs is in a link line that
+//                does not fit the word (the other ID is not a regular ID of this index, or an alias is >= KA).
+// Everything the general pipeline may be asked about is put into H when the links are read: the lines that do
+// not fit a word, and, for every index without a dense person or with links beside it, the links in its word.
+static constexpr u32 KA = 10;
+static constexpr u64 ACC_POISON = 1ULL << 63, ACC_EXTRA = 1ULL << 62, ACC_LAB = (1ULL << (4 * KA)) - 1;
+static constexpr u32 ACC_MSH = 4 * KA, ACC_NSH = 52;
 
 // How many aliases the dense person of an index has: its IDs are exactly the aliases below this, and nothing
 // else is linked to them. 1 if alias 0 is in no link. 0: the index has no dense person (every record of its
-// IDs goes the general way).
-//   Not poisoned means every set that holds an ID of this index holds regular IDs of this index only, so all
-//   their members count. If they are in one set (one of them is a name), alias 0 is among them, and their n
-//   aliases sum to 0 + 1 + .. + n - 1, which only the aliases 0..n-1 do, then that set is exactly those aliases.
+// IDs goes the general way). Valid once the link phase has classified the words.
 static FORCE_INLINE u32 dense_cnt(u64 a) {
   if (__builtin_expect((a & ~ACC_EXTRA) == 0, 1)) return 1;
   if ((i64)a < 0) return 0;
-  if (!(a & ACC_HAS0)) return 1;
-  const u32 n = (u32)a & 0x3FF, sa = (u32)(a >> 10) & 0x3FFFF, sets = (u32)(a >> 28) & 0x3FF;
-  return (sets == 1 && sa * 2 == n * (n - 1)) ? n : 0;
+  return (u32)(a >> ACC_NSH) & 15;
 }
 
-// (person index << 9 | alias) of the link ID whose key has hash h, or NONE if it is not a regular user ID.
-static FORCE_INLINE u32 reg_user_of_hash(u64 h) {
-  const u64 k = unhash_id(h);
-  const u64 w = __builtin_bswap64(_pdep_u64(k, KEY_M7));  // the bytes after the first, zero padded
-  if ((k >> 56) != 'u' || w == 0) return NONE;
-  const u32 n = 8 - ((u32)__builtin_clzll(w) >> 3);  // digits
-  u64 va, vb;
-  const u32 ok = b36_pair((const u8*)&w, n, (const u8*)&w, n, va, vb);
-  if (ok != 0xFFFF || (((u8)w == '0') & (n > 1)) || va > M40) return NONE;
-  const u64 num = unscramble(va, g_ukey);
+// A link between the aliases a and b (both below KA) of person index p: their sets become one in the word.
+// A set is labelled by its smallest alias, so joining two sets relabels the members of the one with the
+// larger label. Any number of threads may do this at once.
+static FORCE_INLINE void link_aliases(u32 p, u32 a, u32 b) {
+  constexpr u64 N1 = 0x1111111111ULL, N7 = 0x7777777777ULL, N8 = 0x8888888888ULL;
+  std::atomic<u64>& word = g_acc[p];
+  u64 cur = word.load(std::memory_order_relaxed);
+  for (;;) {
+    u64 nw = cur;
+    if (!((nw >> (ACC_MSH + a)) & 1)) nw |= (1ULL << (ACC_MSH + a)) | ((u64)a << (4 * a));  // a set of its own
+    if (!((nw >> (ACC_MSH + b)) & 1)) nw |= (1ULL << (ACC_MSH + b)) | ((u64)b << (4 * b));
+    const u32 la = (u32)(nw >> (4 * a)) & 15, lb = (u32)(nw >> (4 * b)) & 15;
+    if (la != lb) {
+      const u64 lo = la < lb ? la : lb, hi = la < lb ? lb : la;
+      const u64 t = (nw & ACC_LAB) ^ (hi * N1);    // a zero nibble where the label is hi (hi > 0: no unused nibble)
+      const u64 z = ~(((t & N7) + N7) | t) & N8;   // the top bit of those nibbles
+      const u64 m = z >> 3;
+      nw = (nw & ~(m * 15)) | (m * lo);
+    }
+    if (nw == cur) return;
+    if (word.compare_exchange_weak(cur, nw, std::memory_order_relaxed)) return;
+  }
+}
+
+// The user number (person index << 9 | alias) of the ID of len bytes at s, or NONE if it is not a regular
+// user ID: 'u', then 1 to 8 base-36 digits without a leading zero, a number below 2^40 whose index is in range.
+// (The same conditions as in the event and click parsers.)
+static inline u32 reg_user(const u8* s, u32 len) {
+  if (len < 2 || len > 9 || s[0] != 'u') return NONE;
+  const u64 v = b36_scalar(s + 1, len - 1);
+  if (v == NOT36) return NONE;
+  const u64 num = unscramble(v, g_ukey);
   return (num >> 9) < g_nu_cap ? (u32)num : NONE;
 }
 
-// Called by the link phase for every linked ID: x and r are the user numbers (or NONE) of the ID and of the
-// name of its set. (An ID is the name of its set exactly when the two are equal.)
-static FORCE_INLINE void link_member_num(u32 x, u32 r) {
-  if (__builtin_expect(x != NONE && r != NONE && (x >> 9) == (r >> 9), 1)) {
-    const u64 a = x & 511;
-    g_acc[x >> 9].fetch_add(1 | (a << 10) | ((u64)(x == r) << 28) | (a == 0 ? ACC_HAS0 : 0), std::memory_order_relaxed);
+static inline u64 person_of(u64 h) { return g_H ? h_lookup(h) : h; }
+
+// ------------------------------------------------------------------------------------------
+// links
+//
+// The link phase of the dense path. A line whose two IDs are regular IDs of one person index, with aliases
+// below KA, is recorded in that index's word (link_aliases) and nowhere else. Any other line is kept for the
+// general link table H, and the indexes of its regular IDs are poisoned. When all lines are read, the words
+// are classified (dense_cnt), the links inside the words that the general pipeline can be asked about are
+// added to the kept lines, and H is built from those alone: thousands of IDs instead of millions.
+
+using LinkList = std::vector<std::array<u64, 2>>;  // links for H: the hashes of the two IDs
+
+// reg_user of the two IDs of a link line, both at once when they have the usual shape (8 readable bytes after
+// the first byte of each are needed, as everywhere).
+static FORCE_INLINE void reg_user_pair(const u8* a, u32 la, const u8* b, u32 lb, const u64 ukey, const u32 nu, u32& x, u32& y) {
+  if (__builtin_expect((la - 2 <= 7) & (lb - 2 <= 7) & (a[0] == 'u') & (b[0] == 'u'), 1)) {
+    u64 va, vb;
+    const u32 ok = b36_pair(a + 1, la - 1, b + 1, lb - 1, va, vb);
+    const u64 na = unscramble(va, ukey), nb = unscramble(vb, ukey);
+    x = (((ok & 0xFF) == 0xFF) & !((a[1] == '0') & (la > 2)) & (va <= M40) & ((na >> 9) < nu)) ? (u32)na : NONE;
+    y = (((ok >> 8) == 0xFF) & !((b[1] == '0') & (lb > 2)) & (vb <= M40) & ((nb >> 9) < nu)) ? (u32)nb : NONE;
   } else {
-    if (x != NONE) g_acc[x >> 9].fetch_or(ACC_POISON, std::memory_order_relaxed);
-    if (r != NONE) g_acc[r >> 9].fetch_or(ACC_POISON, std::memory_order_relaxed);
+    x = reg_user(a, la);
+    y = reg_user(b, lb);
   }
 }
-static inline void link_member(u64 hx, u64 hr) {
-  const u32 x = reg_user_of_hash(hx);
-  link_member_num(x, hx == hr ? x : reg_user_of_hash(hr));
+
+struct LkD {
+  static constexpr u32 CAP = 64;
+  alignas(32) u32 off[CAP][8];
+  alignas(32) u32 len[CAP][8];
+  u32 x[CAP], y[CAP];  // the user numbers of the two IDs, NONE if not regular
+};
+
+static NOINLINE void process_links_dense(LkD& B, const u32 n, const u8* const base, LinkList& keep) {
+  const u64 ukey = g_ukey;
+  const u32 nu = g_nu_cap;
+  for (u32 i = 0; i < n; i++) {
+    const u8* const a = base + B.off[i][0];
+    const u8* const b = base + B.off[i][1];
+    const u32 la = B.len[i][0], lb = B.len[i][1];
+    u32 x, y;
+    reg_user_pair(a, la, b, lb, ukey, nu, x, y);
+    B.x[i] = x;
+    B.y[i] = y;
+    __builtin_prefetch(&g_acc[x == NONE ? 0 : (x >> 9)], 1, 3);
+  }
+  for (u32 i = 0; i < n; i++) {
+    const u32 x = B.x[i], y = B.y[i];
+    if (__builtin_expect((x != NONE) & (y != NONE) & ((x >> 9) == (y >> 9)) & ((x & 511) < KA) & ((y & 511) < KA), 1)) {
+      link_aliases(x >> 9, x & 511, y & 511);
+    } else {
+      keep.push_back({hash_id(make_key(base + B.off[i][0], B.len[i][0])), hash_id(make_key(base + B.off[i][1], B.len[i][1]))});
+      if (x != NONE) g_acc[x >> 9].fetch_or(ACC_POISON, std::memory_order_relaxed);
+      if (y != NONE) g_acc[y >> 9].fetch_or(ACC_POISON, std::memory_order_relaxed);
+    }
+  }
 }
 
-static inline u64 person_of(u64 h) { return g_H ? h_lookup(h) : h; }
+static NOINLINE u64 parse_link_chunk_dense(const u8* begin, const u8* end, bool skip_header, LinkList& keep) {
+  LkD B;
+  u32 n = 0;
+  u64 nl = 0;
+  const u8* base = begin;
+  scan::scan_lines<2>(begin, end, skip_header, [&](const u8* sb, __m256i st, __m256i ln) __attribute__((always_inline)) {
+    _mm256_store_si256((__m256i*)B.off[n], st);
+    _mm256_store_si256((__m256i*)B.len[n], ln);
+    base = sb;
+    // a line with an empty ID links nothing: its slot is reused
+    n += (_mm256_movemask_epi8(_mm256_cmpeq_epi32(ln, _mm256_setzero_si256())) & 0xFF) == 0;
+    if (__builtin_expect(n == LkD::CAP, 0)) {
+      process_links_dense(B, n, sb, keep);
+      nl += n;
+      n = 0;
+    }
+  });
+  if (n) process_links_dense(B, n, base, keep);
+  return nl + n;
+}
+
+static void build_links_dense(std::vector<MFile>& files) {
+  std::vector<Chunk> chunks;
+  make_chunks(files, 1 << 18, chunks);
+  const int nchunks = (int)chunks.size();
+  std::vector<LinkList> keep(NT);  // per thread
+  std::vector<size_t> part(std::max(nchunks, 1), 0);
+  parallel_for(nchunks, [&](int t, int tid) {
+    const Chunk& c = chunks[t];
+    const MFile& f = files[c.file];
+    size_t b = line_start_at_or_after(f, c.nominal), e = line_start_at_or_after(f, c.nominal_end);
+    part[t] = b < e ? parse_link_chunk_dense(f.data + b, f.data + e, b == 0, keep[tid]) : 0;
+  });
+  size_t nlinks = 0, nkept = 0;
+  for (size_t c : part) nlinks += c;
+  for (auto& k : keep) nkept += k.size();
+  // Classify the words. An index has a dense person of n aliases if it is not poisoned and either alias 0 is
+  // in no link (n = 1), or all linked aliases are in one set (every label is 0, the smallest alias) and they
+  // are exactly the aliases 0..n-1. Whatever links a word holds beside its dense person, or without one, go
+  // to H: each member of a set with the set's smallest alias.
+  const u32 nu = g_nu_cap;
+  const int ntask = (int)std::max<u32>(1, std::min<u32>(nu >> 13, 512));
+  std::vector<size_t> ndense(NT, 0);
+  parallel_for(ntask, [&](int t, int tid) {
+    const u32 pa = (u32)((u64)nu * t / ntask), pb = (u32)((u64)nu * (t + 1) / ntask);
+    LinkList& out = keep[tid];
+    const u64 ukey = g_ukey;
+    size_t nd = 0;
+    for (u32 p = pa; p < pb; p++) {
+      const u64 w = g_acc[p].load(std::memory_order_relaxed);
+      if (w == 0) continue;
+      const u32 mask = (u32)(w >> ACC_MSH) & ((1u << KA) - 1);
+      bool general = (i64)w < 0;
+      u32 cnt = 1;
+      if (!general && (mask & 1)) {
+        if ((w & ACC_LAB) == 0 && (mask & (mask + 1)) == 0)
+          cnt = (u32)_mm_popcnt_u32(mask);
+        else
+          general = true;
+      }
+      if (general || !(mask & 1)) {
+        for (u32 m = mask; m; m = _blsr_u32(m)) {
+          const u32 al = (u32)_tzcnt_u32(m), lab = (u32)(w >> (4 * al)) & 15;
+          if (lab != al)
+            out.push_back({hash_id(id_key('u', scramble(((u64)p << 9) | al, ukey))), hash_id(id_key('u', scramble(((u64)p << 9) | lab, ukey)))});
+        }
+      }
+      nd += !general && cnt > 1;
+      g_acc[p].store(general ? ACC_POISON : ((w & ~ACC_POISON) | ((u64)cnt << ACC_NSH)), std::memory_order_relaxed);
+    }
+    ndense[tid] += nd;
+  });
+  size_t npairs = 0, nlinked = 0;
+  for (auto& k : keep) npairs += k.size();
+  for (size_t c : ndense) nlinked += c;
+  // H from the kept links: at most two new IDs per link
+  g_Hbits = std::max<u32>(10, ceil_log2(npairs * 2 + 2));
+  g_H = (HSlot*)vm_alloc(sizeof(HSlot) << g_Hbits);
+  {
+    const u32 hshift = 64 - g_Hbits;
+    const u64 hmask = (1ULL << g_Hbits) - 1;
+    parallel_for(NT, [&](int t, int) {
+      for (const auto& pr : keep[t]) uf_unite(h_slot_for(pr[0], hmask, hshift), h_slot_for(pr[1], hmask, hshift));
+    });
+  }
+  LOG("links (dense): %zu lines, %zu do not fit a word, %zu links to the general table, %zu indexes with linked aliases only",
+      nlinks, nkept, npairs, nlinked);
+  finish_links(nlinks);
+}
 
 // Events and clicks of dense persons that are not in the partitions: events whose event_id is not regular,
 // clicks whose click_id is not. Built after the parse, read-only afterwards.
@@ -947,26 +1100,28 @@ static void resolve_special() {
 struct DS {
   D16* T = nullptr;
   std::vector<std::pair<const D16*, u32>> blk;
-  // the open person (as in the general person phase)
-  std::vector<u32> cov, sstart, dstart, dsess, dev, days;
-  std::vector<i64> drev, catsum;
-  struct Purch {
-    u32 day, cat;
+  // the open person: its sessions so far
+  std::vector<u32> sess_ts;  // the time of each session's first event
+  std::vector<u32> sess_ev;  // how many events the person had before it
+  struct Pur {
+    u32 sess, cat, price;
   };
-  std::vector<Purch> purch;
-  std::vector<u32> tin, sts, scamp;
+  std::vector<Pur> pur;     // its purchases, in event order
+  std::vector<i64> catsum;  // per category: revenue in the row being built
+  std::vector<u32> tcat;    // the categories that have some
+  std::vector<u32> rowstart, rowday;  // per row of the person: its first session, its day
+  std::vector<u32> cov;               // (many clicks) per campaign: sessions below this index are counted
+  std::vector<u32> tin, sts, scamp;   // (many clicks) the clicks in time order
   std::vector<u64> sclick, rtmp;
-  std::vector<u32> pts, pcamp;  // the person's clicks before they are put in time order
+  std::vector<u32> pts, pcamp;  // the person's clicks as they come
   std::vector<u64> pclick;
-  std::vector<u64> xq;  // the person's extra events in time order
+  std::vector<u64> xq;     // the person's extra events in time order
   std::vector<u32> stamp;  // per campaign: the last session (by tag) it was counted as an assist for
   u32 tag = 0;
   // the click partition at hand, grouped by person index
   u32 cp = NONE;
   std::vector<u32> coff, cpos, Cts, Ccamp, Cnum;
   std::vector<u64> Cclick;
-  // counters
-  u64 n_persons = 0, n_events = 0, n_general = 0;
 };
 
 static std::atomic<u8>* g_ck_emitted = nullptr;
@@ -1099,6 +1254,18 @@ static NOINLINE void load_clicks(DS& S, u32 cp, WCScatter<R2C>::Cursor& c2c, u32
   }
 }
 
+// The lanes of eight times that lie in [lo, hi].
+static FORCE_INLINE u32 inwin8(const u32* t, u32 lo, u32 hi) {
+  const __m256i v = _mm256_loadu_si256((const __m256i*)t);
+  const __m256i vlo = _mm256_set1_epi32((int)lo), vhi = _mm256_set1_epi32((int)hi);
+#if defined(__AVX512VL__) && defined(__AVX512F__)
+  return (u32)(_mm256_cmp_epu32_mask(v, vlo, _MM_CMPINT_NLT) & _mm256_cmp_epu32_mask(v, vhi, _MM_CMPINT_LE));
+#else
+  const __m256i in = _mm256_and_si256(_mm256_cmpeq_epi32(_mm256_max_epu32(v, vlo), v), _mm256_cmpeq_epi32(_mm256_min_epu32(v, vhi), v));
+  return (u32)_mm256_movemask_ps(_mm256_castsi256_ps(in));
+#endif
+}
+
 struct SegStat {
   u64 n_persons = 0, n_events = 0, n_general = 0;
 };
@@ -1106,6 +1273,11 @@ struct SegStat {
 // Partitions [pb, pe): a thread's share of the scan. The first dense person met may have begun before pb:
 // its events here are left to the thread that scans the partitions before (it reads on past its own share
 // until that person ends), just as this thread reads on past pe for its last person.
+//
+// A person's events arrive in time order, one after the other. Each one costs a few instructions without a
+// branch that depends on the data: it is counted, and it starts a session if it comes more than 30 minutes
+// after the one before. Everything else is done per person once all its events are in: its sessions' days,
+// revenue, credited campaign and assists, and its rows.
 static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegStat& st) {
   TL& tl = g_tl[tid];
   const u32 NC = g_ncamp, ND = (u32)g_ndays, ORG = NC;
@@ -1114,230 +1286,113 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
   const size_t NC1 = (size_t)NC + 1;
   const u32 p2shift = 64 - g_P2bits;
   const u64 ws_off = (u64)(g_ws - g_day0 * DAY);  // ms from the start of day 0 to the window start
+  const u32 SCAP = NB + 16;  // sessions a person can have (their starts are more than 30 minutes apart), and some
   if (!S.T) {
     S.T = (D16*)aligned_alloc(64, sizeof(D16) * ESLOTS);
     memset(S.T, 0, sizeof(D16) * ESLOTS);
+    S.sess_ts.assign((size_t)SCAP + 16, 0);
+    S.sess_ev.assign((size_t)SCAP + 16, 0);
+    S.catsum.assign(NCAT, 0);
+    S.tcat.assign(NCAT + 1, 0);
+    S.rowstart.assign((size_t)ND + 2, 0);
+    S.rowday.assign((size_t)ND + 2, 0);
     S.cov.assign(NC + 1, 0);
-    S.sstart.assign((size_t)NB + 16, 0);
-    S.dstart.assign((size_t)ND + 2, 0);
-    S.dsess.assign(ND, 0);
-    S.dev.assign(ND, 0);
-    S.drev.assign(ND, 0);
-    S.catsum.assign((size_t)ND * NCAT, 0);
     S.stamp.assign(NC + 1, 0);
   }
   D16* const T = S.T;
   u32* const stamp = S.stamp.data();
   u32 tag = S.tag;
-  bool by_session = true;  // the open person's assists are counted session by session (few clicks)
   auto c2 = tl.r2.cursor(tl.arena);
   auto c2c = tl.r2c.cursor(tl.arena);
   CStat* const c_stat = tl.c_stat.data();
   u32* const c_assist = tl.c_assist.data();
-  u32* const dsess = S.dsess.data();
-  u32* const dev = S.dev.data();
-  i64* const drev = S.drev.data();
   i64* const catsum = S.catsum.data();
-  u32* const cov = S.cov.data();
-  u32* const sstart = S.sstart.data();
-  u32* const dstart = S.dstart.data();
+  u32* const tcat = S.tcat.data();
+  u32* const sess_ts = S.sess_ts.data();
+  u32* const sess_ev = S.sess_ev.data();
   OutCols& out = tl.out;
   const std::atomic<u64>* const acc = g_acc;
   const u64 ukey = g_ukey;
 
-  // ---- the open person
-  u32 cur_p = NONE, cur_cnt = 0;
-  u32 mc = 0, nv = 0;  // its clicks (in S.sts / S.scamp / S.sclick, in time order)
-  u32 ns = 0, hi = 0;  // its sessions so far; (for a long click list: the clicks up to the current session start)
-  i64 s_max = INT64_MIN / 4, s_rev = 0;  // the open session: its last event so far, ...
-  u32 s_start = 0, s_nev = 0, s_day = 0;
-  u32 x_next = NONE;  // time of the person's next extra event
-  size_t x_i = 0;
+  // ---- the open person. This state is read and written by the rare paths below; the loops over the slots
+  // work on copies in plain locals (which the compiler then keeps in registers) and exchange them with it
+  // around every call of a rare path.
+  struct PS {
+    u32 cur_p = NONE, cur_cnt = 0, cur_base = 0;  // its IDs are the user numbers cur_base .. cur_base + cur_cnt - 1
+    u32 ns = 0, nev = 0;                          // its sessions and events so far
+    i64 prev = INT64_MIN / 4;                     // the time of its last event
+    i64 order = 0;                                // negative once an event has come before its predecessor
+    u32 x_next = NONE;                            // time of the person's next extra event
+    size_t x_i = 0;
+  } ps;
   u64 n_persons = 0, n_events = 0, n_general = 0;
-
-  auto close_session = [&]() {
-    const u32* const sts = S.sts.data();
-    u32 credit = ORG;
-    if (mc) {
-      const u32 upper = s_start + (u32)WEEK;
-      if (mc <= 32)
-        hi = count_le(sts, nv, upper);
-      else
-        while (hi < mc && sts[hi] <= upper) hi++;
-      if (hi > 0 && sts[hi - 1] >= s_start) {
-        u32 bi = hi - 1;
-        const u32 tsmax = sts[bi];
-        for (u32 q = bi; q > 0 && sts[q - 1] == tsmax;) {
-          q--;
-          if (click_less(S.sclick[q], S.sclick[bi])) bi = q;
-        }
-        credit = S.scamp[bi];
-      }
-      // Assists: every campaign with a click in the 7 days up to the start, once. With few clicks, here and
-      // now: the clicks of that week are the ones just below `hi`.
-      if (by_session) {
-        u32* const arow = c_assist + (size_t)s_day * NC1;
-        tag++;
-        for (u32 k = hi; k > 0 && sts[k - 1] >= s_start;) {
-          k--;
-          const u32 c = S.scamp[k];
-          arow[c] += stamp[c] != tag;
-          stamp[c] = tag;
-        }
-      }
-    }
-    CStat& cs = c_stat[(size_t)s_day * NC1 + credit];
-    cs.sess++;
-    cs.purch += (s_rev > 0);
-    cs.rev += s_rev;
-    if (dsess[s_day]++ == 0) {
-      dstart[S.days.size()] = ns;
-      S.days.push_back(s_day);
-    }
-    sstart[ns++] = s_start;
-    dev[s_day] += s_nev;
-    drev[s_day] += s_rev;
-  };
-  // An event of the open person; they come in time order.
-  auto feed = [&](const u32 ts, const u32 cat, const u32 price) __attribute__((always_inline)) {  // price 0: no purchase
-    const i64 gap = (i64)ts - s_max;
-    if (gap > MIN30) {
-      if (s_nev) close_session();
-      s_start = ts;
-      s_nev = 0;
-      s_rev = 0;
-      s_day = (u32)((ws_off + ts) / (u64)DAY);
-    } else if (__builtin_expect(gap < 0, 0)) {
-      fail("a person's events are not in time order");
-    }
-    s_max = ts;
-    s_nev++;
-    if (price) {
-      s_rev += price;
-      catsum[(size_t)s_day * NCAT + cat] += price;
-      S.purch.push_back(DS::Purch{s_day, cat});
-    }
-  };
-  auto feed_extras = [&](const u32 upto) {  // the extra events up to a time
-    while (x_i < S.xq.size() && (u32)S.xq[x_i] <= upto) {
-      const u64 e = S.xq[x_i++];
-      const u32 pl = (u32)(e >> 32);
-      feed((u32)e, pl >> 24, pl & 0xFFFFFF);
-      n_events++;
-    }
-    x_next = x_i < S.xq.size() ? (u32)S.xq[x_i] : NONE;
-  };
-  auto close_person = [&]() {
-    if (cur_p == NONE) return;
-    if (x_next != NONE) feed_extras(NONE - 1);
-    if (s_nev) close_session();
-    const u32* const sts = S.sts.data();
-    const u32* const scamp = S.scamp.data();
-    // assists of a person with many clicks: click by click, as in the general person phase
-    if (mc && !by_session) {
-      const u32 ndays = (u32)S.days.size();
-      dstart[ndays] = ns;
-      _mm256_storeu_si256((__m256i*)(sstart + ns), _mm256_set1_epi32(-1));
-      const u32 nsv = (ns + 7) / 8;
-      u32* rows[64];
-      for (u32 j = 0; j < ndays; j++) rows[j] = c_assist + (size_t)S.days[j] * NC1;
-      u32 a = 0, b = 0;
-      for (u32 k = 0; k < mc; k++) {
-        const u32 t = sts[k], c = scamp[k];
-        if (ns <= 32) {
-          b = count_le(sstart, nsv, t);
-          a = t > (u32)WEEK ? count_le(sstart, nsv, t - (u32)WEEK - 1) : 0;
-        } else {
-          while (b < ns && sstart[b] <= t) b++;
-          while (a < b && (u64)sstart[a] + (u64)WEEK < t) a++;
-        }
-        const u32 x = std::max(a, cov[c]);
-        cov[c] = std::max(cov[c], b);
-        if (x < b) {  // sessions [x, b) are new for this campaign: count them on their days
-          u32 j = 0;
-          while (dstart[j + 1] <= x) j++;
-          for (; j < ndays && dstart[j] < b; j++) rows[j][c] += std::min(b, dstart[j + 1]) - std::max(x, dstart[j]);
-        }
-      }
-      for (u32 k = 0; k < mc; k++) cov[scamp[k]] = 0;
-    }
-    // rows: the name is the smallest of the person's IDs
-    const u32 nd = (u32)S.days.size();
-    if (nd) {
-      u64 pkey = id_key('u', scramble((u64)cur_p << 9, ukey));
-      for (u32 a = 1; a < cur_cnt; a++) pkey = std::min(pkey, id_key('u', scramble(((u64)cur_p << 9) | a, ukey)));
-      u8 kb[16];
-      const u32 klen = fast_key_bytes(pkey, kb + 4);
-      memcpy(kb, &klen, 4);
-      u8* ip = out.ids.reserve(16, tl.arena);
-      memcpy(ip, kb, 16);
-      out.ids.cur = ip + 4 + klen;
-      *out.runs.slot(tl.arena) = (u8)nd;
-      out.npersons++;
-      u8* const dayp = out.day.reserve(nd, tl.arena);
-      u8* const sessp = out.sess.reserve(nd, tl.arena);
-      u32* const evsp = out.evs.reserve(nd, tl.arena);
-      i64* const revp = out.rev.reserve(nd, tl.arena);
-      u8* const topp = out.top.reserve(nd, tl.arena);
-      for (u32 di = 0; di < nd; di++) {
-        const u32 d = S.days[di];
-        u16 top = 0xFFFF;
-        if (drev[d] > 0) {
-          i64 best = -1;
-          i64* cs = catsum + (size_t)d * NCAT;
-          for (const DS::Purch& q : S.purch) {
-            if (q.day != d) continue;
-            const i64 v = cs[q.cat];
-            if (v > best || (v == best && q.cat < top)) {
-              best = v;
-              top = (u16)q.cat;
-            }
-          }
-          for (const DS::Purch& q : S.purch)
-            if (q.day == d) cs[q.cat] = 0;
-        }
-        dayp[di] = (u8)d;
-        sessp[di] = (u8)dsess[d];
-        evsp[di] = dev[d];
-        out.max_sess = std::max(out.max_sess, dsess[d]);
-        out.max_evs = std::max(out.max_evs, dev[d]);
-        revp[di] = drev[d];
-        topp[di] = (u8)top;
-        dsess[d] = 0;
-        dev[d] = 0;
-        drev[d] = 0;
-      }
-      out.day.cur += nd;
-      out.sess.cur += nd;
-      out.evs.cur += nd;
-      out.rev.cur += nd;
-      out.top.cur += nd;
-      out.nrows += nd;
-    }
-    n_persons++;
-    cur_p = NONE;
-  };
   i64 prev_p = -1;  // the dense person before the open one
+
+  // An event of the open person, in terms of the state it touches. price 0: not a purchase.
+#define DN_FEED(NS, NEV, PREV, ORDER, ts, cat, price)                                   \
+  do {                                                                                  \
+    const i64 gap_ = (i64)(ts) - (PREV);                                                \
+    (ORDER) |= gap_;                                                                    \
+    sess_ts[NS] = (ts);                                                                 \
+    sess_ev[NS] = (NEV);                                                                \
+    (NS) += gap_ > MIN30;                                                               \
+    (NEV)++;                                                                            \
+    (PREV) = (ts);                                                                      \
+    if (__builtin_expect((price) != 0, 0)) S.pur.push_back(DS::Pur{(NS)-1, (cat), (price)}); \
+    if (__builtin_expect((NS) >= SCAP, 0)) { /* (cannot happen with events in time order) */ \
+      (ORDER) = -1;                                                                     \
+      (NS) = 1;                                                                         \
+    }                                                                                   \
+  } while (0)
+  auto feed_extras = [&](const u32 upto) {  // the extra events up to a time
+    while (ps.x_i < S.xq.size() && (u32)S.xq[ps.x_i] <= upto) {
+      const u64 e = S.xq[ps.x_i++];
+      const u32 pl = (u32)(e >> 32);
+      DN_FEED(ps.ns, ps.nev, ps.prev, ps.order, (u32)e, pl >> 24, pl & 0xFFFFFF);
+    }
+    ps.x_next = ps.x_i < S.xq.size() ? (u32)S.xq[ps.x_i] : NONE;
+  };
   auto open_person = [&](const u32 p, const u32 cnt, const u64 ac) {
     if (__builtin_expect((i64)p <= prev_p, 0)) fail("persons are not in index order");
     prev_p = p;
-    cur_p = p;
-    cur_cnt = cnt;
-    ns = 0;
-    hi = 0;
-    s_max = INT64_MIN / 4;
-    s_nev = 0;
-    s_rev = 0;
-    S.days.clear();
-    S.purch.clear();
-    // its clicks: those of its click partition whose alias is one of its own
+    ps.cur_p = p;
+    ps.cur_cnt = cnt;
+    ps.cur_base = p << 9;
+    ps.ns = 0;
+    ps.nev = 0;
+    ps.prev = INT64_MIN / 4;
+    ps.order = 0;
+    S.pur.clear();
+    ps.x_next = NONE;
+    ps.x_i = 0;
+    if (__builtin_expect((ac & ACC_EXTRA) != 0, 0)) {
+      S.xq = g_extra.find(p)->second.ev;
+      if (!S.xq.empty()) ps.x_next = (u32)S.xq[0];
+    }
+  };
+  // All events of the open person are in: its sessions, its rows.
+  auto close_person = [&]() {
+    if (ps.cur_p == NONE) return;
+    if (ps.x_next != NONE) feed_extras(NONE - 1);
+    const u32 p = ps.cur_p, cnt = ps.cur_cnt, ns = ps.ns;
+    ps.cur_p = NONE;
+    ps.cur_cnt = 0;
+    ps.cur_base = 0;
+    if (__builtin_expect(ps.order < 0, 0)) {  // (the whole attempt is dropped; nothing more is done with this person)
+      fail("a person's events are not in time order");
+      return;
+    }
+    sess_ev[ns] = ps.nev;
+    n_events += ps.nev;
+    n_persons++;
+    // ---- its clicks: those of its click partition whose alias is one of its own
     const u32 cp = p >> KC;
     if (__builtin_expect(cp != S.cp, 0)) load_clicks(S, cp, c2c, p2shift);
     const u32 c0 = S.coff[p & ((1u << KC) - 1)], c1 = S.coff[(p & ((1u << KC) - 1)) + 1];
     const Extra* ex = nullptr;
-    if (__builtin_expect((ac & ACC_EXTRA) != 0, 0)) ex = &g_extra.find(p)->second;
+    if (__builtin_expect((acc[p].load(std::memory_order_relaxed) & ACC_EXTRA) != 0, 0)) ex = &g_extra.find(p)->second;
     const size_t cap = (size_t)(c1 - c0) + (ex ? ex->ck.size() : 0) + 16;
-    if (S.pts.size() < cap) {
+    if (__builtin_expect(S.pts.size() < cap, 0)) {
       S.pts.resize(cap);
       S.pcamp.resize(cap);
       S.pclick.resize(cap);
@@ -1346,32 +1401,181 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
       S.scamp.resize(cap);
       S.sclick.resize(cap);
     }
-    u32 m = 0;
-    for (u32 q = c0; q < c1; q++) {
-      S.pts[m] = S.Cts[q];
-      S.pcamp[m] = S.Ccamp[q];
-      S.pclick[m] = S.Cclick[q];
-      m += (S.Cnum[q] & 511) < cnt;
-    }
-    x_next = NONE;
-    x_i = 0;
-    S.xq.clear();
-    if (ex) {
-      for (auto& c : ex->ck) {
-        S.pts[m] = (u32)c[0];
-        S.pcamp[m] = (u32)(c[0] >> 32);
-        S.pclick[m] = CLICK_IS_KEY | c[1];
-        m++;
+    u32 mc = 0;
+    {
+      u32* const pts = S.pts.data();
+      u32* const pcamp = S.pcamp.data();
+      u64* const pclick = S.pclick.data();
+      for (u32 q = c0; q < c1; q++) {
+        pts[mc] = S.Cts[q];
+        pcamp[mc] = S.Ccamp[q];
+        pclick[mc] = S.Cclick[q];
+        mc += (S.Cnum[q] & 511) < cnt;
       }
-      S.xq = ex->ev;
-      if (!S.xq.empty()) x_next = (u32)S.xq[0];
+      if (ex)
+        for (auto& c : ex->ck) {
+          pts[mc] = (u32)c[0];
+          pcamp[mc] = (u32)(c[0] >> 32);
+          pclick[mc] = CLICK_IS_KEY | c[1];
+          mc++;
+        }
+      _mm256_storeu_si256((__m256i*)(pts + mc), _mm256_set1_epi32(-1));  // (no window reaches these)
     }
-    mc = m;
-    nv = (mc + 7) / 8;
-    by_session = mc <= 64;
-    if (mc)
+    // With many clicks they are put in time order, and assists are counted click by click afterwards (as in
+    // the general person phase); with few, every session looks at all of them.
+    const bool many = mc > 64;
+    if (many)
       sort_person_clicks(S.pts.data(), S.pcamp.data(), S.pclick.data(), mc, S.tin.data(), S.sts.data(), S.scamp.data(),
                          S.sclick.data(), S.rtmp);
+    const u32* const cts = many ? S.sts.data() : S.pts.data();
+    const u32* const ccamp = many ? S.scamp.data() : S.pcamp.data();
+    const u64* const cclk = many ? S.sclick.data() : S.pclick.data();
+    const u32 nv = (mc + 7) / 8;
+    // ---- sessions, in time order; a row per day that has one
+    u8* const dayp = out.day.reserve(ND, tl.arena);
+    u8* const sessp = out.sess.reserve(ND, tl.arena);
+    u32* const evsp = out.evs.reserve(ND, tl.arena);
+    i64* const revp = out.rev.reserve(ND, tl.arena);
+    u8* const topp = out.top.reserve(ND, tl.arena);
+    u32* const rowstart = S.rowstart.data();
+    u32* const rowday = S.rowday.data();
+    u32 nrow = 0, ntc = 0;
+    u32 r_day = NONE, r_sess = 0, r_ev = 0;
+    i64 r_rev = 0;
+    auto flush_row = [&]() {
+      u32 top = 0xFF;  // none
+      if (ntc) {
+        i64 best = -1;
+        for (u32 k = 0; k < ntc; k++) {
+          const u32 c = tcat[k];
+          const i64 v = catsum[c];
+          if (v > best || (v == best && c < top)) {
+            best = v;
+            top = c;
+          }
+          catsum[c] = 0;
+        }
+        ntc = 0;
+      }
+      dayp[nrow] = (u8)r_day;
+      sessp[nrow] = (u8)r_sess;
+      evsp[nrow] = r_ev;
+      revp[nrow] = r_rev;
+      topp[nrow] = (u8)top;
+      out.max_sess = std::max(out.max_sess, r_sess);
+      out.max_evs = std::max(out.max_evs, r_ev);
+      nrow++;
+    };
+    const DS::Pur* pu = S.pur.data();
+    const DS::Pur* const pue = pu + S.pur.size();
+    u32 hi = 0;  // (many clicks) the clicks up to the session start
+    for (u32 j = 0; j < ns; j++) {
+      const u32 s_start = sess_ts[j], s_nev = sess_ev[j + 1] - sess_ev[j];
+      const u32 s_day = (u32)((ws_off + s_start) / (u64)DAY);
+      if (s_day != r_day) {
+        if (r_day != NONE) flush_row();
+        r_day = s_day;
+        r_sess = 0;
+        r_ev = 0;
+        r_rev = 0;
+        rowstart[nrow] = j;
+        rowday[nrow] = s_day;
+      }
+      i64 s_rev = 0;
+      for (; pu != pue && pu->sess == j; pu++) {
+        s_rev += pu->price;
+        if (catsum[pu->cat] == 0) tcat[ntc++] = pu->cat;
+        catsum[pu->cat] += pu->price;
+      }
+      // credit: the latest click in the 7 days up to the session start, the smallest click_id among equal
+      // times (click times count from 7 days before the window, session times from the window start).
+      // Assists: every campaign with a click in those 7 days, once.
+      u32 credit = ORG;
+      if (mc) {
+        const u32 upper = s_start + (u32)WEEK;
+        if (!many) {
+          u32* const arow = c_assist + (size_t)s_day * NC1;
+          tag++;
+          u64 best = 0;  // time + 1 of the latest click so far
+          u32 bk = 0;
+          for (u32 v = 0; v < nv; v++)
+            for (u32 m = inwin8(cts + 8 * v, s_start, upper); m; m = _blsr_u32(m)) {
+              const u32 k = 8 * v + (u32)_tzcnt_u32(m);
+              const u32 c = ccamp[k];
+              const u64 t1 = (u64)cts[k] + 1;
+              arow[c] += stamp[c] != tag;
+              stamp[c] = tag;
+              if (__builtin_expect(t1 == best, 0)) {
+                if (click_less(cclk[k], cclk[bk])) bk = k;
+              } else {  // (a later click replaces the best one; spelled with masks so that it is not a branch)
+                const u32 mk = 0u - (u32)(t1 > best);
+                bk = (bk & ~mk) | (k & mk);
+                best = t1 > best ? t1 : best;
+              }
+            }
+          if (best) credit = ccamp[bk];
+        } else {
+          while (hi < mc && cts[hi] <= upper) hi++;
+          if (hi > 0 && cts[hi - 1] >= s_start) {
+            u32 bi = hi - 1;
+            const u32 tsmax = cts[bi];
+            for (u32 q = bi; q > 0 && cts[q - 1] == tsmax;) {
+              q--;
+              if (click_less(cclk[q], cclk[bi])) bi = q;
+            }
+            credit = ccamp[bi];
+          }
+        }
+      }
+      CStat& cs = c_stat[(size_t)s_day * NC1 + credit];
+      cs.sess++;
+      cs.purch += (s_rev > 0);
+      cs.rev += s_rev;
+      r_sess++;
+      r_ev += s_nev;
+      r_rev += s_rev;
+    }
+    flush_row();
+    if (many) {
+      // A click assists the sessions that start in the 7 days after it: a run [a, b) of the person's
+      // sessions. Going through the clicks in time order, the runs of one campaign only move forward, so the
+      // part of a run that an earlier click of the campaign has not covered is [max(a, cov), b).
+      u32* const cov = S.cov.data();
+      rowstart[nrow] = ns;
+      u32* rows[64];
+      for (u32 j = 0; j < nrow; j++) rows[j] = c_assist + (size_t)rowday[j] * NC1;
+      u32 a = 0, b = 0;
+      for (u32 k = 0; k < mc; k++) {
+        const u32 t = cts[k], c = ccamp[k];
+        while (b < ns && sess_ts[b] <= t) b++;
+        while (a < b && (u64)sess_ts[a] + (u64)WEEK < t) a++;
+        const u32 x = std::max(a, cov[c]);
+        cov[c] = std::max(cov[c], b);
+        if (x < b) {
+          u32 j = 0;
+          while (rowstart[j + 1] <= x) j++;
+          for (; j < nrow && rowstart[j] < b; j++) rows[j][c] += std::min(b, rowstart[j + 1]) - std::max(x, rowstart[j]);
+        }
+      }
+      for (u32 k = 0; k < mc; k++) cov[ccamp[k]] = 0;
+    }
+    // ---- its rows: the name is the smallest of the person's IDs
+    u64 pkey = id_key('u', scramble((u64)p << 9, ukey));
+    for (u32 a = 1; a < cnt; a++) pkey = std::min(pkey, id_key('u', scramble(((u64)p << 9) | a, ukey)));
+    u8 kb[16];
+    const u32 klen = fast_key_bytes(pkey, kb + 4);
+    memcpy(kb, &klen, 4);
+    u8* ip = out.ids.reserve(16, tl.arena);
+    memcpy(ip, kb, 16);
+    out.ids.cur = ip + 4 + klen;
+    *out.runs.slot(tl.arena) = (u8)nrow;
+    out.npersons++;
+    out.day.cur += nrow;
+    out.sess.cur += nrow;
+    out.evs.cur += nrow;
+    out.rev.cur += nrow;
+    out.top.cur += nrow;
+    out.nrows += nrow;
   };
   u32 last_un = NONE;  // (the general person of the last such user, kept for runs of the same one)
   u64 last_ph = 0;
@@ -1385,9 +1589,36 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
   };
 
   // ---- this thread's partitions
-  u32 q_skip = pb ? find_prev_person(pb, S) : NONE;  // the events of this person at the start are not ours
+  const u32 q_skip = pb ? find_prev_person(pb, S) : NONE;  // the events of this person at the start are not ours
   if (q_skip != NONE) prev_p = q_skip;
   bool skipping = q_skip != NONE;
+  // An event that is not of the open person's IDs: of another dense person (which becomes the open one: true),
+  // or of none (false; it goes to the general phase unless it is the previous thread's to deal with).
+  auto other = [&](const u32 un, const u32 ts, const u32 cat, const u32 price) -> bool {
+    const u32 p = un >> 9, a = un & 511;
+    if (p == ps.cur_p) {
+      emit_general(un, ts, cat, price);
+      return false;
+    }
+    const u64 ac = acc[p].load(std::memory_order_relaxed);
+    const u32 cnt = dense_cnt(ac);
+    if (a >= cnt) {
+      emit_general(un, ts, cat, price);
+      return false;
+    }
+    if (skipping) {
+      if (p == q_skip) return false;
+      skipping = false;
+    }
+    close_person();
+    open_person(p, cnt, ac);
+    return true;
+  };
+  // the open person's state in locals (see PS)
+  u32 h_base = ps.cur_base, h_cnt = ps.cur_cnt, h_ns = ps.ns, h_nev = ps.nev, h_xnext = ps.x_next;
+  i64 h_prev = ps.prev, h_order = ps.order;
+#define DN_OUT() (ps.ns = h_ns, ps.nev = h_nev, ps.prev = h_prev, ps.order = h_order)
+#define DN_IN() (h_base = ps.cur_base, h_cnt = ps.cur_cnt, h_ns = ps.ns, h_nev = ps.nev, h_xnext = ps.x_next, h_prev = ps.prev, h_order = ps.order)
   for (u32 j = pb; j < pe && !g_fail.load(std::memory_order_relaxed); j++) {
     if (!place(j, T, S)) continue;
     for (u32 i = 0; i < ESLOTS; i++) {
@@ -1395,7 +1626,7 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
       const u32 tsf = (u32)w0;
       if ((tsf & 0x7FFFFFFF) == 0) continue;  // no record, or an event that is not valid
       const u32 ts = (tsf & 0x7FFFFFFF) - 1;
-      u32 un = (u32)(w0 >> 32), cat, price;
+      u32 un = (u32)(w0 >> 32), cat = 0, price = 0;
       if (__builtin_expect((i32)tsf < 0, 0)) {  // a side entry
         const XEv& x = g_tl[un >> 24].xev[un & 0xFFFFFF];
         if (x.num == NONE) {
@@ -1408,35 +1639,28 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
         price = x.payload & 0xFFFFFF;
       } else {
         const u32 pay = (u32)(T[i].w1 >> 24) & 0x3FFFFF;
-        cat = pay >> 17;
-        price = pay & 0x1FFFF;
-      }
-      const u32 p = un >> 9, a = un & 511;
-      if (__builtin_expect(p != cur_p, 0)) {
-        const u64 ac = acc[p].load(std::memory_order_relaxed);
-        const u32 cnt = dense_cnt(ac);
-        if (a >= cnt) {
-          emit_general(un, ts, cat, price);
-          continue;
+        if (__builtin_expect(pay != 0, 0)) {
+          cat = pay >> 17;
+          price = pay & 0x1FFFF;
         }
-        if (skipping) {
-          if (p == q_skip) continue;
-          skipping = false;
-        }
-        close_person();
-        open_person(p, cnt, ac);
-      } else if (__builtin_expect(a >= cur_cnt, 0)) {
-        emit_general(un, ts, cat, price);
-        continue;
       }
-      if (__builtin_expect(ts >= x_next, 0)) feed_extras(ts);
-      feed(ts, cat, price);
-      n_events++;
+      if (__builtin_expect(un - h_base >= h_cnt, 0)) {  // not an ID of the open person
+        DN_OUT();
+        const bool mine = other(un, ts, cat, price);
+        DN_IN();
+        if (!mine) continue;
+      }
+      if (__builtin_expect(ts >= h_xnext, 0)) {
+        DN_OUT();
+        feed_extras(ts);
+        DN_IN();
+      }
+      DN_FEED(h_ns, h_nev, h_prev, h_order, ts, cat, price);
     }
     memset(T, 0, sizeof(D16) * ESLOTS);
   }
   // ---- the rest of the open person, in the partitions after ours
-  if (cur_p != NONE) {
+  if (ps.cur_p != NONE || h_cnt) {
     for (u32 j = pe; j < g_PE && !g_fail.load(std::memory_order_relaxed); j++) {
       if (!place(j, T, S)) continue;
       bool stop = false;
@@ -1445,7 +1669,7 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
         const u32 tsf = (u32)w0;
         if ((tsf & 0x7FFFFFFF) == 0) continue;
         const u32 ts = (tsf & 0x7FFFFFFF) - 1;
-        u32 un = (u32)(w0 >> 32), cat, price;
+        u32 un = (u32)(w0 >> 32), cat = 0, price = 0;
         if (__builtin_expect((i32)tsf < 0, 0)) {
           const XEv& x = g_tl[un >> 24].xev[un & 0xFFFFFF];
           if (x.num == NONE) continue;
@@ -1457,23 +1681,29 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
           cat = pay >> 17;
           price = pay & 0x1FFFF;
         }
-        const u32 p = un >> 9, a = un & 511;
-        if (p != cur_p) {
-          if (a < dense_cnt(acc[p].load(std::memory_order_relaxed))) {  // the next dense person: ours has ended
+        if (un - h_base >= h_cnt) {
+          const u32 p = un >> 9;
+          if (p != (h_base >> 9) && (un & 511) < dense_cnt(acc[p].load(std::memory_order_relaxed))) {  // the next dense person
             stop = true;
             break;
           }
           continue;
         }
-        if (a >= cur_cnt) continue;
-        if (__builtin_expect(ts >= x_next, 0)) feed_extras(ts);
-        feed(ts, cat, price);
-        n_events++;
+        if (__builtin_expect(ts >= h_xnext, 0)) {
+          DN_OUT();
+          feed_extras(ts);
+          DN_IN();
+        }
+        DN_FEED(h_ns, h_nev, h_prev, h_order, ts, cat, price);
       }
       memset(T, 0, sizeof(D16) * ESLOTS);
       if (stop) break;
     }
   }
+  DN_OUT();
+#undef DN_OUT
+#undef DN_IN
+#undef DN_FEED
   close_person();
   tl.r2.close(c2);
   tl.r2.flush(tl.arena);
@@ -1615,7 +1845,77 @@ static long selftest(Next&& next) {
     }
     n++;
   }
-  fprintf(stderr, "selftest ids: %ld cases, %ld mismatches\n", n, bad);
+  // links: the two IDs of a line at once against one at a time; the sets in a word against a plain union-find
+  {
+    const u64 key0 = g_ukey;
+    const u32 cap0 = g_nu_cap;
+    std::atomic<u64>* const acc0 = g_acc;
+    g_ukey = next() & M40;
+    g_nu_cap = 1u << 20;
+    for (int it = 0; it < 1000000; it++) {
+      u8 t[2][24];
+      u32 l[2];
+      for (int k = 0; k < 2; k++) {
+        memset(t[k], ',', 24);
+        const u32 mode = (u32)(next() % 8);
+        if (mode < 5) {  // a user ID as the generator writes it: an index in range, or any number
+          const u64 num = mode < 3 ? next() % ((u64)g_nu_cap << 10) : (next() & M40);
+          t[k][0] = 'u';
+          l[k] = 1 + b36_write(scramble(num, g_ukey), t[k] + 1);
+        } else {  // any text
+          l[k] = (u32)(next() % 12);
+          for (u32 j = 0; j < l[k]; j++)
+            t[k][j] = (j == 0 && next() % 4) ? (u8)'u' : (u8)(mode == 7 && next() % 5 == 0 ? odd[next() % 44] : alpha[next() % 36]);
+        }
+      }
+      u32 x, y;
+      reg_user_pair(t[0], l[0], t[1], l[1], g_ukey, g_nu_cap, x, y);
+      if (x != reg_user(t[0], l[0]) || y != reg_user(t[1], l[1])) {
+        if (bad < 10) fprintf(stderr, "LINK IDS MISMATCH '%.*s' '%.*s'\n", (int)l[0], t[0], (int)l[1], t[1]);
+        bad++;
+      }
+      n++;
+    }
+    std::atomic<u64> word[1];
+    g_acc = word;
+    for (int it = 0; it < 300000; it++) {
+      word[0].store(0);
+      u32 par[KA];
+      bool pres[KA];
+      for (u32 k = 0; k < KA; k++) {
+        par[k] = k;
+        pres[k] = false;
+      }
+      auto find = [&](u32 v) {
+        while (par[v] != v) v = par[v];
+        return v;
+      };
+      const u32 nl = (u32)(next() % 12), range = 1 + (u32)(next() % KA);
+      for (u32 j = 0; j < nl; j++) {
+        const u32 a = (u32)(next() % range), b = next() % 4 == 0 ? a : (u32)(next() % range);
+        link_aliases(0, a, b);
+        pres[a] = pres[b] = true;
+        par[find(a)] = find(b);
+      }
+      const u64 w = word[0].load();
+      for (u32 k = 0; k < KA; k++) {
+        u32 least = k;  // the smallest alias in k's set
+        for (u32 j = 0; j < k; j++)
+          if (pres[j] && find(j) == find(k)) {
+            least = j;
+            break;
+          }
+        const u32 lab = (u32)(w >> (4 * k)) & 15;
+        if ((((w >> (ACC_MSH + k)) & 1) != 0) != pres[k] || lab != (pres[k] ? least : 0)) bad++;
+      }
+      if (w >> (ACC_MSH + KA)) bad++;
+      n++;
+    }
+    g_ukey = key0;
+    g_nu_cap = cap0;
+    g_acc = acc0;
+  }
+  fprintf(stderr, "selftest ids and links: %ld cases, %ld mismatches\n", n, bad);
   return bad;
 }
 

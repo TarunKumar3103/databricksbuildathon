@@ -29,6 +29,7 @@ def main():
     builds = {}  # (hash, flags) -> binary name
     lines = []
     for raw in plan:
+        note = raw.split("#", 1)[1].strip() if "#" in raw else ""
         line = raw.split("#", 1)[0].split()
         if not line:
             continue
@@ -44,7 +45,7 @@ def main():
         key = (h, " ".join(flags))
         if key not in builds:
             builds[key] = f"ss-{h}" + (f"-f{len(builds)}" if flags else "")
-        lines.append((tag, builds[key], env, f"{h} {' '.join(flags)}".strip()))
+        lines.append((tag, builds[key], env, (f"{h} {' '.join(flags)}".strip() + (f": {note}" if note else ""))))
     with open("bench/variants.txt", "w") as f:
         f.write("# Written by bench/mkbench.py. tag, binary in /usr/local/bench, then ENV=VALUE settings.\n")
         f.write("# The first build also writes the dev output that the report rows are added to.\n")
@@ -61,7 +62,8 @@ def main():
         + "\n".join(compiles)
         + "\n    g++ -std=c++17 -O2 -march=cascadelake -static -pthread -o /out/bench bench/driver.cpp & pd=$!; \\\n"
         + f"    for p in {waits} $pd; do wait $p; done; \\\n"
-        + "    strip /out/*; \\\n    cp bench/generate bench/variants.txt /out/; \\\n    ls -la /out\n"
+        + "    strip /out/*; \\\n    cp bench/generate bench/variants.txt /out/; \\\n"
+        + "    if [ -d bench/prebuilt ]; then cp bench/prebuilt/* /out/; fi; \\\n    ls -la /out\n"
     )
     df2, n = re.subn(r"RUN set -e; mkdir -p /out;.*?ls -la /out\n", lambda m: new_run, df, flags=re.S)
     assert n == 1, "Dockerfile: the bench RUN step was not found"

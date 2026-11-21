@@ -1,9 +1,11 @@
-# The builds the bench times: tag, binary in /usr/local/bench, then optional ENV=VALUE settings.
+# Written by bench/mkbench.py. tag, binary in /usr/local/bench, then ENV=VALUE settings.
 # The first build also writes the dev output that the report rows are added to.
-a ss-77eeb25-f0                  # v4 77eeb25 with gcc 13, as its Dockerfile builds it (JCC padding)
-L ss-77eeb25-clang18-O2          # the same source, clang 18.1.3 -O2 -fno-vectorize -fno-slp-vectorize; built in chat C's sandbox, in bench/prebuilt
-M ss-77eeb25-clang18-O3          # the same at -O3
-K ss-77eeb25-clang-built         # clang 18 installed from Ubuntu's archive and run on the build machine; missing if that failed
-p ss-4f8cb95                     # v4 4f8cb95 with gcc 13, as in bench 1, to tie the two benches together
-t ss-77eeb25-f0 SS_THREADS=12    # build a with 12 threads on the 8 vCPUs
-d ss-77eeb25-f0 SS_NODROP=1      # build a without dropping parsed input pages
+e ss-e1eb3d1-f0   # e1eb3d1 -Wa,-mbranches-within-32B-boundaries: v4 head, new link phase (baseline)
+a ss-77eeb25-f1   # 77eeb25 -Wa,-mbranches-within-32B-boundaries: its parent
+k13 ss-f2023b5-f2   # f2023b5 -Wa,-mbranches-within-32B-boundaries: a-ke13: event partitions of 2^13 indexes
+k12 ss-ca31a92-f3   # ca31a92 -Wa,-mbranches-within-32B-boundaries: a-ke12: 2^12
+c10 ss-7deef7a-f4   # 7deef7a -Wa,-mbranches-within-32B-boundaries: a-kc10: click partitions of 2^10 persons
+c8 ss-d02bc98-f5   # d02bc98 -Wa,-mbranches-within-32B-boundaries: a-kc8: 2^8
+pin ss-f258112-f6   # f258112 -Wa,-mbranches-within-32B-boundaries: a-pin: workers pinned to CPUs
+L ss-e1eb3d1-clang18-O2   # e1eb3d1 with clang 18.1.3 -O2 -fno-vectorize -fno-slp-vectorize, built in chat C's sandbox (bench/prebuilt); = branch c-clang 3ecb331
+K ss-e1eb3d1-clang-built  # e1eb3d1 with clang 18 installed from Ubuntu's archive on the build machine, as c-clang's Dockerfile does; missing if that failed

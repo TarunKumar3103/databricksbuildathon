@@ -31,14 +31,14 @@ sha256 `179ace9bd7e60d7932672ddf7105b83c5a56a3fe121e1b8ffc3c63d1f4cede53`.
 
 Row `!1 20M` and row `!2 60M`, one entry per build in its `user_id`:
 
-`a=512/498,u2.91,s0.62,596M,f150k,d3` means median wall 512 ms and best 498 ms, median user CPU 2.91 s and
-system CPU 0.62 s, peak resident memory 596 MB, 150 thousand minor page faults, route `d` (dense; `g` general,
-`f` dense given up) over 3 good runs. `!2` after it would count failed runs. `rows=U/C` are the `user_daily`
+`a=512,u2.91,s0.62,596M,d3` means median wall 512 ms (bench 1 also gave the best, as `512/498`), median user CPU 2.91 s and
+system CPU 0.62 s, peak resident memory 596 MB, route `d` (dense; `g` general, `f` dense given up) over 3 good
+runs. (Bench 1 also printed minor page faults, as `f150k`.) `!2` after it would count failed runs. `rows=U/C` are the `user_daily`
 and `campaign_daily` row counts, the same for every run unless `DIFFER` follows.
 
-Its `top_category` holds the phase split of each build from `SS_LOG`: `a:480=19+260+150+3+8` is the
-in-process time in ms until the output is written, then user CPU ms of links, parse, dedup or scan, person
-phase and output. The `sessions`, `events` and `revenue_cents` columns repeat the median wall times of the
+Its `top_category` holds the phase split of each build from `SS_LOG`: `a:149+1514+805` is the user CPU in ms
+of links, parse, and dedup or scan, medians over the rounds. (Bench 1 printed `a:365=149+1514+805+6+14`: the
+in-process time until the output is written, then the means of all five phases.) The `sessions`, `events` and `revenue_cents` columns repeat the median wall times of the
 first three builds.
 
 The last row has the machine (`cpus`, kernel, free space on `/scratch`, cgroup `cpu.max/memory.max`, the dev
