@@ -40,6 +40,9 @@ using u64 = uint64_t;
 using i32 = int32_t;
 using i64 = int64_t;
 
+#define FORCE_INLINE inline __attribute__((always_inline))
+#define NOINLINE __attribute__((noinline))
+
 static constexpr i64 DAY = 86400000LL;
 static constexpr i64 MIN30 = 1800000LL;
 static constexpr i64 WEEK = 7 * DAY;
@@ -193,12 +196,17 @@ struct Stream {
 };
 
 // Hash-partitioned output with software write-combining: records for a partition are staged in a
-// 64-byte line and written with non-temporal stores when the line is full.
+// 64-byte line, and full lines go to the partition's block with non-temporal stores.
+//
+// "Is this line full now?" is a coin flip for a random partition, so a branch on it mispredicts on a large
+// share of pushes. Instead every push copies the line it touched to the tail of a small queue and advances
+// the queue only if the line became full; the queue is drained in a tight loop every QCAP lines.
 template <class T>
 struct WCScatter {
   static_assert(sizeof(T) == 16 || sizeof(T) == 32, "record size");
   static constexpr u32 PER = 64 / sizeof(T);
   static constexpr u32 BLK = (u32)(BLOCK_BYTES / sizeof(T));
+  static constexpr u32 QCAP = 32;
   struct Hot {
     T* cur;
     T* lim;
@@ -208,13 +216,19 @@ struct WCScatter {
   u8* stage = nullptr;
   u8* fill = nullptr;
   T** beg = nullptr;
+  u8* q = nullptr;    // QCAP full lines waiting for their non-temporal stores
+  u32* qp = nullptr;  // their partitions
+  u32 nq = 0;
   std::vector<std::vector<std::pair<T*, u32>>> blocks;
   void init(u32 parts) {
     P = parts;
     hot = (Hot*)calloc(P, sizeof(Hot));
     stage = (u8*)aligned_alloc(64, (size_t)64 * P);
+    memset(stage, 0, (size_t)64 * P);
     fill = (u8*)calloc(P, 1);
     beg = (T**)calloc(P, sizeof(T*));
+    q = (u8*)aligned_alloc(64, (size_t)64 * QCAP);
+    qp = (u32*)calloc(QCAP, sizeof(u32));
     blocks.assign(P, {});
   }
   void grow(u32 p, Arena& a) {
@@ -222,40 +236,100 @@ struct WCScatter {
     beg[p] = hot[p].cur = (T*)a.block();
     hot[p].lim = beg[p] + BLK;
   }
+  NOINLINE void drain(Arena& a) {
+    const u32 n = nq;
+    nq = 0;
+    for (u32 i = 0; i < n; i++) {
+      const u32 p = qp[i];
+      Hot& h = hot[p];
+      if (__builtin_expect(h.cur == h.lim, 0)) grow(p, a);
+      const __m256i* src = (const __m256i*)(q + (size_t)i * 64);
+      _mm256_stream_si256((__m256i*)h.cur, _mm256_load_si256(src));
+      _mm256_stream_si256((__m256i*)h.cur + 1, _mm256_load_si256(src + 1));
+      h.cur += PER;
+    }
+  }
   inline void push32(u32 p, __m256i x, Arena& a) {
     static_assert(sizeof(T) == 32, "push32");
     u8* s = stage + (size_t)p * 64;
-    if (!fill[p]) {
-      _mm256_store_si256((__m256i*)s, x);
-      fill[p] = 1;
-      return;
-    }
-    Hot& h = hot[p];
-    if (__builtin_expect(h.cur == h.lim, 0)) grow(p, a);
-    _mm256_stream_si256((__m256i*)h.cur, _mm256_load_si256((const __m256i*)s));
-    _mm256_stream_si256((__m256i*)h.cur + 1, x);
-    h.cur += 2;
-    fill[p] = 0;
+    const u32 f = fill[p];
+    u8* e = q + (size_t)nq * 64;
+    _mm256_store_si256((__m256i*)e, _mm256_load_si256((const __m256i*)s));  // the line's first record
+    _mm256_store_si256((__m256i*)(e + 32), x);
+    _mm256_store_si256((__m256i*)(s + 32 * f), x);
+    qp[nq] = p;
+    nq += f;  // the queue entry counts only if x was the line's second record
+    fill[p] = (u8)(f ^ 1);
+    if (__builtin_expect(nq == QCAP, 0)) drain(a);
   }
   inline void push16(u32 p, __m128i x, Arena& a) {
     static_assert(sizeof(T) == 16, "push16");
     u8* s = stage + (size_t)p * 64;
-    u32 f = fill[p];
-    if (f < 3) {
-      _mm_store_si128((__m128i*)(s + 16 * f), x);
-      fill[p] = (u8)(f + 1);
-      return;
+    const u32 f = fill[p];
+    u8* e = q + (size_t)nq * 64;
+    _mm256_store_si256((__m256i*)e, _mm256_load_si256((const __m256i*)s));
+    _mm256_store_si256((__m256i*)(e + 32), _mm256_load_si256((const __m256i*)(s + 32)));
+    _mm_store_si128((__m128i*)(e + 16 * f), x);
+    _mm_store_si128((__m128i*)(s + 16 * f), x);
+    qp[nq] = p;
+    nq += (f == 3);
+    fill[p] = (u8)((f + 1) & 3);
+    if (__builtin_expect(nq == QCAP, 0)) drain(a);
+  }
+  // A copy of the fields a run of pushes needs, kept in a local so they stay in registers.
+  struct Cursor {
+    u8* stage;
+    u8* fill;
+    u8* q;
+    u32* qp;
+    u32 nq;
+    WCScatter* sc;
+    Arena* arena;
+  };
+  Cursor cursor(Arena& a) { return Cursor{stage, fill, q, qp, nq, this, &a}; }
+  void close(const Cursor& c) { nq = c.nq; }
+  static FORCE_INLINE void push32(Cursor& c, u32 p, __m256i x) {
+    static_assert(sizeof(T) == 32, "push32");
+    u8* s = c.stage + (size_t)p * 64;
+    const u32 f = c.fill[p];
+    u8* e = c.q + (size_t)c.nq * 64;
+    _mm256_store_si256((__m256i*)e, _mm256_load_si256((const __m256i*)s));
+    _mm256_store_si256((__m256i*)(e + 32), x);
+    _mm256_store_si256((__m256i*)(s + 32 * f), x);
+    c.qp[c.nq] = p;
+    c.nq += f;
+    c.fill[p] = (u8)(f ^ 1);
+    if (__builtin_expect(c.nq == QCAP, 0)) {
+      c.sc->nq = c.nq;
+      c.sc->drain(*c.arena);
+      c.nq = 0;
     }
-    Hot& h = hot[p];
-    if (__builtin_expect(h.cur == h.lim, 0)) grow(p, a);
-    __m256i v0 = _mm256_set_m128i(_mm_load_si128((const __m128i*)(s + 16)), _mm_load_si128((const __m128i*)s));
-    __m256i v1 = _mm256_set_m128i(x, _mm_load_si128((const __m128i*)(s + 32)));
-    _mm256_stream_si256((__m256i*)h.cur, v0);
-    _mm256_stream_si256((__m256i*)h.cur + 1, v1);
-    h.cur += 4;
-    fill[p] = 0;
+  }
+  static FORCE_INLINE void push16(Cursor& c, u32 p, __m128i x) {
+    static_assert(sizeof(T) == 16, "push16");
+    u8* s = c.stage + (size_t)p * 64;
+    const u32 f = c.fill[p];
+    u8* e = c.q + (size_t)c.nq * 64;
+    _mm256_store_si256((__m256i*)e, _mm256_load_si256((const __m256i*)s));
+    _mm256_store_si256((__m256i*)(e + 32), _mm256_load_si256((const __m256i*)(s + 32)));
+    _mm_store_si128((__m128i*)(e + 16 * f), x);
+    _mm_store_si128((__m128i*)(s + 16 * f), x);
+    c.qp[c.nq] = p;
+    c.nq += (f == 3);
+    c.fill[p] = (u8)((f + 1) & 3);
+    if (__builtin_expect(c.nq == QCAP, 0)) {
+      c.sc->nq = c.nq;
+      c.sc->drain(*c.arena);
+      c.nq = 0;
+    }
+  }
+  // Ends this thread's run of pushes: full lines are written out (partial lines stay staged).
+  void flush(Arena& a) {
+    drain(a);
+    _mm_sfence();
   }
   void finish(Arena& a) {
+    drain(a);
     for (u32 p = 0; p < P; p++) {
       for (u32 f = 0; f < fill[p]; f++) {
         if (hot[p].cur == hot[p].lim) grow(p, a);
@@ -437,7 +511,6 @@ static void init_doy() {
       }
 }
 
-#define FORCE_INLINE inline __attribute__((always_inline))
 
 // Finish a parsed civil time: y, mo*32+dd, hh*60+mi already range checked (mo<=12, dd<=31, hh<=23, mi<=59)
 static FORCE_INLINE bool civil_finish(u32 y, u32 md, u32 hm, u32 se, i64& out) {
@@ -502,9 +575,10 @@ static FORCE_INLINE u32 civil19x2(const u8* sa, const u8* sb, i64& oa, i64& ob) 
   const __m256i bad = _mm256_or_si256(_mm256_cmpgt_epi16(p, hi), _mm256_cmpgt_epi16(lo, p));
   u32 badm = (u32)_mm256_movemask_epi8(bad);
   const __m256i q = _mm256_madd_epi16(p, _mm256_setr_epi16(100, 1, 32, 1, 60, 1, 0, 0, 100, 1, 32, 1, 60, 1, 0, 0));
-  alignas(32) u32 L[8];
-  _mm256_store_si256((__m256i*)L, q);
-  __asm__ volatile("" : : : "memory");  // read L back with plain loads instead of vector extracts
+  alignas(32) u32 Lbuf[8];
+  _mm256_store_si256((__m256i*)Lbuf, q);
+  const u32* L = Lbuf;
+  __asm__("" : "+r"(L));  // read the values back with plain loads instead of vector extracts
   u32 a17 = (u32)sa[17] - '0', a18 = (u32)sa[18] - '0', b17 = (u32)sb[17] - '0', b18 = (u32)sb[18] - '0';
   u32 r = 0;
   if (((okm & 0xFFFF) == 0xFFFF) & ((badm & 0xFFFF) == 0) & (sa[16] == ':') & (a17 <= 5) & (a18 <= 9))
@@ -886,8 +960,8 @@ struct TL {
   WCScatter<R2C> r2c;
   std::vector<std::pair<u64, u64>> links;
   OutRows out;
-  std::vector<CStat> c_stat;   // (ncamp + 1) x ndays: credited sessions, purchasing sessions, revenue
-  std::vector<u32> c_assist;   // (ncamp + 1) x ndays
+  std::vector<CStat> c_stat;   // ndays x (ncamp + 1): credited sessions, purchasing sessions, revenue
+  std::vector<u32> c_assist;   // ndays x (ncamp + 1)
   u64 n_event_lines = 0, n_click_lines = 0;
 };
 static std::vector<TL> g_tl;
@@ -1205,6 +1279,54 @@ static inline bool parse_price(const u8* s, u32 n, u32& out) {
 
 static void build_links(std::vector<MFile>& files);
 
+// One chunk of an events file -> R1 records. Everything the per-line code needs is a local of this function,
+// so it is kept in registers across the loop. Returns the number of lines with a non-empty event_id.
+static NOINLINE u64 parse_event_chunk(const u8* begin, const u8* end, bool skip_header, TL& tl, const u32 p1shift,
+                                      const i64 ws, const i64 we) {
+  u64 nl = 0;
+  auto cur = tl.r1.cursor(tl.arena);
+  scan_chunk<7>(begin, end, skip_header, [&](const u8* sb, const u32* fo, const u32* fl) __attribute__((always_inline)) {
+    if (fl[0] == 0) return;
+    nl++;
+    u64 eid = make_key((sb + fo[0]), fl[0]);
+    i64 ingest = INT64_MAX, ts = 0;
+    bool ts_ok;
+    if (fl[2] == 20 && (sb + fo[2])[19] == 'Z' && fl[3] == 20 && (sb + fo[3])[19] == 'Z') {
+      u32 r = civil19x2((sb + fo[2]), (sb + fo[3]), ts, ingest);
+      if (!(r & 2)) ingest = INT64_MAX;
+      ts_ok = r & 1;
+    } else {
+      if (!parse_f1((sb + fo[3]), fl[3], ingest)) ingest = INT64_MAX;
+      ts_ok = parse_ts((sb + fo[2]), fl[2], ts);
+    }
+    u64 uid = 0, tspl = TS_INVALID;
+    if (fl[1] != 0 && fl[5] != 0 && ts_ok && ts >= ws && ts < we && ingest - ts <= DAY) {
+      int ty = event_type((sb + fo[4]), fl[4]);
+      if (ty >= 0) {
+        bool ok = true;
+        u32 payload = 0;
+        if (ty == 2) {
+          u32 price;
+          if (parse_price((sb + fo[6]), fl[6], price))
+            payload = (cat_of((sb + fo[5]), fl[5]) << 24) | price;
+          else
+            ok = false;
+        }
+        if (ok) {
+          tspl = (u64)(u32)(ts - ws) | ((u64)payload << 32);
+          uid = make_key((sb + fo[1]), fl[1]);
+        }
+      }
+    }
+    const u64 eh = mix64(eid);
+    WCScatter<R1>::push32(cur, (u32)(eh >> p1shift),
+                          _mm256_set_epi64x((long long)tspl, (long long)uid, (long long)ingest, (long long)eh));
+  });
+  tl.r1.close(cur);
+  tl.r1.flush(tl.arena);
+  return nl;
+}
+
 static void parse_events_clicks(std::vector<MFile>& ev, std::vector<MFile>& ck, std::vector<MFile>& lk) {
   size_t ev_bytes = 0, ck_bytes = 0;
   for (auto& f : ev) ev_bytes += f.size;
@@ -1224,46 +1346,7 @@ static void parse_events_clicks(std::vector<MFile>& ev, std::vector<MFile>& ck, 
       const MFile& f = ev[c.file];
       size_t b = line_start_at_or_after(f, c.nominal), e = line_start_at_or_after(f, c.nominal_end);
       if (b >= e) return;
-      u64 nl = 0;
-      scan_chunk<7>(f.data + b, f.data + e, b == 0, [&](const u8* sb, const u32* fo, const u32* fl) __attribute__((always_inline)) {
-        if (fl[0] == 0) return;
-        nl++;
-        u64 eid = make_key((sb + fo[0]), fl[0]);
-        i64 ingest = INT64_MAX, ts = 0;
-        bool ts_ok;
-        if (fl[2] == 20 && (sb + fo[2])[19] == 'Z' && fl[3] == 20 && (sb + fo[3])[19] == 'Z') {
-          u32 r = civil19x2((sb + fo[2]), (sb + fo[3]), ts, ingest);
-          if (!(r & 2)) ingest = INT64_MAX;
-          ts_ok = r & 1;
-        } else {
-          if (!parse_f1((sb + fo[3]), fl[3], ingest)) ingest = INT64_MAX;
-          ts_ok = parse_ts((sb + fo[2]), fl[2], ts);
-        }
-        u64 uid = 0, tspl = TS_INVALID;
-        if (fl[1] != 0 && fl[5] != 0 && ts_ok && ts >= ws && ts < we && ingest - ts <= DAY) {
-          int ty = event_type((sb + fo[4]), fl[4]);
-          if (ty >= 0) {
-            bool ok = true;
-            u32 payload = 0;
-            if (ty == 2) {
-              u32 price;
-              if (parse_price((sb + fo[6]), fl[6], price))
-                payload = (cat_of((sb + fo[5]), fl[5]) << 24) | price;
-              else
-                ok = false;
-            }
-            if (ok) {
-              tspl = (u64)(u32)(ts - ws) | ((u64)payload << 32);
-              uid = make_key((sb + fo[1]), fl[1]);
-            }
-          }
-        }
-        const u64 eh = mix64(eid);
-        tl.r1.push32((u32)(eh >> p1shift),
-                     _mm256_set_epi64x((long long)tspl, (long long)uid, (long long)ingest, (long long)eh), tl.arena);
-      });
-      _mm_sfence();
-      tl.n_event_lines += nl;
+      tl.n_event_lines += parse_event_chunk(f.data + b, f.data + e, b == 0, tl, p1shift, ws, we);
       drop_parsed(f, c.nominal, c.nominal_end);
     } else {
       const Chunk& c = cc[t - ce.size()];
@@ -1327,55 +1410,66 @@ static void parse_events_clicks(std::vector<MFile>& ev, std::vector<MFile>& ck, 
 // ------------------------------------------------------------------------------------------
 // dedup (per event_id partition) and person lookups; click person lookups
 
-// Streams items through two rings: first the filter word is prefetched; items the filter flags then
-// prefetch their H slot; done(person, item) is called in arrival order within each path.
+// Person lookup for a batch of items. Three simple loops instead of one loop with data-dependent
+// branches: (1) hash every key and prefetch its filter word; (2) split the batch, without branching, into
+// items whose ID is its own person name and items the filter flags, prefetching the H slot of the latter;
+// (3) emit both lists. done(person, item) is called once per item, in no particular order.
 template <class Item, class Done>
-struct LookupRing {
-  static constexpr u32 DA = 16, DB = 16;
-  struct E {
-    u64 key, h;
-    Item item;
-  };
-  E ra[DA], rb[DB];
-  u32 na = 0, nb = 0;
+struct Router {
+  static constexpr u32 CAP = 128;
+  u64 key[CAP], h[CAP];
+  Item item[CAP];
+  u8 ld[CAP + 1], lh[CAP + 1];
+  u32 n = 0;
   Done& done;
-  explicit LookupRing(Done& d) : done(d) {}
-  inline void to_b(const E& e) {
-    if (!f_maybe(e.h)) {
-      done(e.key, e.item);
-      return;
-    }
-    _mm_prefetch((const char*)&g_H[h_slot_index(e.h)], _MM_HINT_T0);
-    E& b = rb[nb & (DB - 1)];
-    if (nb >= DB) done(person_of_h(b.key, b.h), b.item);
-    b = e;
-    nb++;
+  explicit Router(Done& d) : done(d) {}
+  inline void add(u64 k, const Item& it) {
+    key[n] = k;
+    item[n] = it;
+    if (__builtin_expect(++n == CAP, 0)) run();
   }
-  inline void push(u64 key, const Item& it) {
+  NOINLINE void run() {
+    const u32 m = n;
+    n = 0;
     if (!g_H) {
-      done(key, it);
+      for (u32 i = 0; i < m; i++) done(key[i], item[i]);
       return;
     }
-    const u64 h = mix64(key);
-    _mm_prefetch((const char*)&g_F[h & g_Fmask], _MM_HINT_T0);
-    E& a = ra[na & (DA - 1)];
-    if (na >= DA) to_b(a);
-    a.key = key;
-    a.h = h;
-    a.item = it;
-    na++;
-  }
-  inline void drain() {
-    for (u32 k = na > DA ? na - DA : 0; k < na; k++) to_b(ra[k & (DA - 1)]);
-    na = 0;
-    for (u32 k = nb > DB ? nb - DB : 0; k < nb; k++) {
-      E& b = rb[k & (DB - 1)];
-      done(person_of_h(b.key, b.h), b.item);
+    for (u32 i = 0; i < m; i++) {
+      const u64 x = mix64(key[i]);
+      h[i] = x;
+      _mm_prefetch((const char*)&g_F[x & g_Fmask], _MM_HINT_T0);
     }
-    nb = 0;
+    u32 nd = 0, nh = 0;
+    for (u32 i = 0; i < m; i++) {
+      const u64 x = h[i];
+      const u32 maybe = f_maybe(x);
+      ld[nd] = (u8)i;
+      lh[nh] = (u8)i;
+      nd += maybe ^ 1;
+      nh += maybe;
+      // prefetch the H slot of flagged items only (the others get a harmless address)
+      const uintptr_t slot = (uintptr_t)&g_H[h_slot_index(x)], dummy = (uintptr_t)h;
+      _mm_prefetch((const char*)(dummy ^ ((slot ^ dummy) & (0 - (uintptr_t)maybe))), _MM_HINT_T0);
+    }
+    for (u32 j = 0; j < nd; j++) {
+      const u32 i = ld[j];
+      done(key[i], item[i]);
+    }
+    for (u32 j = 0; j < nh; j++) {
+      const u32 i = lh[j];
+      done(person_of_h(key[i], h[i]), item[i]);
+    }
   }
 };
 
+// Dedup of one event_id partition, then the survivors are routed to their person partition.
+//
+// A bit map with 8+ bits per record finds the records whose event_id may have been seen before; their IDs
+// go into a small exact table. A second pass sends every record whose ID is not in that table straight to
+// the router (it is the only copy) and keeps, per ID in the table, the copy with the smallest ingest_ts.
+// The bit map and the table stay in L1/L2 whatever the partition size, and nothing is written back to the
+// records.
 static void dedup_and_route() {
   u32 P1 = 1u << g_P1bits;
   const u32 p2shift = 64 - g_P2bits;
@@ -1395,11 +1489,16 @@ static void dedup_and_route() {
     size_t nb = g_tl[t].c0.blocks.size();
     for (size_t b = 0; b < nb; b += 16) ctasks.push_back({t, b, std::min(nb, b + 16)});
   }
-  struct Slot {
+  struct DSlot {
     u64 eid;
-    R1* ptr;
+    const R1* best;
   };
-  std::vector<std::vector<Slot>> tabs(NT);
+  struct Scratch {
+    std::vector<u64> seen, cand;  // bit maps: IDs seen so far; IDs that may have copies
+    std::vector<u64> ids;         // the IDs of the records that found their bit set
+    std::vector<DSlot> tab;
+  };
+  std::vector<Scratch> scr(NT);
   int ntasks = (int)(P1 + ctasks.size());
   parallel_for(ntasks, [&](int oi, int tid) {
     TL& tl = g_tl[tid];
@@ -1411,71 +1510,109 @@ static void dedup_and_route() {
         tl.r2c.push32((u32)(ph >> p2shift), _mm256_set_epi64x(0, (long long)v.b, (long long)v.a, (long long)ph),
                       tl.arena);
       };
-      LookupRing<u64x2, decltype(done)> ring(done);
+      Router<u64x2, decltype(done)> router(done);
       for (size_t b = ct.b0; b < ct.b1; b++) {
         const C0* r = blocks[b].first;
         for (u32 j = 0; j < blocks[b].second; j++) {
           u64 tc;
           memcpy(&tc, &r[j].ts, 8);
-          ring.push(r[j].uid, u64x2{r[j].click, tc});
+          router.add(r[j].uid, u64x2{r[j].click, tc});
         }
-        ring.drain();
+        router.run();
         tl.arena.free_blocks.push_back(blocks[b].first);
       }
+      tl.r2c.flush(tl.arena);
       return;
     }
     int p = order[oi];
-    size_t n = sizes[p];
+    const size_t n = sizes[p];
     if (n == 0) return;
-    std::vector<Slot>& T = tabs[tid];
-    u32 bits = ceil_log2(n * 2 + 16);
-    size_t tsz = (size_t)1 << bits;
-    if (T.size() < tsz) T.resize(tsz);
-    memset(T.data(), 0, tsz * sizeof(Slot));
-    u64 mask = tsz - 1;
-    Slot* tab = T.data();
+    Scratch& S = scr[tid];
+    // ---- pass 1: which IDs may occur more than once?
+    const u32 mbits = std::max<u32>(12, ceil_log2(n * 8));
+    const size_t words = (size_t)1 << (mbits - 6);
+    if (S.seen.size() < words) {
+      S.seen.resize(words);
+      S.cand.resize(words);
+    }
+    if (S.ids.size() < n + 1) S.ids.resize(n + 1);
+    u64* seen = S.seen.data();
+    memset(seen, 0, words * 8);
+    u64* ids = S.ids.data();
+    size_t nids = 0;
+    const u32 P1bits = g_P1bits, ishift = 64 - mbits;
     for (int t = 0; t < NT; t++)
       for (auto& b : g_tl[t].r1.blocks[p]) {
-        R1* rec = b.first;
+        const R1* rec = b.first;
         for (u32 j = 0; j < b.second; j++) {
-          R1* r = &rec[j];
-          u64 h = (r->eid << g_P1bits) >> (64 - bits);
-          for (;;) {
-            Slot& s = tab[h];
-            if (s.ptr == nullptr) {
-              s.eid = r->eid;
-              s.ptr = r;
-              break;
-            }
-            if (s.eid == r->eid) {
-              if (r->ingest < s.ptr->ingest) {
-                s.ptr->ts = TS_INVALID;
-                s.ptr = r;
-              } else {
-                r->ts = TS_INVALID;
-              }
-              break;
-            }
-            h = (h + 1) & mask;
-          }
+          const u64 e = rec[j].eid;
+          const u64 i = (e << P1bits) >> ishift;
+          const u64 w = seen[i >> 6];
+          ids[nids] = e;
+          nids += (w >> (i & 63)) & 1;
+          seen[i >> 6] = w | (1ULL << (i & 63));
         }
       }
     auto done = [&](u64 person, const u64& tp) __attribute__((always_inline)) {
       const u64 ph = mix64(person);
       tl.r2.push16((u32)(ph >> p2shift), _mm_set_epi64x((long long)tp, (long long)ph), tl.arena);
     };
-    LookupRing<u64, decltype(done)> ring(done);
-    for (int t = 0; t < NT; t++)
-      for (auto& b : g_tl[t].r1.blocks[p]) {
-        const R1* rec = b.first;
-        for (u32 j = 0; j < b.second; j++) {
-          if (rec[j].ts == TS_INVALID) continue;
-          u64 tp;
-          memcpy(&tp, &rec[j].ts, 8);
-          ring.push(rec[j].uid, tp);
+    Router<u64, decltype(done)> router(done);
+    auto route = [&](const R1& r) __attribute__((always_inline)) {
+      u64 tp;
+      memcpy(&tp, &r.ts, 8);
+      router.add(r.uid, tp);
+    };
+    if (nids == 0) {
+      // ---- every ID is unique
+      for (int t = 0; t < NT; t++)
+        for (auto& b : g_tl[t].r1.blocks[p]) {
+          const R1* rec = b.first;
+          for (u32 j = 0; j < b.second; j++)
+            if (rec[j].ts != TS_INVALID) route(rec[j]);
         }
+    } else {
+      // ---- exact table of the candidate IDs (and a bit map of them, to skip the table for most records)
+      u64* cand = S.cand.data();
+      memset(cand, 0, words * 8);
+      const u32 tbits = ceil_log2(nids * 2 + 8);
+      const size_t tsz = (size_t)1 << tbits;
+      if (S.tab.size() < tsz) S.tab.resize(tsz);
+      DSlot* tab = S.tab.data();
+      memset(tab, 0, tsz * sizeof(DSlot));
+      const u64 tmask = tsz - 1;
+      const u32 tshift = 64 - tbits;
+      for (size_t k = 0; k < nids; k++) {
+        const u64 e = ids[k];
+        const u64 i = (e << P1bits) >> ishift;
+        cand[i >> 6] |= 1ULL << (i & 63);
+        u64 q = (e << P1bits) >> tshift;
+        while (tab[q].eid != e && tab[q].eid != 0) q = (q + 1) & tmask;
+        tab[q].eid = e;  // eid is a bijective hash of a non-empty key; 0 would need key 0, which no ID has
       }
-    ring.drain();
+      for (int t = 0; t < NT; t++)
+        for (auto& b : g_tl[t].r1.blocks[p]) {
+          const R1* rec = b.first;
+          for (u32 j = 0; j < b.second; j++) {
+            const R1& r = rec[j];
+            const u64 e = r.eid;
+            const u64 i = (e << P1bits) >> ishift;
+            if (__builtin_expect((cand[i >> 6] >> (i & 63)) & 1, 0)) {
+              u64 q = (e << P1bits) >> tshift;
+              while (tab[q].eid != e && tab[q].eid != 0) q = (q + 1) & tmask;
+              if (tab[q].eid == e) {
+                if (tab[q].best == nullptr || r.ingest < tab[q].best->ingest) tab[q].best = &r;
+                continue;
+              }
+            }
+            if (r.ts != TS_INVALID) route(r);
+          }
+        }
+      for (size_t q = 0; q < tsz; q++)
+        if (tab[q].best != nullptr && tab[q].best->ts != TS_INVALID) route(*tab[q].best);
+    }
+    router.run();
+    tl.r2.flush(tl.arena);
     for (int t = 0; t < NT; t++) g_tl[t].r1.release(p, tl.arena);
   });
   parallel_for(NT, [&](int t, int) {
@@ -1612,7 +1749,7 @@ static void person_phase() {
     if (S.ccnt.size() < NC + 1) {
       S.ccnt.assign(NC + 1, 0);
       S.cpos.assign(NC + 1, 0);
-      S.agg.assign(NB, BAgg{0, 0, 0, 0, 0});
+      S.agg.assign(NB, BAgg{0xFFFFFFFFu, 0, 0, 0, 0});
       S.bitmap.assign(NW, 0);
       S.bday.assign(NB, 0);
       S.dsess.assign(ND, 0);
@@ -1738,8 +1875,9 @@ static void person_phase() {
     // ---- per person
     u32* ccnt = S.ccnt.data();
     u32* cpos = S.cpos.data();
-    CStat* c_stat = tl.c_stat.data();
+    CStat* c_stat = tl.c_stat.data();  // both indexed [day][campaign]
     u32* c_assist = tl.c_assist.data();
+    const size_t NC1 = (size_t)NC + 1;
     BAgg* agg = S.agg.data();
     u64* bitmap = S.bitmap.data();
     u16* bday = S.bday.data();
@@ -1762,22 +1900,15 @@ static void person_phase() {
         const u64 e = Eall[i];
         const u32 ts = (u32)(e >> 32), pl = (u32)e;
         const u32 b = ts >> BSHIFT;
+        // every aggregate starts as {mn = max, mx = 0, cnt = 0, rev = 0} (reset when its bucket is consumed),
+        // so the first event of a bucket needs no special case
         BAgg& a = agg[b];
-        const u64 bit = 1ULL << (b & 63);
-        u64& w = bitmap[b >> 6];
-        if (!(w & bit)) {
-          w |= bit;
-          a.mn = ts;
-          a.mx = ts;
-          a.cnt = 1;
-          a.rev = 0;
-          wlo = std::min(wlo, b >> 6);
-          whi = std::max(whi, b >> 6);
-        } else {
-          a.mn = ts < a.mn ? ts : a.mn;
-          a.mx = ts > a.mx ? ts : a.mx;
-          a.cnt++;
-        }
+        bitmap[b >> 6] |= 1ULL << (b & 63);
+        a.mn = ts < a.mn ? ts : a.mn;
+        a.mx = ts > a.mx ? ts : a.mx;
+        a.cnt++;
+        wlo = std::min(wlo, b >> 6);
+        whi = std::max(whi, b >> 6);
         if (pl) {
           a.rev += pl & 0xFFFFFF;
           S.purch.push_back(Purch{b, pl >> 24, pl & 0xFFFFFF});
@@ -1820,11 +1951,16 @@ static void person_phase() {
           }
           credit = C[bi].camp;
         }
-        CStat& cs = c_stat[(size_t)credit * ND + s_day];
+        CStat& cs = c_stat[(size_t)s_day * NC1 + credit];
         cs.sess++;
         cs.purch += (s_rev > 0);
         cs.rev += s_rev;
-        for (u32 c : S.active) c_assist[(size_t)c * ND + s_day]++;
+        {
+          u32* row = c_assist + (size_t)s_day * NC1;  // one day's row: 4 bytes per campaign
+          const u32* act = S.active.data();
+          const size_t na = S.active.size();
+          for (size_t k = 0; k < na; k++) row[act[k]]++;
+        }
         if (dsess[s_day]++ == 0) S.days.push_back(s_day);
         dev[s_day] += s_nev;
         drev[s_day] += s_rev;
@@ -1835,7 +1971,7 @@ static void person_phase() {
         while (w) {
           const u32 b = wi * 64 + (u32)__builtin_ctzll(w);
           w &= w - 1;
-          const BAgg& a = agg[b];
+          const BAgg a = agg[b];
           if (!open || a.mn - s_max > (u32)MIN30) {
             if (open) close_session();
             open = true;
@@ -1848,6 +1984,7 @@ static void person_phase() {
           s_nev += a.cnt;
           s_rev += a.rev;
           bday[b] = (u16)s_day;
+          agg[b] = BAgg{0xFFFFFFFFu, 0, 0, 0, 0};
         }
       }
       if (open) close_session();
@@ -1957,7 +2094,7 @@ static void write_outputs(const std::string& out) {
       const std::string org = "organic";
       for (u32 c = 0; c <= NC; c++)
         for (u32 d = 0; d < ND; d++) {
-          size_t i = (size_t)c * ND + d;
+          size_t i = (size_t)d * (NC + 1) + c;
           if (sess[i] == 0 && assist[i] == 0) continue;
           const std::string& id = (c == NC) ? org : g_camp_ids[c];
           const std::string& ch = (c == NC) ? org : g_camp_channel[c];

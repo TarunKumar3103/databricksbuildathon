@@ -74,8 +74,11 @@ static inline u32 next_bit(const u64* w, u32 from, u32 limit) {
   }
 }
 
+// Always inlined into its caller, together with on_line: the callback's captured state then lives in
+// registers instead of being reloaded through the closure after every store.
 template <int NF, class F>
-static void scan_chunk(const u8* begin, const u8* end, bool skip_header, F&& on_line) {
+static inline __attribute__((always_inline)) void scan_chunk(const u8* begin, const u8* end, bool skip_header,
+                                                             F&& on_line) {
   static_assert(NF >= 1 && NF <= 8, "fields per line");
   const u8* p = begin;
   if (skip_header) {
@@ -231,10 +234,13 @@ static void scan_chunk(const u8* begin, const u8* end, bool skip_header, F&& on_
         const __m256i t = _mm256_add_epi32(qm, MONE);
         _mm256_store_si256((__m256i*)st, _mm256_sub_epi32(S0, t));  // separator + 1 (+ 1 if quoted)
         _mm256_store_si256((__m256i*)ln, _mm256_add_epi32(_mm256_sub_epi32(S1, S0), _mm256_add_epi32(t, qm)));
-        // Make the compiler read the fields back from memory (one load each); otherwise it extracts every
-        // element from the vector registers, which costs two to three times as many instructions.
-        __asm__ volatile("" : : : "memory");
-        on_line(p, (const u32*)st, (const u32*)ln);
+        // Hide where the pointers point, so the compiler reads the fields back from memory (one load each);
+        // otherwise it extracts every element from the vector registers, which costs two to three times as
+        // many instructions.
+        const u32* stp = st;
+        const u32* lnp = ln;
+        __asm__("" : "+r"(stp), "+r"(lnp));
+        on_line(p, stp, lnp);
         si += NF;
       } else {
         const u64 nlb = nbits & PATMASK;

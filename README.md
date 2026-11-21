@@ -18,10 +18,14 @@ One static C++17 binary (no engine, no runtime dependencies) that reads `/data` 
    references in `--selftest`. Parsed input pages are dropped from the mapping as each chunk finishes, so
    the kernel does not have to unmap the whole input serially at exit.
    IDs up to 9 bytes are packed into order-preserving 64-bit keys; longer or non-ASCII IDs are interned.
-4. **Dedup.** Event lines are hash-partitioned by `event_id`; each partition keeps the copy with the
-   smallest `ingest_ts` *before* validation. Survivors look up their person (software-prefetched) and are
-   re-partitioned by person. Clicks are partitioned by person directly (copies are identical, so click
-   dedup cannot change any result).
+4. **Dedup.** Event lines are hash-partitioned by `event_id` (software write-combining with non-temporal
+   stores; full lines go through a small queue so no branch depends on which partition filled up). Per
+   partition, a bit map with 8+ bits per record finds the IDs that may occur more than once; only those
+   go into a small exact table, which keeps the copy with the smallest `ingest_ts` *before* validation.
+   Every other record is the only copy of its event. Survivors look up their person in batches (hash and
+   prefetch, split by a Bloom filter without branching, then probe) and are re-partitioned by person.
+   Clicks are partitioned by person directly (copies are identical, so click dedup cannot change any
+   result).
 5. **Sessions.** Per person partition, events are counting-sorted by (person, 2^20 ms time bucket). A
    bucket spans less than 30 minutes, so each bucket lies in one session and gaps only need checking
    between consecutive buckets: no comparison sort. Clicks per person are sorted by time; a sliding
