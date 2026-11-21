@@ -95,9 +95,11 @@ whole job. The general route alone is what runs on the fixtures; `SS_DENSE=0` fo
 
 ## Build and test
 
-The image compiles with clang 18 from Ubuntu's archive (`ubuntu:24.04` build stage). gcc 13 builds the same
-source to the same output; on the cost model clang needs about 5% fewer cycles per event line. `make native`
-and the tools under `tools/` still use g++ unless `CXX` is set.
+The image compiles with clang 18 from Ubuntu's archive (`ubuntu:24.04` build stage), guided by the profile in
+`pgo/clang18.profdata`. gcc 13 builds the same source to the same output; on the cost model clang needs about
+5% fewer cycles per event line and the profile about 3% fewer again. `pgo/make-profile.sh` rebuilds the profile
+after a source change, on generated data only. `make native` and the tools under `tools/` still use g++ unless
+`CXX` is set.
 
 ```sh
 make build              # docker image (ubuntu:24.04 + clang 18 build stage, debian:bookworm-slim run stage)

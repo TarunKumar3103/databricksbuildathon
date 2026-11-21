@@ -9,8 +9,12 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY src/ ./src/
+COPY pgo/ ./pgo/
 # -fno-vectorize -fno-slp-vectorize: the hot loops are vectorised by hand (as -fno-tree-vectorize with gcc).
+# -fprofile-instr-use: branch weights and layout from a profile of this source on generated data, made with
+# pgo/make-profile.sh by the same clang version. Nothing runs on the build machine.
 RUN clang++-18 -std=c++17 -O2 -fno-vectorize -fno-slp-vectorize -march=cascadelake -mtune=cascadelake -static -pthread \
+        -fprofile-instr-use=pgo/clang18.profdata -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled \
         -o /shopping-sessions src/main.cpp \
  && strip /shopping-sessions
 

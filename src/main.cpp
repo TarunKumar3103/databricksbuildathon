@@ -3163,6 +3163,14 @@ static int selftest() {
 
 static int bench_parse(const char* data, const char* file, int reps);
 
+// A profile-collecting build (clang -fprofile-instr-generate, used only to make pgo/clang18.profdata) writes its
+// profile at exit, which _exit skips; in every other build this symbol is absent and the call does nothing.
+extern "C" int __llvm_profile_write_file(void) __attribute__((weak));
+static inline void exit_now() {
+  if (__llvm_profile_write_file) __llvm_profile_write_file();
+  _exit(0);
+}
+
 int main(int argc, char** argv) {
   g_t0 = now_s();
   if (argc >= 2 && strcmp(argv[1], "--selftest") == 0) return selftest();
@@ -3297,7 +3305,7 @@ int main(int argc, char** argv) {
       release_memory();
       if (g_log) fprintf(stderr, "ABS end %.6f\n", now_s());
       fflush(nullptr);
-      _exit(0);
+      exit_now();
     }
   }
   if (dn::g_on) {
@@ -3359,7 +3367,7 @@ int main(int argc, char** argv) {
   release_memory();
   if (g_log) fprintf(stderr, "ABS end %.6f\n", now_s());
   fflush(nullptr);
-  _exit(0);  // nothing left to clean up that the kernel does not do anyway
+  exit_now();  // nothing left to clean up that the kernel does not do anyway
 }
 
 // ------------------------------------------------------------------------------------------
