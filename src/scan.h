@@ -1,7 +1,7 @@
 // CSV line scanner for the Shopping Sessions dialect.
 //
-// scan_chunk<NF>(begin, end, skip_header, on_line) calls on_line(fs, fl) for every well-formed line with
-// exactly NF fields: fs[i] / fl[i] are the field's bytes with surrounding quotes removed. A line is
+// scan_chunk<NF>(begin, end, skip_header, on_line) calls on_line(base, st, ln) for every well-formed line
+// with exactly NF fields: field i is the ln[i] bytes at base + st[i], surrounding quotes removed. A line is
 // well-formed when every field is either free of '"' or is '"' + bytes without '"' + '"' (length >= 2).
 // Lines end at '\n' only; the last line may lack it. [begin, end) must start at a line start, and at least
 // 64 bytes after `end` must be readable.
@@ -9,9 +9,11 @@
 // Stage 1 (per 64-byte block): bit masks of ',', '\n', '"'. A quote is "regular" when it sits right after
 // a separator (or the chunk start) or right before one (or the chunk end), and the quote parity since the
 // line start is even at every separator. Blocks containing any irregular quote are flagged; lines that touch
-// a flagged block are re-validated exactly (slow path). Comma and newline offsets are flattened into arrays.
-// Stage 2 (per line): exactly NF-1 commas before the newline; fields split at the commas; a field is quoted
-// iff it starts with '"' (regular quotes guarantee the closing one).
+// a flagged block are re-validated exactly (slow path). The offsets of all separators (commas and newlines,
+// in order) are flattened into one array, with two bit streams alongside: "this separator is a newline" and
+// "the byte after this separator is a quote".
+// Stage 2 (per line): a line is the NF + 1 consecutive separators [previous newline, NF - 1 commas, newline];
+// the newline bits check that shape in one compare, and the fields are split with a few vector operations.
 #pragma once
 #include <immintrin.h>
 
@@ -24,7 +26,7 @@ using u8 = uint8_t;
 using u32 = uint32_t;
 using u64 = uint64_t;
 
-// exact validation and split of one line [a, b) (no newline inside); returns field count (capped)
+// exact validation and split of one line [a, b) (no newline inside)
 template <int NF>
 static inline bool slow_line(const u8* a, const u8* b, const u8** fs, u32* fl) {
   int nf = 0;
@@ -55,8 +57,26 @@ static inline u64 prefix_xor(u64 x) {
   return (u64)_mm_cvtsi128_si64(_mm_clmulepi64_si128(_mm_set_epi64x(0, (long long)x), _mm_set1_epi8((char)0xFF), 0));
 }
 
+// index of the first set bit at or after `from` and below `limit` in the bit stream w; `limit` if none.
+// Bits at and above `limit` in the last word are zero.
+static inline u32 next_bit(const u64* w, u32 from, u32 limit) {
+  if (from >= limit) return limit;
+  u32 wi = from >> 6;
+  const u32 last = (limit - 1) >> 6;
+  u64 x = w[wi] & (~0ULL << (from & 63));
+  for (;;) {
+    if (x) {
+      const u32 r = wi * 64 + (u32)_tzcnt_u64(x);
+      return r < limit ? r : limit;
+    }
+    if (wi == last) return limit;
+    x = w[++wi];
+  }
+}
+
 template <int NF, class F>
 static void scan_chunk(const u8* begin, const u8* end, bool skip_header, F&& on_line) {
+  static_assert(NF >= 1 && NF <= 8, "fields per line");
   const u8* p = begin;
   if (skip_header) {
     const u8* nl = (const u8*)memchr(p, '\n', (size_t)(end - p));
@@ -66,22 +86,30 @@ static void scan_chunk(const u8* begin, const u8* end, bool skip_header, F&& on_
   if (p >= end) return;
   const u32 total = (u32)(end - p);
   constexpr u32 WB = 16;  // blocks per window (one bit each in `badw`)
-  constexpr u32 CAP = WB * 64 + 64;
-  u32 Cpos[CAP + NF + 16];  // comma offsets (relative to p)
-  u32 Npos[CAP + 16];       // newline offsets
-  u32 nc = 0;               // commas buffered (carry-over of the open line first)
-  bool line_bad = false;    // the open line touched a flagged block in an earlier window
-  bool line_toomany = false;
-  u32 lstart = 0;
-  u32 carry = 0;            // quote parity since the start of the open line
-  u64 prev_top = 1;         // was the byte before this block a separator (or chunk start)?
-  const u8* fs[NF];
-  u32 fl[NF];
+  constexpr u32 CAP = WB * 64 + 32;
+  // Separator entries. Entry 0 is always the newline before the open line (a virtual one at offset -1 for
+  // the first line), followed by that line's commas.
+  u32 Spos[CAP + 16];
+  u64 Nw[CAP / 64 + 4], Qw[CAP / 64 + 4];
+  Spos[0] = 0xFFFFFFFFu;
+  u32 ns = 1;
+  Nw[0] = 1;
+  Nw[1] = 0;
+  Qw[0] = (p[0] == '"');
+  Qw[1] = 0;
+  bool skip_open = false;  // the open line already has too many fields: no entries are kept for it
+  bool line_bad = false;   // the open line touched a flagged block in an earlier window
+  u32 carry = 0;           // quote parity since the start of the open line
+  u64 prev_top = 1;        // was the byte before this block a separator (or the chunk start)?
+  alignas(32) u32 st[8], ln[8];
+  const u64 PATMASK = (2ULL << NF) - 2;  // entries 1..NF of a line
+  const u64 PAT = 1ULL << NF;            // only the last of them is a newline
   const __m256i vc = _mm256_set1_epi8(','), vn = _mm256_set1_epi8('\n'), vq = _mm256_set1_epi8('"');
+  const __m256i MONE = _mm256_set1_epi32(-1);
+  const __m256i BITS = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
   for (u32 w = 0; w < total; w += WB * 64) {
     const u32 wend = (total - w < WB * 64) ? total : w + WB * 64;
     u64 badw = 0;
-    u32 nn = 0;
     // ---------------- stage 1
     for (u32 off = w, bi = 0; off < wend; off += 64, bi++) {
       const u8* blk = p + off;
@@ -104,6 +132,7 @@ static void scan_chunk(const u8* begin, const u8* end, bool skip_header, F&& on_
       const u64 sep = mc | mn;
       const u64 starts = (sep << 1) | prev_top;
       u64 ends = sep >> 1;
+      u64 qn = mq >> 1;  // the byte after position i is a quote
       if (rem < 64) {
         ends |= 1ULL << (rem - 1);  // the chunk end is a virtual separator
       } else if (rem == 64) {
@@ -111,22 +140,37 @@ static void scan_chunk(const u8* begin, const u8* end, bool skip_header, F&& on_
       } else {
         const u8 nx = blk[64];
         ends |= (u64)((nx == ',') | (nx == '\n')) << 63;
+        qn |= (u64)(nx == '"') << 63;
       }
       prev_top = sep >> 63;
       const u64 px = prefix_xor(mq) ^ (0 - (u64)carry);
       const u64 irregular = (mq & ~(starts | ends)) | (px & sep);
-      badw |= (u64)(irregular != 0) << bi;
-      if (mn) {
-        const u32 last = 63 - (u32)__builtin_clzll(mn);
-        carry = (u32)__builtin_popcountll(last == 63 ? 0 : (mq >> (last + 1))) & 1;
+      if (__builtin_expect(irregular == 0, 1)) {
+        // every separator of the block sits at even parity, so the parity at the block end is also the
+        // parity since the last newline
+        carry = (u32)(px >> 63);
       } else {
-        carry ^= (u32)__builtin_popcountll(mq) & 1;
+        badw |= 1ULL << bi;
+        if (mn) {
+          const u32 last = 63 - (u32)__builtin_clzll(mn);
+          carry = (u32)__builtin_popcountll(last == 63 ? 0 : (mq >> (last + 1))) & 1;
+        } else {
+          carry ^= (u32)__builtin_popcountll(mq) & 1;
+        }
       }
-      // flatten commas and newlines
+      // append the separators of this block: newline bits, quote-after bits, offsets
+      const u32 cnt = (u32)__builtin_popcountll(sep);
+      const u64 nb = _pext_u64(mn, sep), qb = _pext_u64(qn, sep);
       {
-        u64 m = mc;
-        const u32 cnt = (u32)__builtin_popcountll(m);
-        u32* o = Cpos + nc;
+        const u32 wi = ns >> 6, sh = ns & 63;
+        Nw[wi] |= nb << sh;
+        Nw[wi + 1] = (nb >> 1) >> (63 - sh);
+        Qw[wi] |= qb << sh;
+        Qw[wi + 1] = (qb >> 1) >> (63 - sh);
+      }
+      {
+        u64 m = sep;
+        u32* o = Spos + ns;
         for (u32 done = 0;; done += 8) {
 #pragma GCC unroll 8
           for (int j = 0; j < 8; j++) {
@@ -135,78 +179,123 @@ static void scan_chunk(const u8* begin, const u8* end, bool skip_header, F&& on_
           }
           if (done + 8 >= cnt) break;
         }
-        nc += cnt;
       }
-      {
-        u64 m = mn;
-        const u32 cnt = (u32)__builtin_popcountll(m);
-        u32* o = Npos + nn;
-        for (u32 done = 0;; done += 4) {
-#pragma GCC unroll 4
-          for (int j = 0; j < 4; j++) {
-            o[done + j] = off + (u32)_tzcnt_u64(m);
-            m = _blsr_u64(m);
-          }
-          if (done + 4 >= cnt) break;
-        }
-        nn += cnt;
-      }
+      ns += cnt;
     }
     // ---------------- stage 2
-    u32 ci = 0;
-    for (u32 li = 0; li < nn; li++) {
-      const u32 nl = Npos[li];
-      // block range of the line within this window
-      const u32 b0 = (lstart > w) ? (lstart - w) >> 6 : 0;
-      const u32 b1 = (nl - w) >> 6;
-      const u64 span = (b1 >= 63 ? ~0ULL : ((2ULL << b1) - 1)) & ~((1ULL << b0) - 1);
-      const bool touched_bad = line_bad || (badw & span);
-      // commas of this line: Cpos[ci ..] while < nl
-      bool shape = (ci + NF - 1 <= nc) && !line_toomany;
-      if (shape) {
-        if (NF > 1) shape = Cpos[ci + NF - 2] < nl;
-        if (shape && ci + NF - 1 < nc) shape = Cpos[ci + NF - 1] > nl;
+    u32 si = 0;  // entry of the newline before the current line
+    if (skip_open) {
+      const u32 k = next_bit(Nw, 0, ns);
+      if (k == ns) {  // the malformed line is still open
+        ns = 0;
+        Nw[0] = Nw[1] = Qw[0] = Qw[1] = 0;
+        continue;
       }
-      if (__builtin_expect(shape, 1)) {
-        if (__builtin_expect(!touched_bad, 1)) {
-          u32 a = lstart;
-          for (int f = 0; f < NF; f++) {
-            const u32 bnd = (f == NF - 1) ? nl : Cpos[ci + f];
-            const u8* ptr = p + a;
-            const u32 len = bnd - a;
-            const u32 qd = (ptr[0] == '"') & (len != 0);
-            fs[f] = ptr + qd;
-            fl[f] = len - 2 * qd;
-            a = bnd + 1;
+      si = k;
+      skip_open = false;
+    }
+    const bool careful = (badw != 0) | line_bad;
+    while (si + NF < ns) {
+      u64 nbits;
+      memcpy(&nbits, (const u8*)Nw + (si >> 3), 8);
+      nbits >>= (si & 7);
+      if (__builtin_expect((nbits & PATMASK) == PAT, 1)) {
+        if (__builtin_expect(careful, 0)) {
+          const u32 lstart = Spos[si] + 1, nl = Spos[si + NF];
+          const u32 b0 = (lstart > w) ? (lstart - w) >> 6 : 0;
+          const u32 b1 = (nl - w) >> 6;
+          const u64 span = (b1 >= 63 ? ~0ULL : ((2ULL << b1) - 1)) & ~((1ULL << b0) - 1);
+          const bool touched = line_bad || (badw & span);
+          line_bad = false;
+          if (touched) {
+            const u8* fs[NF];
+            u32 fl[NF];
+            if (slow_line<NF>(p + lstart, p + nl, fs, fl)) {
+              for (int f = 0; f < NF; f++) {
+                st[f] = (u32)(fs[f] - p);
+                ln[f] = fl[f];
+              }
+              on_line(p, (const u32*)st, (const u32*)ln);
+            }
+            si += NF;
+            continue;
           }
-          on_line(fs, fl);
-        } else {
-          if (slow_line<NF>(p + lstart, p + nl, fs, fl)) on_line(fs, fl);
         }
-        ci += NF - 1;
+        const __m256i S0 = _mm256_loadu_si256((const __m256i*)(Spos + si));
+        const __m256i S1 = _mm256_loadu_si256((const __m256i*)(Spos + si + 1));
+        u64 qbits;
+        memcpy(&qbits, (const u8*)Qw + (si >> 3), 8);
+        qbits >>= (si & 7);
+        // qm: -1 where the field starts with a quote
+        const __m256i qm = _mm256_cmpeq_epi32(_mm256_and_si256(_mm256_set1_epi32((int)(u32)qbits), BITS), BITS);
+        const __m256i t = _mm256_add_epi32(qm, MONE);
+        _mm256_store_si256((__m256i*)st, _mm256_sub_epi32(S0, t));  // separator + 1 (+ 1 if quoted)
+        _mm256_store_si256((__m256i*)ln, _mm256_add_epi32(_mm256_sub_epi32(S1, S0), _mm256_add_epi32(t, qm)));
+        // Make the compiler read the fields back from memory (one load each); otherwise it extracts every
+        // element from the vector registers, which costs two to three times as many instructions.
+        __asm__ volatile("" : : : "memory");
+        on_line(p, (const u32*)st, (const u32*)ln);
+        si += NF;
       } else {
-        while (ci < nc && Cpos[ci] < nl) ci++;
+        const u64 nlb = nbits & PATMASK;
+        if (nlb) {
+          si += (u32)_tzcnt_u64(nlb);  // too few fields: skip to the line's newline
+        } else {
+          const u32 k = next_bit(Nw, si + NF + 1, ns);  // too many fields
+          if (k == ns) {
+            skip_open = true;
+            break;
+          }
+          si = k;
+        }
+        line_bad = false;
       }
-      lstart = nl + 1;
+    }
+    if (skip_open) {
+      ns = 0;
+      Nw[0] = Nw[1] = Qw[0] = Qw[1] = 0;
       line_bad = false;
-      line_toomany = false;
+      continue;
     }
-    // the open line: remember whether it touched a flagged block; carry its commas
-    const u32 rest = nc - ci;
-    if (lstart < wend) {
-      const u32 b0 = (lstart > w) ? (lstart - w) >> 6 : 0;
-      if (badw >> b0) line_bad = true;
+    // fewer than NF + 1 entries are left: lines that end among them have too few fields
+    for (;;) {
+      const u32 k = next_bit(Nw, si + 1, ns);
+      if (k == ns) break;
+      si = k;
+      line_bad = false;
     }
-    if (rest >= (u32)NF) {
-      line_toomany = true;
-      nc = 0;
-    } else {
-      for (u32 r = 0; r < rest; r++) Cpos[r] = Cpos[ci + r];
-      nc = rest;
+    // the open line: remember whether it touched a flagged block; carry its entries
+    {
+      const u32 lstart = Spos[si] + 1;
+      if (lstart < wend) {
+        const u32 b0 = (lstart > w) ? (lstart - w) >> 6 : 0;
+        if (badw >> b0) line_bad = true;
+      }
+      const u32 rest = ns - si;  // 1..NF
+      u64 qbits;
+      memcpy(&qbits, (const u8*)Qw + (si >> 3), 8);
+      qbits >>= (si & 7);
+      _mm256_storeu_si256((__m256i*)Spos, _mm256_loadu_si256((const __m256i*)(Spos + si)));  // rest <= 8 entries
+      ns = rest;
+      Nw[0] = 1;
+      Nw[1] = 0;
+      Qw[0] = qbits & ((1ULL << rest) - 1);
+      Qw[1] = 0;
     }
   }
   // last line without a newline
-  if (lstart < total && slow_line<NF>(p + lstart, p + total, fs, fl)) on_line(fs, fl);
+  if (!skip_open) {
+    const u32 lstart = Spos[0] + 1;
+    const u8* fs[NF];
+    u32 fl[NF];
+    if (lstart < total && slow_line<NF>(p + lstart, p + total, fs, fl)) {
+      for (int f = 0; f < NF; f++) {
+        st[f] = (u32)(fs[f] - p);
+        ln[f] = fl[f];
+      }
+      on_line(p, (const u32*)st, (const u32*)ln);
+    }
+  }
 }
 
 }  // namespace scan

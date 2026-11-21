@@ -7,7 +7,7 @@ ANSWER ?= dev-answer
 export IMAGE CPUS MEM PLATFORM
 
 CXX ?= g++
-CXXFLAGS ?= -std=c++17 -O2 -march=cascadelake -mtune=cascadelake -pthread
+CXXFLAGS ?= -std=c++17 -O2 -fno-tree-vectorize -march=cascadelake -mtune=cascadelake -pthread
 
 .PHONY: build native fixtures fixtures-native dev run-dev check-dev selftest fuzz
 

@@ -317,7 +317,7 @@ static inline u64 key_fast(const u8* s, u32 n) {
   if (m > 8) return 0;
   u64 w;
   memcpy(&w, s + 1, 8);
-  u64 keep = (m == 8) ? ~0ULL : ((1ULL << (8 * m)) - 1);
+  const u64 keep = _bzhi_u64(~0ULL, 8 * m);  // the low m bytes (all of them for m == 8)
   w &= keep;
   u64 v = w | ~keep;
   if ((w & 0x8080808080808080ULL) | ((v - 0x0101010101010101ULL) & ~v & 0x8080808080808080ULL)) return 0;
@@ -504,6 +504,7 @@ static FORCE_INLINE u32 civil19x2(const u8* sa, const u8* sb, i64& oa, i64& ob) 
   const __m256i q = _mm256_madd_epi16(p, _mm256_setr_epi16(100, 1, 32, 1, 60, 1, 0, 0, 100, 1, 32, 1, 60, 1, 0, 0));
   alignas(32) u32 L[8];
   _mm256_store_si256((__m256i*)L, q);
+  __asm__ volatile("" : : : "memory");  // read L back with plain loads instead of vector extracts
   u32 a17 = (u32)sa[17] - '0', a18 = (u32)sa[18] - '0', b17 = (u32)sb[17] - '0', b18 = (u32)sb[18] - '0';
   u32 r = 0;
   if (((okm & 0xFFFF) == 0xFFFF) & ((badm & 0xFFFF) == 0) & (sa[16] == ':') & (a17 <= 5) & (a18 <= 9))
@@ -652,6 +653,16 @@ struct Chunk {
   size_t nominal;  // nominal start
   size_t nominal_end;
 };
+
+static bool g_drop_parsed = true;
+// Drop the mapping's page-table entries for a parsed chunk, on the worker that parsed it: otherwise the
+// kernel unmaps every input page serially at process exit.
+static inline void drop_parsed(const MFile& f, size_t a, size_t b) {
+  if (!g_drop_parsed) return;
+  a = (a + 4095) & ~(size_t)4095;
+  b &= ~(size_t)4095;
+  if (b > a) madvise((void*)(f.data + a), b - a, MADV_DONTNEED);
+}
 
 static inline size_t line_start_at_or_after(const MFile& f, size_t x) {
   if (x == 0) return 0;
@@ -910,8 +921,8 @@ static void load_lookups(const std::string& data) {
     std::string s = read_small(path);
     size_t n = s.size();
     s.append(64, '\0');
-    scan_chunk<2>((const u8*)s.data(), (const u8*)s.data() + n, true, [&](const u8* const* fs, const u32* fl) {
-      rows.emplace_back(std::string((const char*)fs[0], fl[0]), std::string((const char*)fs[1], fl[1]));
+    scan_chunk<2>((const u8*)s.data(), (const u8*)s.data() + n, true, [&](const u8* sb, const u32* fo, const u32* fl) {
+      rows.emplace_back(std::string((const char*)(sb + fo[0]), fl[0]), std::string((const char*)(sb + fo[1]), fl[1]));
     });
   };
   {
@@ -925,26 +936,26 @@ static void load_lookups(const std::string& data) {
     std::unordered_map<std::string, u32> seen_other;
     u32 maxnum = 0;
     u32 last_cat = UINT32_MAX;
-    scan_chunk<2>((const u8*)sbuf.data(), (const u8*)sbuf.data() + sn, true, [&](const u8* const* fs, const u32* fl) {
+    scan_chunk<2>((const u8*)sbuf.data(), (const u8*)sbuf.data() + sn, true, [&](const u8* sb, const u32* fo, const u32* fl) {
       // category index (linear scan with a one-entry cache; there are only a few categories)
       u32 ci = UINT32_MAX;
       if (last_cat != UINT32_MAX && cat_names[last_cat].size() == fl[1] &&
-          memcmp(cat_names[last_cat].data(), fs[1], fl[1]) == 0)
+          memcmp(cat_names[last_cat].data(), (sb + fo[1]), fl[1]) == 0)
         ci = last_cat;
       else {
         for (u32 i = 0; i < cat_names.size(); i++)
-          if (cat_names[i].size() == fl[1] && memcmp(cat_names[i].data(), fs[1], fl[1]) == 0) {
+          if (cat_names[i].size() == fl[1] && memcmp(cat_names[i].data(), (sb + fo[1]), fl[1]) == 0) {
             ci = i;
             break;
           }
         if (ci == UINT32_MAX) {
           ci = (u32)cat_names.size();
-          cat_names.emplace_back((const char*)fs[1], fl[1]);
+          cat_names.emplace_back((const char*)(sb + fo[1]), fl[1]);
           if (cat_names.size() > 4096) die("too many categories");
         }
         last_cat = ci;
       }
-      const u8* id = fs[0];
+      const u8* id = (sb + fo[0]);
       u32 n = fl[0];
       bool canonical = n >= 2 && n <= 9 && id[0] == 'p' && (id[1] != '0' || n == 2);
       u32 v = 0;
@@ -1027,9 +1038,9 @@ static void build_links(std::vector<MFile>& files) {
     size_t b = line_start_at_or_after(f, c.nominal), e = line_start_at_or_after(f, c.nominal_end);
     if (b >= e) return;
     auto& out = g_tl[tid].links;
-    scan_chunk<2>(f.data + b, f.data + e, b == 0, [&](const u8* const* fs, const u32* fl) {
+    scan_chunk<2>(f.data + b, f.data + e, b == 0, [&](const u8* sb, const u32* fo, const u32* fl) {
       if (fl[0] == 0 || fl[1] == 0) return;
-      out.push_back({make_key(fs[0], fl[0]), make_key(fs[1], fl[1])});
+      out.push_back({make_key((sb + fo[0]), fl[0]), make_key((sb + fo[1]), fl[1])});
     });
   });
   size_t nlinks = 0;
@@ -1214,36 +1225,36 @@ static void parse_events_clicks(std::vector<MFile>& ev, std::vector<MFile>& ck, 
       size_t b = line_start_at_or_after(f, c.nominal), e = line_start_at_or_after(f, c.nominal_end);
       if (b >= e) return;
       u64 nl = 0;
-      scan_chunk<7>(f.data + b, f.data + e, b == 0, [&](const u8* const* fs, const u32* fl) __attribute__((always_inline)) {
+      scan_chunk<7>(f.data + b, f.data + e, b == 0, [&](const u8* sb, const u32* fo, const u32* fl) __attribute__((always_inline)) {
         if (fl[0] == 0) return;
         nl++;
-        u64 eid = make_key(fs[0], fl[0]);
+        u64 eid = make_key((sb + fo[0]), fl[0]);
         i64 ingest = INT64_MAX, ts = 0;
         bool ts_ok;
-        if (fl[2] == 20 && fs[2][19] == 'Z' && fl[3] == 20 && fs[3][19] == 'Z') {
-          u32 r = civil19x2(fs[2], fs[3], ts, ingest);
+        if (fl[2] == 20 && (sb + fo[2])[19] == 'Z' && fl[3] == 20 && (sb + fo[3])[19] == 'Z') {
+          u32 r = civil19x2((sb + fo[2]), (sb + fo[3]), ts, ingest);
           if (!(r & 2)) ingest = INT64_MAX;
           ts_ok = r & 1;
         } else {
-          if (!parse_f1(fs[3], fl[3], ingest)) ingest = INT64_MAX;
-          ts_ok = parse_ts(fs[2], fl[2], ts);
+          if (!parse_f1((sb + fo[3]), fl[3], ingest)) ingest = INT64_MAX;
+          ts_ok = parse_ts((sb + fo[2]), fl[2], ts);
         }
         u64 uid = 0, tspl = TS_INVALID;
         if (fl[1] != 0 && fl[5] != 0 && ts_ok && ts >= ws && ts < we && ingest - ts <= DAY) {
-          int ty = event_type(fs[4], fl[4]);
+          int ty = event_type((sb + fo[4]), fl[4]);
           if (ty >= 0) {
             bool ok = true;
             u32 payload = 0;
             if (ty == 2) {
               u32 price;
-              if (parse_price(fs[6], fl[6], price))
-                payload = (cat_of(fs[5], fl[5]) << 24) | price;
+              if (parse_price((sb + fo[6]), fl[6], price))
+                payload = (cat_of((sb + fo[5]), fl[5]) << 24) | price;
               else
                 ok = false;
             }
             if (ok) {
               tspl = (u64)(u32)(ts - ws) | ((u64)payload << 32);
-              uid = make_key(fs[1], fl[1]);
+              uid = make_key((sb + fo[1]), fl[1]);
             }
           }
         }
@@ -1253,21 +1264,22 @@ static void parse_events_clicks(std::vector<MFile>& ev, std::vector<MFile>& ck, 
       });
       _mm_sfence();
       tl.n_event_lines += nl;
+      drop_parsed(f, c.nominal, c.nominal_end);
     } else {
       const Chunk& c = cc[t - ce.size()];
       const MFile& f = ck[c.file];
       size_t b = line_start_at_or_after(f, c.nominal), e = line_start_at_or_after(f, c.nominal_end);
       if (b >= e) return;
       u64 nl = 0;
-      scan_chunk<4>(f.data + b, f.data + e, b == 0, [&](const u8* const* fs, const u32* fl) {
+      scan_chunk<4>(f.data + b, f.data + e, b == 0, [&](const u8* sb, const u32* fo, const u32* fl) {
         if (fl[0] == 0 || fl[1] == 0) return;
         nl++;
         i64 ts;
-        if (!parse_ts(fs[3], fl[3], ts) || ts < cws || ts >= we) return;
-        i32 camp = camp_of(fs[2], fl[2]);
+        if (!parse_ts((sb + fo[3]), fl[3], ts) || ts < cws || ts >= we) return;
+        i32 camp = camp_of((sb + fo[2]), fl[2]);
         if (camp < 0) return;
-        u64 click = make_key(fs[0], fl[0]);
-        u64 uid = make_key(fs[1], fl[1]);
+        u64 click = make_key((sb + fo[0]), fl[0]);
+        u64 uid = make_key((sb + fo[1]), fl[1]);
         u64 tc = (u64)(u32)(ts - cws) | ((u64)(u32)camp << 32);
         C0* d = tl.c0.slot(tl.arena);
         d->uid = uid;
@@ -1275,6 +1287,7 @@ static void parse_events_clicks(std::vector<MFile>& ev, std::vector<MFile>& ck, 
         memcpy(&d->ts, &tc, 8);
       });
       tl.n_click_lines += nl;
+      drop_parsed(f, c.nominal, c.nominal_end);
     }
   };
   parallel_threads([&](int tid) {
@@ -2110,11 +2123,16 @@ static int selftest() {
 
 // ------------------------------------------------------------------------------------------
 
+static int bench_parse(const char* data, const char* file, int reps);
+
 int main(int argc, char** argv) {
   g_t0 = now_s();
   if (argc >= 2 && strcmp(argv[1], "--selftest") == 0) return selftest();
+  if (argc >= 4 && strcmp(argv[1], "--bench-parse") == 0) return bench_parse(argv[2], argv[3], argc >= 5 ? atoi(argv[4]) : 5);
   const char* lg = getenv("SS_LOG");
   g_log = lg && *lg && *lg != '0';
+  if (g_log) fprintf(stderr, "ABS start %.6f\n", g_t0);
+  if (const char* e = getenv("SS_NODROP")) g_drop_parsed = !(*e && *e != '0');
   std::string data = getenv("DATA_DIR") ? getenv("DATA_DIR") : "/data";
   std::string out = getenv("OUTPUT_DIR") ? getenv("OUTPUT_DIR") : "/output";
   if (argc >= 3) {
@@ -2188,6 +2206,40 @@ int main(int argc, char** argv) {
     fprintf(stderr, "user s:");
     for (int i = 1; i < 6; i++) fprintf(stderr, " %s %.3f", g_phase_names[i], g_phase_cycles[i].load() / 1e6);
     fprintf(stderr, " | total %.3f   sys s: total %.3f (parse %.3f)\n", tot, tots, g_phase_sys[2].load() / 1e6);
+    fprintf(stderr, "ABS end %.6f\n", now_s());
+  }
+  return 0;
+}
+
+// ------------------------------------------------------------------------------------------
+// micro-benchmark: event parsing of one file, single thread (R1 records are produced as usual)
+static int bench_parse(const char* data, const char* file, int reps) {
+  init_years();
+  NT = 1;
+  load_lookups(data);
+  std::vector<MFile> ev{map_file(file)}, ck, lk;
+  g_P1bits = 11;
+  g_P2bits = 10;
+  g_tl.resize(1);
+  // touch the file once
+  volatile u64 sink = 0;
+  for (size_t i = 0; i < ev[0].size; i += 4096) sink += ev[0].data[i];
+  const size_t slab = (size_t)1 << 30;
+  u8* mem = (u8*)vm_alloc(slab);
+  memset(mem, 0, slab);  // pre-touch
+  for (int r = 0; r < reps; r++) {
+    TL& t = g_tl[0];
+    t = TL();
+    t.arena.cur = mem;
+    t.arena.end = mem + slab;
+    t.r1.init(1u << g_P1bits);
+    t.r2.init(1u << g_P2bits);
+    t.r2c.init(1u << g_P2bits);
+    u64 c0 = __rdtsc();
+    parse_events_clicks(ev, ck, lk);
+    u64 c1 = __rdtsc();
+    fprintf(stderr, "rep %d: %.1f cycles/line (%llu lines)\n", r, (double)(c1 - c0) / t.n_event_lines,
+            (unsigned long long)t.n_event_lines);
   }
   return 0;
 }

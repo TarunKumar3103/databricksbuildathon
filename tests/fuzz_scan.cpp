@@ -36,11 +36,26 @@ static long run(long iters) {
     buf.assign(len + 128, 0);
     // generate either random soup or near-valid lines
     size_t i = 0;
-    int soup = nxt() % 3;
+    int soup = nxt() % 6;
     while (i < len) {
       if (soup == 0) {
         const char* alph = "ab,,\"\n\r x";
         buf[i++] = alph[nxt() % 9];
+      } else if (soup == 3) {
+        // very long lines: separators and quotes with rare newlines (lines spanning many windows)
+        int r = nxt() % 3000;
+        buf[i++] = r == 0 ? '\n' : (r < 40 ? ',' : (r < 44 ? '"' : (u8)('a' + r % 26)));
+      } else if (soup == 4) {
+        // well-shaped lines with huge fields
+        for (int f = 0; f < NF && i < len; f++) {
+          if (f) buf[i++] = ',';
+          bool q = nxt() % 4 == 0;
+          size_t flen = nxt() % 8 ? nxt() % 10 : nxt() % 3000;
+          if (q && i < len) buf[i++] = '"';
+          for (size_t k = 0; k < flen && i < len; k++) buf[i++] = (u8)('a' + nxt() % 26);
+          if (q && i < len) buf[i++] = '"';
+        }
+        if (i < len) buf[i++] = '\n';
       } else {
         // a line of NF fields, random quoting, occasional corruption
         int nf = NF + ((nxt() % 20 == 0) ? (int)(nxt() % 3) - 1 : 0);
@@ -64,8 +79,8 @@ static long run(long iters) {
     bool skip = nxt() % 2;
     std::vector<std::string> a, b;
     ref_scan<NF>(buf.data(), buf.data() + len, skip, a);
-    scan_chunk<NF>(buf.data(), buf.data() + len, skip, [&](const u8* const* fs, const u32* fl) {
-      std::string r; for (int k = 0; k < NF; k++) { r.append((const char*)fs[k], fl[k]); r.push_back('|'); } b.push_back(r); });
+    scan_chunk<NF>(buf.data(), buf.data() + len, skip, [&](const u8* sb, const u32* fo, const u32* fl) {
+      std::string r; for (int k = 0; k < NF; k++) { r.append((const char*)(sb + fo[k]), fl[k]); r.push_back('|'); } b.push_back(r); });
     if (a != b) {
       if (bad < 3) {
         fprintf(stderr, "NF=%d mismatch len=%zu skip=%d: ref %zu lines, fast %zu lines\n", NF, len, skip, a.size(), b.size());

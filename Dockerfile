@@ -4,7 +4,9 @@
 FROM gcc:13 AS build
 WORKDIR /build
 COPY src/ ./src/
-RUN g++ -std=c++17 -O2 -march=cascadelake -mtune=cascadelake -static -pthread \
+# -fno-tree-vectorize: the hot loops are vectorised by hand; the auto-vectoriser only gets in the way
+# (it turns runs of scalar stores into slower insert/permute sequences).
+RUN g++ -std=c++17 -O2 -fno-tree-vectorize -march=cascadelake -mtune=cascadelake -static -pthread \
         -o /shopping-sessions src/main.cpp \
  && strip /shopping-sessions
 

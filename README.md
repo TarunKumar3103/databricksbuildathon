@@ -12,9 +12,11 @@ One static C++17 binary (no engine, no runtime dependencies) that reads `/data` 
    so every root *is* the person's name. Result: a hash table `ID -> person name`.
 3. **Events and clicks.** Files are memory-mapped and split into chunks at line boundaries. A SIMD CSV
    scanner (`src/scan.h`) finds commas, newlines and quotes per 64-byte block, validates quote placement
-   with bit tricks (blocks with any irregular quote fall back to an exact byte-by-byte check), and hands
-   each 7-field line to the parser. Timestamps (all three forms) are parsed with SSE/AVX2 and checked
-   against scalar references in `--selftest`.
+   with bit tricks (blocks with any irregular quote fall back to an exact byte-by-byte check), flattens
+   all separator offsets into one array, and splits each well-shaped line into its fields with a few
+   vector operations. Timestamps (all three forms) are parsed with SSE/AVX2 and checked against scalar
+   references in `--selftest`. Parsed input pages are dropped from the mapping as each chunk finishes, so
+   the kernel does not have to unmap the whole input serially at exit.
    IDs up to 9 bytes are packed into order-preserving 64-bit keys; longer or non-ASCII IDs are interned.
 4. **Dedup.** Event lines are hash-partitioned by `event_id`; each partition keeps the copy with the
    smallest `ingest_ts` *before* validation. Survivors look up their person (software-prefetched) and are
