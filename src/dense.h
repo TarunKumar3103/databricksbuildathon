@@ -709,7 +709,7 @@ static NOINLINE void ev_slow(TL& tl, int tid, EvB& B, u32 i, bool regular, const
     return;
   }
   const bool fits = ((payload >> 24) < 32) & ((payload & 0xFFFFFF) < (1u << 17));
-  u64 w0, w1 = (u64)code | ((idx & ELOM) << 46);
+  u64 w0, w1 = (u64)(0x1000000u - code) | ((idx & ELOM) << 46);
   if (!valid) {
     w0 = 0;
   } else if (u_reg && fits) {
@@ -834,6 +834,7 @@ static NOINLINE u32 process_events(EvB& B, const u8* const base, WCScatter<D16>:
     // (code - 1) * 1000 may exceed the ts since the window start by this much: 24 hours, base to window start
     const __m256i late0 = _mm256_set1_epi64x(DAY + ws - g_ing_base), k1000 = _mm256_set1_epi64x(1000);
     const __m256i lom = _mm256_set1_epi64x(ELOM);
+    const __m256i cnot = _mm256_set1_epi64x(0xFFFFFF);  // 2^24 - code = 0xFFFFFF - (code - 1)
     for (u32 i = 0; i < n; i += 4) {
       const __m256i rel = _mm256_sub_epi64(_mm256_load_si256((const __m256i*)(B.ts + i)), vws);
       const __m256i ic1 = _mm256_sub_epi64(_mm256_load_si256((const __m256i*)(B.icode + i)), vone);
@@ -848,7 +849,7 @@ static NOINLINE u32 process_events(EvB& B, const u8* const base, WCScatter<D16>:
                                           late);
       bad |= (u64)(u32)_mm256_movemask_pd(_mm256_castsi256_pd(neg)) << i;
       const __m256i w0 = _mm256_or_si256(_mm256_add_epi64(rel, vone), _mm256_slli_epi64(num, 32));
-      const __m256i w1 = _mm256_or_si256(_mm256_add_epi64(ic1, vone), _mm256_slli_epi64(_mm256_and_si256(idx, lom), 46));
+      const __m256i w1 = _mm256_or_si256(_mm256_sub_epi64(cnot, ic1), _mm256_slli_epi64(_mm256_and_si256(idx, lom), 46));
       const __m256i lo = _mm256_unpacklo_epi64(w0, w1), hi = _mm256_unpackhi_epi64(w0, w1);  // records 0, 2 / 1, 3
       _mm256_store_si256((__m256i*)(B.rec + i), _mm256_permute2x128_si256(lo, hi, 0x20));
       _mm256_store_si256((__m256i*)(B.rec + i + 2), _mm256_permute2x128_si256(lo, hi, 0x31));
@@ -1603,8 +1604,8 @@ static NOINLINE bool place(u32 j, D16* T, DS& S) {
       const u64 w0 = q->w0, w1 = q->w1;
       D16* const s = (D16*)(Tb + ((w1 >> 42) & ((u64)ELOM << 4)));  // (the slot is bits 46 to 59)
       const u64 o0 = s->w0, o1 = s->w1;
-      // (an empty slot has code 0, which wraps to the largest value)
-      const bool take = _bzhi_u32((u32)w1, 24) - 1 < _bzhi_u32((u32)o1, 24) - 1;
+      // (the field is 2^24 - code: the earlier ingest_ts is the larger, an empty slot 0, below them all)
+      const bool take = _bzhi_u32((u32)w1, 24) > _bzhi_u32((u32)o1, 24);
       s->w0 = take ? w0 : o0;
       s->w1 = take ? w1 : o1;
     };
