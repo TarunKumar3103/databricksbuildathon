@@ -1635,6 +1635,26 @@ static inline bool parse_price(const u8* s, u32 n, u32& out) {
   return true;
 }
 
+// cat_of for the usual form "p<1..8 digits>" without a loop; everything else goes to cat_of.
+// Needs 9 readable bytes at s.
+static FORCE_INLINE u32 cat_fast(const u8* s, u32 n) {
+  const u32 nd = n - 1;
+  u64 v;
+  if (__builtin_expect((nd - 1 > 7) | (s[0] != 'p') | ((s[1] == '0') & (n != 2)), 0)) return cat_of(s, n);
+  if (__builtin_expect(!digits_le8(s + 1, nd, v) || v >= g_cat_by_num.size(), 0)) return cat_of(s, n);
+  return g_cat_by_num[v];
+}
+// parse_price for prices of 1..8 bytes without a loop (leading zeros included); longer ones go to parse_price.
+// Needs 8 readable bytes at s.
+static FORCE_INLINE bool price_fast(const u8* s, u32 n, u32& out) {
+  u64 v;
+  if (__builtin_expect(n - 1 > 7, 0)) return parse_price(s, n, out);
+  if (!digits_le8(s, n, v) || v < 1 || v > 10000000) return false;
+  out = (u32)v;
+  return true;
+}
+
+
 // Event lines are parsed a batch at a time, in three simple loops over the batch instead of one long loop
 // body per line: keys and hashes; timestamps, grouped by the form of `ts` so each group runs one kernel
 // without the form changing under it; validation, record assembly and the scatter.
