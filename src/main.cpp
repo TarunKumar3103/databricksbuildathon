@@ -117,17 +117,23 @@ static void parallel_for(int ntasks, F&& f) {
   for (auto& t : th) t.join();
 }
 
+// Zero-filled memory for the big tables and the arenas, on huge pages where the kernel grants them: from
+// 1 MB on, the size is rounded up to whole 2 MB pages and the start is aligned to one.
 static void* vm_alloc(size_t bytes) {
+  constexpr size_t HP = (size_t)2 << 20;
   if (bytes == 0) bytes = 64;
-  void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  const bool huge = bytes >= ((size_t)1 << 20);
+  if (huge) bytes = (bytes + HP - 1) & ~(HP - 1);
+  u8* p = (u8*)mmap(nullptr, bytes + (huge ? HP : 0), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
   if (p == MAP_FAILED) die("mmap anonymous");
+  if (huge) p = (u8*)(((uintptr_t)p + HP - 1) & ~(uintptr_t)(HP - 1));  // (the unused ends are never touched)
   madvise(p, bytes, MADV_HUGEPAGE);
   return p;
 }
 
 // Records are kept in blocks of one page. Every thread has an open block per partition, on average half
 // full at the end, and all of that memory has to be zeroed by the kernel first: small blocks keep it small.
-static constexpr size_t BLOCK_BYTES = 4096;
+static constexpr size_t BLOCK_BYTES = 2048;
 
 struct Arena {
   u8* cur = nullptr;
@@ -237,16 +243,21 @@ struct WCScatter {
   QEnt* qe = nullptr;
   T** beg = nullptr;
   std::vector<std::vector<std::pair<T*, u32>>> blocks;
-  void init(u32 parts) {
+  // The working state comes from the thread's arena: it is touched at random for every record, and there it
+  // sits on a huge page next to the blocks instead of on dozens of small pages of its own.
+  void init(u32 parts, Arena& a) {
     P = parts;
-    hot = (Hot*)calloc(P, sizeof(Hot));
-    lines = (u8*)aligned_alloc(64, (size_t)64 * (P + QCAP));
-    sp = (T**)malloc((size_t)P * sizeof(T*));
+    hot = (Hot*)a.alloc((size_t)P * sizeof(Hot));
+    memset((void*)hot, 0, (size_t)P * sizeof(Hot));
+    lines = (u8*)a.alloc((size_t)64 * (P + QCAP));
+    sp = (T**)a.alloc((size_t)P * sizeof(T*));
     for (u32 p = 0; p < P; p++) sp[p] = (T*)(lines + (size_t)64 * p);
-    q = (QEnt*)calloc(QCAP, sizeof(QEnt));
+    q = (QEnt*)a.alloc(QCAP * sizeof(QEnt));
+    memset((void*)q, 0, QCAP * sizeof(QEnt));
     for (u32 i = 0; i < QCAP; i++) q[i].spare = lines + (size_t)64 * (P + i);
     qe = q;
-    beg = (T**)calloc(P, sizeof(T*));
+    beg = (T**)a.alloc((size_t)P * sizeof(T*));
+    memset((void*)beg, 0, (size_t)P * sizeof(T*));
     blocks.assign(P, {});
   }
   void grow(u32 p, Arena& a) {
@@ -1150,15 +1161,29 @@ struct Router {
   Cursor& cur;
   Emit& emit;
   Router(Cursor& c, Emit& e) : cur(c), emit(e) {}
-  FORCE_INLINE void add(u64 uh, const Item& it) { add_if(uh, it, 1); }
-  // The item is stored either way; it stays only if keep is 1.
-  FORCE_INLINE void add_if(u64 uh, const Item& it, u32 keep) {
-    key[n] = uh;
-    item[n] = it;
-    _mm_prefetch((const char*)&g_F[uh >> g_Fshift], _MM_HINT_T0);  // (a null g_F is harmless here)
-    n += keep;
-    if (__builtin_expect(n == CAP, 0)) run();
-  }
+  // What a loop that adds items needs, as a local of that loop (so it stays in registers).
+  struct Feed {
+    u64* key;
+    Item* item;
+    const u64* F;
+    Router* r;
+    u32 fs;
+    u32 n;
+    // The item is stored either way; it stays only if keep is 1.
+    FORCE_INLINE void add_if(u64 uh, const Item& it, u32 keep) {
+      key[n] = uh;
+      item[n] = it;
+      _mm_prefetch((const char*)&F[uh >> fs], _MM_HINT_T0);  // (a null F is harmless here)
+      n += keep;
+      if (__builtin_expect(n == CAP, 0)) {
+        r->n = n;
+        r->run();
+        n = 0;
+      }
+    }
+  };
+  Feed feed() { return Feed{key, item, g_F, this, g_Fshift, n}; }
+  void close(const Feed& f) { n = f.n; }
   NOINLINE void run() {
     const u32 m = n;
     n = 0;
@@ -1171,19 +1196,24 @@ struct Router {
     const u64* const F = g_F;
     const HSlot* const H = g_H;
     const u32 fs = g_Fshift, hshift = 64 - g_Hbits;
-    u32 nd = 0, nh = 0;
+    const uintptr_t dummy = (uintptr_t)key;
+    u32 nh = 0;
     for (u32 i = 0; i < m; i++) {
       const u64 x = key[i];
       const u64 b = f_bits(x, fs);
       const u32 maybe = (F[x >> fs] & b) == b;
-      ld[nd] = (u8)i;
+      // The item joins one of the two lists. Both entries are written: the one in the list it does not join
+      // lies just past that list's end (the direct items so far number i - nh).
+      ld[i - nh] = (u8)i;
       lh[nh] = (u8)i;
-      nd += maybe ^ 1;
       nh += maybe;
-      // prefetch the H slot of flagged items only (the others get a harmless address)
-      const uintptr_t slot = (uintptr_t)&H[x >> hshift], dummy = (uintptr_t)key;
-      _mm_prefetch((const char*)(dummy ^ ((slot ^ dummy) & (0 - (uintptr_t)maybe))), _MM_HINT_T0);
+      // prefetch the H slot of flagged items only (the others get a harmless address); a conditional move,
+      // spelled out so that it does not become a branch
+      uintptr_t a = (uintptr_t)&H[x >> hshift];
+      __asm__("testl %[m], %[m]\n\tcmove %[d], %[a]" : [a] "+r"(a) : [m] "r"(maybe), [d] "r"(dummy) : "cc");
+      _mm_prefetch((const char*)a, _MM_HINT_T0);
     }
+    const u32 nd = m - nh;
     for (u32 j = 0; j < nd; j++) {
       const u32 i = ld[j];
       emit(c, key[i], item[i]);
@@ -1727,6 +1757,7 @@ static NOINLINE void process_clicks(CkBatch& B, const u32 n, const u8* const bas
   for (u32 j = 0; j < cnt[3]; j++) ck_ts_exact(B, B.idx[3][j], base);
   // ---- keys and campaign; every line is handed to the router, which keeps the valid ones
   const u64 wlen = (u64)(we - cws);
+  auto feed = router.feed();
   for (u32 i = 0; i < n; i++) {
     const u32* off = B.off[i];
     const u32* len = B.len[i];
@@ -1735,8 +1766,9 @@ static NOINLINE void process_clicks(CkBatch& B, const u32 n, const u8* const bas
     const i32 camp = camp_fast(base + off[2], len[2]);
     const u64 rel = (u64)B.ts[i] - (u64)cws;  // in [0, wlen) iff the click is inside [window start - 7 days, window end)
     const u64 tc = (u64)(u32)rel | ((u64)(u32)camp << 32);
-    router.add_if(uid, u64x2{click, tc}, (u32)((rel < wlen) & (camp >= 0)));
+    feed.add_if(uid, u64x2{click, tc}, (u32)((rel < wlen) & (camp >= 0)));
   }
+  router.close(feed);
 }
 
 // One chunk of a clicks file -> R2C records. Returns the number of lines with a click_id and a user_id.
@@ -1883,11 +1915,12 @@ static void dedup_and_route() {
       WCScatter<R2>::push16(c, (u32)(ph >> p2shift), _mm_set_epi64x((long long)tp, (long long)ph));
     };
     Router<u64, R2, decltype(emit)> router(cur, emit);
+    auto feed = router.feed();
     // Hands a record to the router, which keeps it only if `keep` is 1 (no branch on the data).
     auto route_if = [&](const R1& r, u32 keep) __attribute__((always_inline)) {
       u64 tp;
       memcpy(&tp, &r.ts, 8);
-      router.add_if(r.uid, tp, keep);
+      feed.add_if(r.uid, tp, keep);
     };
     if (nids == 0) {
       // ---- every ID is unique
@@ -1946,6 +1979,7 @@ static void dedup_and_route() {
       }
       for (size_t q = 0; q < tsz; q++) route_if(*tab[q].best, tab[q].best->ts != TS_INVALID);
     }
+    router.close(feed);
     router.run();
     tl.r2.close(cur);
     tl.r2.flush(tl.arena);
@@ -2974,9 +3008,9 @@ int main(int argc, char** argv) {
     load_lookups(data);
     g_tl.resize(NT);
     for (auto& t : g_tl) {
-      t.r1.init(1u << g_P1bits);
-      t.r2.init(1u << g_P2bits);
-      t.r2c.init(1u << g_P2bits);
+      t.r1.init(1u << g_P1bits, t.arena);
+      t.r2.init(1u << g_P2bits, t.arena);
+      t.r2c.init(1u << g_P2bits, t.arena);
     }
   });
   g_phase = 1;
@@ -3043,9 +3077,9 @@ static int bench_parse(const char* data, const char* file, int reps) {
     t = TL();
     t.arena.cur = mem;
     t.arena.end = mem + slab;
-    t.r1.init(1u << g_P1bits);
-    t.r2.init(1u << g_P2bits);
-    t.r2c.init(1u << g_P2bits);
+    t.r1.init(1u << g_P1bits, t.arena);
+    t.r2.init(1u << g_P2bits, t.arena);
+    t.r2c.init(1u << g_P2bits, t.arena);
     u64 c0 = __rdtsc();
     parse_events_clicks(ev, ck);
     u64 c1 = __rdtsc();
