@@ -562,25 +562,28 @@ struct Cols {
   alignas(32) u32 st[NF][CAP + 8];
   alignas(32) u32 ln[NF][CAP + 8];
   u32 n = 0;
+  // (n is read once into a local: the stores into st and ln could alias it as far as the compiler knows)
   FORCE_INLINE void add_group(const __m256i* C, const u32* q) {
     const __m256i one = _mm256_set1_epi32(1);
+    const u32 n0 = n;
     for (int k = 0; k < NF; k++) {
       const __m256i qm = movm32x8(q[k]);  // -1: quoted
-      _mm256_storeu_si256((__m256i*)(st[k] + n), _mm256_sub_epi32(_mm256_add_epi32(C[k], one), qm));
-      _mm256_storeu_si256((__m256i*)(ln[k] + n),
+      _mm256_storeu_si256((__m256i*)(st[k] + n0), _mm256_sub_epi32(_mm256_add_epi32(C[k], one), qm));
+      _mm256_storeu_si256((__m256i*)(ln[k] + n0),
                           _mm256_add_epi32(_mm256_sub_epi32(_mm256_sub_epi32(C[k + 1], C[k]), one), _mm256_add_epi32(qm, qm)));
     }
-    n += 8;
+    n = n0 + 8;
   }
   FORCE_INLINE void add_row(__m256i s, __m256i l, u32 keep) {  // (the row stays only if keep is 1)
     alignas(32) u32 a[8], b[8];
     _mm256_store_si256((__m256i*)a, s);
     _mm256_store_si256((__m256i*)b, l);
+    const u32 n0 = n;
     for (int k = 0; k < NF; k++) {
-      st[k][n] = a[k];
-      ln[k][n] = b[k];
+      st[k][n0] = a[k];
+      ln[k][n0] = b[k];
     }
-    n += keep;
+    n = n0 + keep;
   }
   // the lanes after the last line read as empty fields at offset 0 (they are loaded, and gathered from)
   void pad() {
