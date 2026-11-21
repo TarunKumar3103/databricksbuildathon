@@ -1249,39 +1249,6 @@ static NOINLINE bool place(u32 j, D16* T, DS& S) {
   return true;
 }
 
-// The valid event of a regular user in a slot, if there is one: its user number.
-static FORCE_INLINE bool slot_user(const D16& s, u32& un) {
-  const u32 tsf = (u32)s.w0;
-  if ((tsf & 0x7FFFFFFF) == 0) return false;
-  un = (u32)(s.w0 >> 32);
-  if (__builtin_expect((i32)tsf < 0, 0)) {
-    const XEv& x = g_tl[un >> 24].xev[un & 0xFFFFFF];
-    if (x.num == NONE) return false;
-    un = x.num;
-  }
-  return true;
-}
-// ... and whether it is an event of a dense person: the person index.
-static FORCE_INLINE bool slot_dense(const D16& s, u32& p) {
-  u32 un;
-  if (!slot_user(s, un)) return false;
-  p = un >> 9;
-  return (un & 511) < dense_cnt(g_acc[p].load(std::memory_order_relaxed));
-}
-
-// The dense person of the last event before partition pb (NONE if there is none).
-static u32 find_prev_person(u32 pb, DS& S) {
-  for (i64 j = (i64)pb - 1; j >= 0; j--) {
-    if (!place((u32)j, S.T, S)) continue;
-    u32 q = NONE;
-    for (u32 i = ESLOTS; i-- > 0;)
-      if (slot_dense(S.T[i], q)) break; else q = NONE;
-    memset(S.T, 0, sizeof(D16) * ESLOTS);
-    if (q != NONE) return q;
-  }
-  return NONE;
-}
-
 // The clicks of click partition cp that do not belong to a dense person -> the general person phase.
 static NOINLINE void emit_other_clicks(u32 cp, WCScatter<R2C>::Cursor& c2c, u32 p2shift) {
   for (int t = 0; t < NT; t++)
@@ -1513,9 +1480,9 @@ struct SegStat {
   u64 n_persons = 0, n_events = 0, n_general = 0;
 };
 
-// Partitions [pb, pe): a thread's share of the scan. The first dense person met may have begun before pb:
-// its events here are left to the thread that scans the partitions before (it reads on past its own share
-// until that person ends), just as this thread reads on past pe for its last person.
+// Partitions [pb, pe): a thread's share of the scan. The first dense person met in them is left to the thread
+// that scans the partitions before, which reads on past its own share for the first dense person out there,
+// just as this thread reads on past pe (see the two places below).
 //
 // A person's events arrive in time order, one after the other. Each one costs a few instructions without a
 // branch that depends on the data: it is counted, and it starts a session if it comes more than 30 minutes
@@ -1850,9 +1817,11 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
   };
 
   // ---- this thread's partitions
-  const u32 q_skip = pb ? find_prev_person(pb, S) : NONE;  // the events of this person at the start are not ours
-  if (q_skip != NONE) prev_p = q_skip;
-  bool skipping = q_skip != NONE;
+  // The first dense person met in a thread's partitions is not its own (but in the first segment): the thread
+  // before reads on past its partitions for that person, wherever it began. So nothing has to be looked up
+  // before the segment, and a segment costs little.
+  u32 q_skip = NONE;        // that person, once it is met
+  bool skipping = pb != 0;  // until another dense person comes
   // An event that is not of the open person's IDs: of another dense person (which becomes the open one: true),
   // or of none (false; it goes to the general phase unless it is the previous thread's to deal with).
   auto other = [&](const u32 un, const u32 ts, const u32 cat, const u32 price) -> bool {
@@ -1868,6 +1837,10 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
       return false;
     }
     if (skipping) {
+      if (q_skip == NONE) {
+        q_skip = p;
+        prev_p = p;
+      }
       if (p == q_skip) return false;
       skipping = false;
     }
@@ -2009,8 +1982,13 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
   }
 #undef DN_SLOT
 #undef DN_VEC
-  // ---- the rest of the open person, in the partitions after ours
-  if (ps.cur_p != NONE || h_cnt) {
+  // ---- past our partitions: the first dense person met there is ours too, whether it is the open person
+  // going on or a new one (the thread that has those partitions leaves it alone, see above). Two cases have
+  // nothing to do: no dense person at all in our partitions (then the first one out there was already the
+  // first one here, and the thread before us has it), and only the one we left to the thread before, if
+  // that one is still going on out there.
+  if (pb == 0 || !skipping || q_skip != NONE) {
+    bool taken = false;  // the first dense person out there has come
     for (u32 j = pe; j < g_PE && !g_fail.load(std::memory_order_relaxed); j++) {
       if (!place(j, T, S)) continue;
       bool stop = false;
@@ -2031,14 +2009,22 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
           cat = pay >> 17;
           price = pay & 0x1FFFF;
         }
-        if (un - h_base >= h_cnt) {
+        if (un - h_base >= h_cnt) {  // not an ID of the open person
           const u32 p = un >> 9;
-          if (p != (h_base >> 9) && (un & 511) < dense_cnt(acc[p].load(std::memory_order_relaxed))) {  // the next dense person
+          if (p == ps.cur_p) continue;  // (an ID of its index that is not one of the dense person)
+          const u64 ac = acc[p].load(std::memory_order_relaxed);
+          const u32 cnt = dense_cnt(ac);
+          if ((un & 511) >= cnt) continue;  // no dense person's event: the other thread's to hand on
+          if (taken || (skipping && p == q_skip)) {  // the person after ours / the one we left is still going on
             stop = true;
             break;
           }
-          continue;
+          DN_OUT();
+          close_person();
+          open_person(p, cnt, ac);
+          DN_IN();
         }
+        taken = true;
         if (__builtin_expect(ts >= h_xnext, 0)) {
           DN_OUT();
           feed_extras(ts);
@@ -2083,7 +2069,10 @@ static void scan_all() {
     total += cnt[j];
     if (cnt[j]) used = j + 1;
   }
-  const u32 nseg = std::max<u32>(1, std::min<u32>(used, (u32)NT * 4));
+  // (A segment costs little, one partition placed a second time, so they are small, about ten partitions:
+  // the threads then end the scan close together. SS_SEGPART sets another size, for tests.)
+  const u32 segpart = getenv("SS_SEGPART") ? (u32)std::max(1, atoi(getenv("SS_SEGPART"))) : 10;
+  const u32 nseg = std::max<u32>(1, std::min<u32>(used, std::max<u32>((u32)NT, used / segpart)));
   std::vector<u32> sb(nseg + 1, used);
   {
     u64 run = 0;
