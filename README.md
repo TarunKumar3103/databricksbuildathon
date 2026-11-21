@@ -29,7 +29,9 @@ One static C++17 binary (no engine, no runtime dependencies) that reads `/data` 
    bits. Parsed input pages are dropped from the mapping as each chunk finishes, so the kernel does not
    have to unmap the whole input serially at exit.
 4. **Dedup.** Event lines are hash-partitioned by `event_id` (software write-combining with non-temporal
-   stores; full lines go through a small queue so no branch depends on which partition filled up). Per
+   stores: a push is one store into the partition's staging line, and when that fills the line, the line
+   joins a small queue and the partition takes a spare one, with conditional moves instead of a branch
+   on which partition filled up). Per
    partition, a bit map with 8+ bits per record finds the IDs that may occur more than once; only those
    go into a small exact table, which keeps the copy with the smallest `ingest_ts` *before* validation.
    Every other record is the only copy of its event; the pass that separates the two kinds has no

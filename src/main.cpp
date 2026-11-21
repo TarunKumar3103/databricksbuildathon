@@ -205,12 +205,15 @@ struct Stream {
   }
 };
 
-// Hash-partitioned output with software write-combining: records for a partition are staged in a
-// 64-byte line, and full lines go to the partition's block with non-temporal stores.
+// Hash-partitioned output with software write-combining: the records of a partition are collected in a
+// 64-byte staging line, and full lines go to the partition's block with non-temporal stores.
 //
 // "Is this line full now?" is a coin flip for a random partition, so a branch on it mispredicts on a large
-// share of pushes. Instead every push copies the line it touched to the tail of a small queue and advances
-// the queue only if the line became full; the queue is drained in a tight loop every QCAP lines.
+// share of pushes, and copying the line somewhere on every push costs several vector loads and stores.
+// Instead a push is one store through the partition's cursor into its staging line. When that fills the
+// line, the line itself joins a queue and the partition takes a spare line, all without a branch: the queue
+// entry and the partition's cursor are written either way, and only whether the queue advances depends on
+// the outcome. Every QCAP full lines the queue is drained in a tight loop and its lines become the spares.
 template <class T>
 struct WCScatter {
   static_assert(sizeof(T) == 16 || sizeof(T) == 32, "record size");
@@ -221,24 +224,29 @@ struct WCScatter {
     T* cur;
     T* lim;
   };
+  struct QEnt {
+    T* nxt;     // end of a staging line that is full (if the entry is in use)
+    u8* spare;  // a free line for the partition whose line this entry takes
+    u32 p;      // the partition
+  };
   u32 P = 0;
   Hot* hot = nullptr;
-  u8* stage = nullptr;
-  u8* fill = nullptr;
+  u8* lines = nullptr;  // P + QCAP staging lines
+  T** sp = nullptr;     // per partition: where its next record goes, inside its staging line
+  QEnt* q = nullptr;    // QCAP entries; those before qe hold full lines
+  QEnt* qe = nullptr;
   T** beg = nullptr;
-  u8* q = nullptr;    // QCAP full lines waiting for their non-temporal stores
-  u32* qp = nullptr;  // their partitions
-  u32 nq = 0;
   std::vector<std::vector<std::pair<T*, u32>>> blocks;
   void init(u32 parts) {
     P = parts;
     hot = (Hot*)calloc(P, sizeof(Hot));
-    stage = (u8*)aligned_alloc(64, (size_t)64 * P);
-    memset(stage, 0, (size_t)64 * P);
-    fill = (u8*)calloc(P, 1);
+    lines = (u8*)aligned_alloc(64, (size_t)64 * (P + QCAP));
+    sp = (T**)malloc((size_t)P * sizeof(T*));
+    for (u32 p = 0; p < P; p++) sp[p] = (T*)(lines + (size_t)64 * p);
+    q = (QEnt*)calloc(QCAP, sizeof(QEnt));
+    for (u32 i = 0; i < QCAP; i++) q[i].spare = lines + (size_t)64 * (P + i);
+    qe = q;
     beg = (T**)calloc(P, sizeof(T*));
-    q = (u8*)aligned_alloc(64, (size_t)64 * QCAP);
-    qp = (u32*)calloc(QCAP, sizeof(u32));
     blocks.assign(P, {});
   }
   void grow(u32 p, Arena& a) {
@@ -247,91 +255,65 @@ struct WCScatter {
     hot[p].lim = beg[p] + BLK;
   }
   NOINLINE void drain(Arena& a) {
-    const u32 n = nq;
-    nq = 0;
-    for (u32 i = 0; i < n; i++) {
-      const u32 p = qp[i];
-      Hot& h = hot[p];
-      if (__builtin_expect(h.cur == h.lim, 0)) grow(p, a);
-      const __m256i* src = (const __m256i*)(q + (size_t)i * 64);
+    QEnt* const end = qe;
+    qe = q;
+    for (QEnt* e = q; e != end; e++) {
+      u8* const line = (u8*)e->nxt - 64;
+      Hot& h = hot[e->p];
+      if (__builtin_expect(h.cur == h.lim, 0)) grow(e->p, a);
+      const __m256i* src = (const __m256i*)line;
       _mm256_stream_si256((__m256i*)h.cur, _mm256_load_si256(src));
       _mm256_stream_si256((__m256i*)h.cur + 1, _mm256_load_si256(src + 1));
       h.cur += PER;
+      e->spare = line;  // the entry's old spare went to the partition; the entries from `end` on kept theirs
     }
-  }
-  inline void push32(u32 p, __m256i x, Arena& a) {
-    static_assert(sizeof(T) == 32, "push32");
-    u8* s = stage + (size_t)p * 64;
-    const u32 f = fill[p];
-    u8* e = q + (size_t)nq * 64;
-    _mm256_store_si256((__m256i*)e, _mm256_load_si256((const __m256i*)s));  // the line's first record
-    _mm256_store_si256((__m256i*)(e + 32), x);
-    _mm256_store_si256((__m256i*)(s + 32 * f), x);
-    qp[nq] = p;
-    nq += f;  // the queue entry counts only if x was the line's second record
-    fill[p] = (u8)(f ^ 1);
-    if (__builtin_expect(nq == QCAP, 0)) drain(a);
-  }
-  inline void push16(u32 p, __m128i x, Arena& a) {
-    static_assert(sizeof(T) == 16, "push16");
-    u8* s = stage + (size_t)p * 64;
-    const u32 f = fill[p];
-    u8* e = q + (size_t)nq * 64;
-    _mm256_store_si256((__m256i*)e, _mm256_load_si256((const __m256i*)s));
-    _mm256_store_si256((__m256i*)(e + 32), _mm256_load_si256((const __m256i*)(s + 32)));
-    _mm_store_si128((__m128i*)(e + 16 * f), x);
-    _mm_store_si128((__m128i*)(s + 16 * f), x);
-    qp[nq] = p;
-    nq += (f == 3);
-    fill[p] = (u8)((f + 1) & 3);
-    if (__builtin_expect(nq == QCAP, 0)) drain(a);
   }
   // A copy of the fields a run of pushes needs, kept in a local so they stay in registers.
   struct Cursor {
-    u8* stage;
-    u8* fill;
-    u8* q;
-    u32* qp;
-    u32 nq;
+    T** sp;
+    QEnt* qe;
+    QEnt* qend;
     WCScatter* sc;
     Arena* arena;
   };
-  Cursor cursor(Arena& a) { return Cursor{stage, fill, q, qp, nq, this, &a}; }
-  void close(const Cursor& c) { nq = c.nq; }
+  Cursor cursor(Arena& a) { return Cursor{sp, qe, q + QCAP, this, &a}; }
+  void close(const Cursor& c) { qe = c.qe; }
+  // The record at `cur` has just been written for partition p.
+  static FORCE_INLINE void advance(Cursor& c, u32 p, T* cur) {
+    T* const nxt = cur + 1;
+    QEnt* const e = c.qe;
+    e->nxt = nxt;
+    e->p = p;
+    T* const fresh = (T*)e->spare;
+    QEnt* const e1 = e + 1;
+    // if the line is full now (nxt is at a 64-byte boundary): the partition continues in the spare line and
+    // the queue keeps the entry. Two conditional moves, spelled out because the compiler prefers a branch
+    // here, and this one is as unpredictable as branches get.
+    T* nsp = nxt;
+    QEnt* nqe = e;
+    __asm__("testb $63, %b[s]\n\tcmove %[f], %[s]\n\tcmove %[e1], %[q]"
+            : [s] "+r"(nsp), [q] "+r"(nqe)
+            : [f] "r"(fresh), [e1] "r"(e1)
+            : "cc");
+    c.sp[p] = nsp;
+    c.qe = nqe;
+    if (__builtin_expect(c.qe == c.qend, 0)) {
+      c.sc->qe = c.qe;
+      c.sc->drain(*c.arena);
+      c.qe = c.sc->q;
+    }
+  }
   static FORCE_INLINE void push32(Cursor& c, u32 p, __m256i x) {
     static_assert(sizeof(T) == 32, "push32");
-    u8* s = c.stage + (size_t)p * 64;
-    const u32 f = c.fill[p];
-    u8* e = c.q + (size_t)c.nq * 64;
-    _mm256_store_si256((__m256i*)e, _mm256_load_si256((const __m256i*)s));
-    _mm256_store_si256((__m256i*)(e + 32), x);
-    _mm256_store_si256((__m256i*)(s + 32 * f), x);
-    c.qp[c.nq] = p;
-    c.nq += f;
-    c.fill[p] = (u8)(f ^ 1);
-    if (__builtin_expect(c.nq == QCAP, 0)) {
-      c.sc->nq = c.nq;
-      c.sc->drain(*c.arena);
-      c.nq = 0;
-    }
+    T* const cur = c.sp[p];
+    _mm256_store_si256((__m256i*)cur, x);
+    advance(c, p, cur);
   }
   static FORCE_INLINE void push16(Cursor& c, u32 p, __m128i x) {
     static_assert(sizeof(T) == 16, "push16");
-    u8* s = c.stage + (size_t)p * 64;
-    const u32 f = c.fill[p];
-    u8* e = c.q + (size_t)c.nq * 64;
-    _mm256_store_si256((__m256i*)e, _mm256_load_si256((const __m256i*)s));
-    _mm256_store_si256((__m256i*)(e + 32), _mm256_load_si256((const __m256i*)(s + 32)));
-    _mm_store_si128((__m128i*)(e + 16 * f), x);
-    _mm_store_si128((__m128i*)(s + 16 * f), x);
-    c.qp[c.nq] = p;
-    c.nq += (f == 3);
-    c.fill[p] = (u8)((f + 1) & 3);
-    if (__builtin_expect(c.nq == QCAP, 0)) {
-      c.sc->nq = c.nq;
-      c.sc->drain(*c.arena);
-      c.nq = 0;
-    }
+    T* const cur = c.sp[p];
+    _mm_store_si128((__m128i*)cur, x);
+    advance(c, p, cur);
   }
   // Ends this thread's run of pushes: full lines are written out (partial lines stay staged).
   void flush(Arena& a) {
@@ -341,12 +323,14 @@ struct WCScatter {
   void finish(Arena& a) {
     drain(a);
     for (u32 p = 0; p < P; p++) {
-      for (u32 f = 0; f < fill[p]; f++) {
+      T* const end = sp[p];
+      T* const start = (T*)((uintptr_t)end & ~(uintptr_t)63);
+      for (const T* r = start; r < end; r++) {
         if (hot[p].cur == hot[p].lim) grow(p, a);
-        memcpy(hot[p].cur, stage + (size_t)p * 64 + f * sizeof(T), sizeof(T));
+        memcpy(hot[p].cur, r, sizeof(T));
         hot[p].cur++;
       }
-      fill[p] = 0;
+      sp[p] = start;
       if (beg[p]) blocks[p].push_back({beg[p], (u32)(hot[p].cur - beg[p])});
       beg[p] = nullptr;
       hot[p].cur = hot[p].lim = nullptr;
@@ -1556,16 +1540,16 @@ struct EvBatch {
   static constexpr u32 CAP = 64;
   alignas(32) u32 off[CAP][8];  // field offsets from the chunk base
   alignas(32) u32 len[CAP][8];  // field lengths
-  u64 eh[CAP], uid[CAP];
-  i64 ts[CAP], ing[CAP];  // TS_NONE / ING_NONE if not a timestamp
-  u8 idx[4][CAP];         // lines by form of ts: 20 bytes, 13 bytes, 25 bytes, other
+  alignas(32) R1 rec[CAP];      // the records, filled in step by step (ingest: ING_NONE if not a timestamp)
+  i64 ts[CAP];                  // TS_NONE if not a timestamp
+  u8 idx[4][CAP];               // lines by form of ts: 20 bytes, 13 bytes, 25 bytes, other
 };
 
 static NOINLINE void ts_exact(EvBatch& B, u32 i, const u8* base) {
   const u32* off = B.off[i];
   const u32* len = B.len[i];
   if (!parse_ts(base + off[2], len[2], B.ts[i])) B.ts[i] = TS_NONE;
-  if (!parse_f1(base + off[3], len[3], B.ing[i])) B.ing[i] = ING_NONE;
+  if (!parse_f1(base + off[3], len[3], B.rec[i].ingest)) B.rec[i].ingest = ING_NONE;
 }
 
 static NOINLINE void process_events(EvBatch& B, const u32 n, const u8* const base, WCScatter<R1>::Cursor& cur_out,
@@ -1574,10 +1558,10 @@ static NOINLINE void process_events(EvBatch& B, const u32 n, const u8* const bas
   for (u32 i = 0; i < n; i++) {
     const u32* off = B.off[i];
     const u32* len = B.len[i];
-    B.eh[i] = hash_id(make_key(base + off[0], len[0]));
+    B.rec[i].eid = hash_id(make_key(base + off[0], len[0]));
     u64 uid = 0;
     if (__builtin_expect(len[1] != 0, 1)) uid = hash_id(make_key(base + off[1], len[1]));
-    B.uid[i] = uid;
+    B.rec[i].uid = uid;
   }
   // ---- timestamps
   static const u8 CLS[32] = {3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 1, 3, 3, 3, 3, 3, 3, 0, 3, 3, 3, 3, 2, 3, 3, 3, 3, 3, 3};
@@ -1593,7 +1577,7 @@ static NOINLINE void process_events(EvBatch& B, const u32 n, const u8* const bas
     i64 ta, tb;
     if (__builtin_expect(B.len[i][3] == 20 && f1_pair(base + off[2], base + off[3], ta, tb), 1)) {
       B.ts[i] = ta;
-      B.ing[i] = tb;
+      B.rec[i].ingest = tb;
     } else {
       ts_exact(B, i, base);
     }
@@ -1604,7 +1588,7 @@ static NOINLINE void process_events(EvBatch& B, const u32 n, const u8* const bas
     i64 ta, tb;
     if (__builtin_expect(B.len[i][3] == 20 && digits13(base + off[2], ta) && f1_one(base + off[3], tb), 1)) {
       B.ts[i] = ta;
-      B.ing[i] = tb;
+      B.rec[i].ingest = tb;
     } else {
       ts_exact(B, i, base);
     }
@@ -1615,20 +1599,19 @@ static NOINLINE void process_events(EvBatch& B, const u32 n, const u8* const bas
     i64 ta, tb;
     if (__builtin_expect(B.len[i][3] == 20 && f3f1_pair(base + off[2], base + off[3], ta, tb), 1)) {
       B.ts[i] = ta;
-      B.ing[i] = tb;
+      B.rec[i].ingest = tb;
     } else {
       ts_exact(B, i, base);
     }
   }
   for (u32 j = 0; j < cnt[3]; j++) ts_exact(B, B.idx[3][j], base);
-  // ---- validation, records, scatter
-  auto cur = cur_out;
+  // ---- validation; the last field of each record
   const u64 wlen = (u64)(we - ws);
   for (u32 i = 0; i < n; i++) {
     const u32* off = B.off[i];
     const u32* len = B.len[i];
-    const i64 ts = B.ts[i], ing = B.ing[i];
-    const u64 uid = B.uid[i];
+    const i64 ts = B.ts[i], ing = B.rec[i].ingest;
+    const u64 uid = B.rec[i].uid;
     const u8* s4 = base + off[4];
     const u32 n4 = len[4];
     u32 w4;
@@ -1648,9 +1631,14 @@ static NOINLINE void process_events(EvBatch& B, const u32 n, const u8* const bas
         valid = false;
     }
     const u64 tspl = valid ? ((u64)(u32)rel | ((u64)payload << 32)) : (u64)TS_INVALID;
-    const u64 eh = B.eh[i];
-    WCScatter<R1>::push32(cur, (u32)(eh >> p1shift),
-                          _mm256_set_epi64x((long long)tspl, (long long)uid, (long long)ing, (long long)eh));
+    memcpy(&B.rec[i].ts, &tspl, 8);
+  }
+  // ---- scatter (a loop of its own: few values to keep in registers, and the records are loaded whole long
+  // after their fields were stored)
+  auto cur = cur_out;
+  for (u32 i = 0; i < n; i++) {
+    const __m256i r = _mm256_load_si256((const __m256i*)&B.rec[i]);
+    WCScatter<R1>::push32(cur, (u32)(B.rec[i].eid >> p1shift), r);
   }
   cur_out = cur;
 }
@@ -1841,6 +1829,7 @@ static void dedup_and_route() {
     std::vector<u64> seen, cand;  // bit maps: IDs seen so far; IDs that may have copies
     std::vector<u64> ids;         // the IDs of the records that found their bit set
     std::vector<DSlot> tab;
+    std::vector<std::pair<const R1*, u32>> blk;  // the partition's blocks
   };
   std::vector<Scratch> scr(NT);
   parallel_for((int)P1, [&](int oi, int tid) {
@@ -1862,18 +1851,33 @@ static void dedup_and_route() {
     u64* ids = S.ids.data();
     size_t nids = 0;
     const u32 P1bits = g_P1bits, ishift = 64 - mbits;
+    S.blk.clear();
     for (int t = 0; t < NT; t++)
-      for (auto& b : g_tl[t].r1.blocks[p]) {
-        const R1* rec = b.first;
-        for (u32 j = 0; j < b.second; j++) {
-          const u64 e = rec[j].eid;
-          const u64 i = (e << P1bits) >> ishift;
-          const u64 w = seen[i >> 6];
-          ids[nids] = e;
-          nids += (w >> (i & 63)) & 1;
-          seen[i >> 6] = w | (1ULL << (i & 63));
-        }
+      for (auto& b : g_tl[t].r1.blocks[p])
+        if (b.second) S.blk.push_back({b.first, b.second});
+    const size_t nblk = S.blk.size();
+    S.blk.push_back(S.blk[0]);  // (something harmless to prefetch after the last block)
+    const std::pair<const R1*, u32>* const blk = S.blk.data();
+    for (size_t k = 0; k < nblk; k++) {
+      // The blocks are scattered pages: the first lines of the next one are fetched while this one is read,
+      // so the processor's own stream detection starts with a lead instead of a few misses per page.
+      const char* const nx = (const char*)blk[k + 1].first;
+      _mm_prefetch(nx, _MM_HINT_T0);
+      _mm_prefetch(nx + 64, _MM_HINT_T0);
+      _mm_prefetch(nx + 128, _MM_HINT_T0);
+      _mm_prefetch(nx + 192, _MM_HINT_T0);
+      const R1* rec = blk[k].first;
+      const u32 cnt = blk[k].second;
+      for (u32 j = 0; j < cnt; j++) {
+        const u64 e = rec[j].eid;
+        const u64 i = (e << P1bits) >> ishift;
+        u64 w = seen[i >> 6];
+        ids[nids] = e;
+        // test and set bit i of the word; the old bit is added to nids
+        __asm__("btsq %[i], %[w]\n\tadcq $0, %[n]" : [w] "+r"(w), [n] "+r"(nids) : [i] "r"(i) : "cc");
+        seen[i >> 6] = w;
       }
+    }
     auto cur = tl.r2.cursor(tl.arena);
     auto emit = [p2shift](WCScatter<R2>::Cursor& c, u64 ph, const u64& tp) __attribute__((always_inline)) {
       WCScatter<R2>::push16(c, (u32)(ph >> p2shift), _mm_set_epi64x((long long)tp, (long long)ph));
@@ -1887,11 +1891,11 @@ static void dedup_and_route() {
     };
     if (nids == 0) {
       // ---- every ID is unique
-      for (int t = 0; t < NT; t++)
-        for (auto& b : g_tl[t].r1.blocks[p]) {
-          const R1* rec = b.first;
-          for (u32 j = 0; j < b.second; j++) route_if(rec[j], rec[j].ts != TS_INVALID);
-        }
+      for (size_t k = 0; k < nblk; k++) {
+        const R1* rec = blk[k].first;
+        const u32 cnt = blk[k].second;
+        for (u32 j = 0; j < cnt; j++) route_if(rec[j], rec[j].ts != TS_INVALID);
+      }
     } else {
       // ---- exact table of the candidate IDs (and a bit map of them, to skip the table for most records).
       // Every slot starts with NONE as its best copy: later than any real ingest_ts and not a valid event,
@@ -1915,31 +1919,31 @@ static void dedup_and_route() {
         tab[q].eid = e;  // eid is a bijective hash of a non-empty key; 0 would need key 0, which no ID has
       }
       const R1* cl[WCScatter<R1>::BLK];  // the records of a block whose ID may be in the table
-      for (int t = 0; t < NT; t++)
-        for (auto& b : g_tl[t].r1.blocks[p]) {
-          const R1* rec = b.first;
-          u32 nc = 0;
-          for (u32 j = 0; j < b.second; j++) {
-            const R1& r = rec[j];
-            const u64 i = (r.eid << P1bits) >> ishift;
-            const u32 c = (u32)(cand[i >> 6] >> (i & 63)) & 1;
-            cl[nc] = &r;
-            nc += c;
-            route_if(r, (u32)(r.ts != TS_INVALID) & (c ^ 1));  // the only copy of its event
-          }
-          for (u32 k = 0; k < nc; k++) {
-            const R1& r = *cl[k];
-            const u64 e = r.eid;
-            u64 q = (e << P1bits) >> tshift;
-            while (tab[q].eid != e && tab[q].eid != 0) q = (q + 1) & tmask;
-            if (__builtin_expect(tab[q].eid == e, 1)) {
-              const R1* best = tab[q].best;  // the first copy with the smallest ingest_ts stays
-              tab[q].best = r.ingest < best->ingest ? &r : best;
-            } else {
-              route_if(r, r.ts != TS_INVALID);  // the bit map was wrong about it
-            }
+      for (size_t bi = 0; bi < nblk; bi++) {
+        const R1* rec = blk[bi].first;
+        const u32 cnt = blk[bi].second;
+        u32 nc = 0;
+        for (u32 j = 0; j < cnt; j++) {
+          const R1& r = rec[j];
+          const u64 i = (r.eid << P1bits) >> ishift;
+          const u32 c = (u32)(cand[i >> 6] >> (i & 63)) & 1;
+          cl[nc] = &r;
+          nc += c;
+          route_if(r, (u32)(r.ts != TS_INVALID) & (c ^ 1));  // the only copy of its event
+        }
+        for (u32 k = 0; k < nc; k++) {
+          const R1& r = *cl[k];
+          const u64 e = r.eid;
+          u64 q = (e << P1bits) >> tshift;
+          while (tab[q].eid != e && tab[q].eid != 0) q = (q + 1) & tmask;
+          if (__builtin_expect(tab[q].eid == e, 1)) {
+            const R1* best = tab[q].best;  // the first copy with the smallest ingest_ts stays
+            tab[q].best = r.ingest < best->ingest ? &r : best;
+          } else {
+            route_if(r, r.ts != TS_INVALID);  // the bit map was wrong about it
           }
         }
+      }
       for (size_t q = 0; q < tsz; q++) route_if(*tab[q].best, tab[q].best->ts != TS_INVALID);
     }
     router.run();
@@ -1964,9 +1968,8 @@ static void dedup_and_route() {
 static constexpr u32 BSHIFT = 20;
 
 struct XRec {
+  u64 tp;  // ts | payload << 32, as in R2
   u32 lid;
-  u32 ts;
-  u32 payload;
   u32 pad;
 };
 
@@ -2069,9 +2072,9 @@ static void person_phase() {
     tl.c_assist.assign((size_t)(NC + 1) * ND, 0);
   });
   struct PSlot {
-    u64 h;
+    u64 h;  // 0: free (the hash of a person is never 0)
     u32 lid;
-    u32 used;
+    u32 pad;
   };
   struct BAgg {
     u32 mn, mx, cnt, pad;
@@ -2086,6 +2089,7 @@ static void person_phase() {
     std::vector<u32> cntL, posL, cntC, offC;
     std::vector<XRec> X;
     std::vector<u64> E;
+    std::vector<std::pair<const R2*, u32>> blk;  // the partition's blocks of events
     std::vector<u32> Cts, Ccamp;  // clicks grouped by person, in any order
     std::vector<u64> Cclick;
     std::vector<u32> tin, sts, scamp;  // one person's clicks in time order
@@ -2127,57 +2131,81 @@ static void person_phase() {
     u32 bits = std::max<u32>(8, ceil_log2(n_e / 8 + 64));
     size_t tsz = (size_t)1 << bits;
     S.tab.assign(tsz, PSlot{0, 0, 0});
-    u64 mask = tsz - 1;
     S.hs.clear();
     S.cntL.clear();
     auto rehash = [&]() {
       bits++;
       tsz = (size_t)1 << bits;
-      mask = tsz - 1;
       S.tab.assign(tsz, PSlot{0, 0, 0});
+      const u64 m = tsz - 1;
       for (u32 lid = 0; lid < S.hs.size(); lid++) {
         u64 i = (S.hs[lid] << P2bits) >> (64 - bits);
-        while (S.tab[i].used) i = (i + 1) & mask;
-        S.tab[i] = PSlot{S.hs[lid], lid, 1};
+        while (S.tab[i].h) i = (i + 1) & m;
+        S.tab[i] = PSlot{S.hs[lid], lid, 0};
       }
     };
     if (S.X.size() < n_e) {
       S.X.resize(n_e);
       S.E.resize(n_e);
     }
-    XRec* X = S.X.data();
-    size_t k = 0;
+    S.blk.clear();
     for (int t = 0; t < NT; t++)
-      for (auto& b : g_tl[t].r2.blocks[p]) {
-        const R2* r = b.first;
-        for (u32 j = 0; j < b.second; j++) {
-          u64 h = r[j].h;
-          u64 i = (h << P2bits) >> (64 - bits);
+      for (auto& b : g_tl[t].r2.blocks[p])
+        if (b.second) S.blk.push_back({b.first, b.second});
+    const size_t nblk = S.blk.size();
+    S.blk.push_back(S.blk[0]);  // (something harmless to prefetch after the last block)
+    XRec* X = S.X.data();
+    {
+      // the table, its geometry and the counters as plain locals, so the loop keeps them in registers; a new
+      // person (the rare case) refreshes them
+      PSlot* tab = S.tab.data();
+      u64 mask = tsz - 1;
+      u32 sh = 64 - bits;
+      u32* cntL = S.cntL.data();
+      u32 np = 0;
+      size_t k = 0;
+      for (size_t bi = 0; bi < nblk; bi++) {
+        const char* const nx = (const char*)S.blk[bi + 1].first;  // (see the same step in dedup_and_route)
+        _mm_prefetch(nx, _MM_HINT_T0);
+        _mm_prefetch(nx + 64, _MM_HINT_T0);
+        _mm_prefetch(nx + 128, _MM_HINT_T0);
+        _mm_prefetch(nx + 192, _MM_HINT_T0);
+        const R2* r = S.blk[bi].first;
+        const u32 cnt = S.blk[bi].second;
+        for (u32 j = 0; j < cnt; j++) {
+          const u64 h = r[j].h;
+          u64 i = (h << P2bits) >> sh;
           u32 lid;
           for (;;) {
-            PSlot& sl = S.tab[i];
-            if (!sl.used) {
-              lid = (u32)S.hs.size();
-              sl = PSlot{h, lid, 1};
-              S.hs.push_back(h);
-              S.cntL.push_back(0);
-              if (S.hs.size() * 2 > tsz) rehash();
+            PSlot& sl = tab[i];
+            if (__builtin_expect(sl.h == h, 1)) {
+              lid = sl.lid;
               break;
             }
-            if (sl.h == h) {
-              lid = sl.lid;
+            if (sl.h == 0) {
+              lid = np++;
+              sl.h = h;
+              sl.lid = lid;
+              S.hs.push_back(h);
+              S.cntL.push_back(0);
+              if ((size_t)np * 2 > tsz) rehash();
+              tab = S.tab.data();
+              mask = tsz - 1;
+              sh = 64 - bits;
+              cntL = S.cntL.data();
               break;
             }
             i = (i + 1) & mask;
           }
+          memcpy(&X[k].tp, &r[j].ts, 8);
           X[k].lid = lid;
-          X[k].ts = r[j].ts;
-          X[k].payload = r[j].payload;
           k++;
-          S.cntL[lid]++;
+          cntL[lid]++;
         }
       }
+    }
     const u32 np = (u32)S.hs.size();
+    const u64 mask = tsz - 1;
     S.posL.resize(np + 1);
     {
       u32* posL = S.posL.data();
@@ -2188,7 +2216,7 @@ static void person_phase() {
       }
       posL[np] = sum;
       u64* E = S.E.data();
-      for (size_t i = 0; i < n_e; i++) E[posL[X[i].lid]++] = ((u64)X[i].ts << 32) | X[i].payload;
+      for (size_t i = 0; i < n_e; i++) E[posL[X[i].lid]++] = X[i].tp;
       // posL[l] is now the end of person l
     }
     // ---- clicks of these persons, grouped by person
@@ -2202,14 +2230,14 @@ static void person_phase() {
           for (u32 j = 0; j < b.second; j++) {
             u64 h = r[j].h;
             u64 i = (h << P2bits) >> (64 - bits);
-            u32 lid = np;
+            u32 lid = np;  // a click of a person without events
             for (;;) {
               const PSlot& sl = S.tab[i];
-              if (!sl.used) break;
               if (sl.h == h) {
                 lid = sl.lid;
                 break;
               }
+              if (sl.h == 0) break;
               i = (i + 1) & mask;
             }
             S.lidC[kk++] = lid;
@@ -2288,7 +2316,7 @@ static void person_phase() {
       u32 ncell = 0;
       for (u32 i = ebeg; i < eend; i++) {
         const u64 e = Eall[i];
-        const u32 ts = (u32)(e >> 32), pl = (u32)e;
+        const u32 ts = (u32)e, pl = (u32)(e >> 32);
         const u32 b = ts >> BSHIFT;
         // every aggregate starts as {mn = max, mx = 0, cnt = 0, rev = 0} (reset when its bucket is consumed),
         // so the first event of a bucket needs no special case
