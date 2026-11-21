@@ -59,9 +59,9 @@ def main():
     new_run = (
         "RUN set -e; mkdir -p /out; \\\n"
         f'    F="{BASE}"; \\\n'
-        + "\n".join(compiles)
-        + "\n    g++ -std=c++17 -O2 -march=cascadelake -static -pthread -o /out/bench bench/driver.cpp & pd=$!; \\\n"
-        + f"    for p in {waits} $pd; do wait $p; done; \\\n"
+        + "".join(c + "\n" for c in compiles)
+        + "    g++ -std=c++17 -O2 -march=cascadelake -static -pthread -o /out/bench bench/driver.cpp & pd=$!; \\\n"
+        + f"    for p in {(waits + ' ') if waits else ''}$pd; do wait $p; done; \\\n"
         + "    strip /out/*; \\\n    cp bench/generate bench/variants.txt /out/; \\\n"
         + "    if [ -d bench/prebuilt ]; then cp bench/prebuilt/* /out/; fi; \\\n    ls -la /out\n"
     )

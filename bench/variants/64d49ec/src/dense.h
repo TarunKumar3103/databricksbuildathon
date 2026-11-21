@@ -130,7 +130,7 @@ static NOINLINE void fail(const char* why) {
 static u64 g_ukey = 0, g_ekey = 0;
 static u64 g_ne_cap = 0;  // regular event indexes are below this
 static u32 g_nu_cap = 0;  // regular person indexes are below this (at most 2^23, so a user number fits 32 bits)
-static constexpr u32 KE = 14, KC = 9;  // event indexes per event partition, person indexes per click partition
+static constexpr u32 KE = 14, KC = 8;  // event indexes per event partition, person indexes per click partition
 static constexpr u32 ESLOTS = 1u << KE, ELOM = ESLOTS - 1;
 static u32 g_PE = 0, g_PC = 0;
 static i64 g_ing_base = 0;  // ingest_ts is kept as whole seconds since this, plus 1, in 24 bits
@@ -514,27 +514,44 @@ static void init_daycode() {
     for (int i = 0; i < 416; i++) g_daycode[k][i] = g_dayms[k][i] == DAYMS_NONE ? 0 : (g_dayms[k][i] - g_ing_base) / 1000 + 1;
 }
 
-// Eight 32-bit lanes at a time (mask compares and compress-store with AVX-512, plain AVX2 otherwise).
+// Eight 32-bit lanes at a time (mask compares with AVX-512, plain AVX2 otherwise).
 #if defined(__AVX512VL__) && defined(__AVX512DQ__) && defined(__AVX512F__)
 static FORCE_INLINE __m256i movm32x8(u32 m) { return _mm256_movm_epi32((__mmask8)m); }  // -1 in the lanes of set bits
 static FORCE_INLINE u32 eq32x8(__m256i a, __m256i b) { return _mm256_cmpeq_epi32_mask(a, b); }
-// the indexes first + j of the set bits j of m, appended at dst (which has room for 8); returns how many
-static FORCE_INLINE u32 list8(u32* dst, u32 m, u32 first) {
-  _mm256_mask_compressstoreu_epi32(dst, (__mmask8)m, _mm256_add_epi32(_mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7), _mm256_set1_epi32((int)first)));
-  return (u32)_mm_popcnt_u32(m);
-}
 #else
 static FORCE_INLINE __m256i movm32x8(u32 m) {
   const __m256i bits = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
   return _mm256_cmpeq_epi32(_mm256_and_si256(_mm256_set1_epi32((int)m), bits), bits);
 }
 static FORCE_INLINE u32 eq32x8(__m256i a, __m256i b) { return (u32)_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(a, b))); }
-static FORCE_INLINE u32 list8(u32* dst, u32 m, u32 first) {
-  u32 c = 0;
-  for (; m; m = _blsr_u32(m)) dst[c++] = first + (u32)_tzcnt_u32(m);
-  return c;
-}
 #endif
+
+// The lanes of v at the set bits of m (8 bits), moved down to lanes 0, 1, ... in order (the other lanes are
+// left undefined), by a table of the lane numbers for each m. pack8x also gives those lane numbers.
+// (One table load and one permute; with AVX-512 a compress instruction would do the same in about as many uops.)
+struct Lanes8 {
+  u64 ix[256];
+  constexpr Lanes8() : ix() {
+    for (u32 m = 0; m < 256; m++) {
+      u32 c = 0;
+      for (u32 l = 0; l < 8; l++)
+        if (m >> l & 1) ix[m] |= (u64)l << (8 * c++);
+    }
+  }
+};
+alignas(64) static constexpr Lanes8 k_lanes8{};
+static FORCE_INLINE __m256i lanes_of8(u32 m) { return _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*)(k_lanes8.ix + m))); }
+static FORCE_INLINE __m256i pack8(__m256i v, u32 m) { return _mm256_permutevar8x32_epi32(v, lanes_of8(m)); }
+static FORCE_INLINE __m256i pack8x(__m256i v, u32 m, __m256i& from) {
+  from = lanes_of8(m);
+  return _mm256_permutevar8x32_epi32(v, from);
+}
+// the indexes first + j of the set bits j of m, appended at dst (which has room for 8); returns how many.
+// (By the lane table with AVX-512 too, in place of a compress-store to memory.)
+static FORCE_INLINE u32 list8(u32* dst, u32 m, u32 first) {
+  _mm256_storeu_si256((__m256i*)dst, _mm256_add_epi32(lanes_of8(m), _mm256_set1_epi32((int)first)));
+  return (u32)_mm_popcnt_u32(m);
+}
 
 // A batch of lines as the scanner hands them over: per field, a column of starts (offsets from the chunk
 // base) and a column of lengths. Groups of eight lines arrive as columns of separators (scan_cols); single
@@ -545,25 +562,28 @@ struct Cols {
   alignas(32) u32 st[NF][CAP + 8];
   alignas(32) u32 ln[NF][CAP + 8];
   u32 n = 0;
+  // (n is read once into a local: the stores into st and ln could alias it as far as the compiler knows)
   FORCE_INLINE void add_group(const __m256i* C, const u32* q) {
     const __m256i one = _mm256_set1_epi32(1);
+    const u32 n0 = n;
     for (int k = 0; k < NF; k++) {
       const __m256i qm = movm32x8(q[k]);  // -1: quoted
-      _mm256_storeu_si256((__m256i*)(st[k] + n), _mm256_sub_epi32(_mm256_add_epi32(C[k], one), qm));
-      _mm256_storeu_si256((__m256i*)(ln[k] + n),
+      _mm256_storeu_si256((__m256i*)(st[k] + n0), _mm256_sub_epi32(_mm256_add_epi32(C[k], one), qm));
+      _mm256_storeu_si256((__m256i*)(ln[k] + n0),
                           _mm256_add_epi32(_mm256_sub_epi32(_mm256_sub_epi32(C[k + 1], C[k]), one), _mm256_add_epi32(qm, qm)));
     }
-    n += 8;
+    n = n0 + 8;
   }
   FORCE_INLINE void add_row(__m256i s, __m256i l, u32 keep) {  // (the row stays only if keep is 1)
     alignas(32) u32 a[8], b[8];
     _mm256_store_si256((__m256i*)a, s);
     _mm256_store_si256((__m256i*)b, l);
+    const u32 n0 = n;
     for (int k = 0; k < NF; k++) {
-      st[k][n] = a[k];
-      ln[k][n] = b[k];
+      st[k][n0] = a[k];
+      ln[k][n0] = b[k];
     }
-    n += keep;
+    n = n0 + keep;
   }
   // the lanes after the last line read as empty fields at offset 0 (they are loaded, and gathered from)
   void pad() {
@@ -784,7 +804,9 @@ static NOINLINE u32 process_events(EvB& B, const u8* const base, WCScatter<D16>:
       const __m256i idx = _mm256_load_si256((const __m256i*)(B.idx + i));
       const __m256i num = _mm256_cvtepu32_epi64(_mm_load_si128((const __m128i*)(B.num + i)));
       // negative if: ts before the window, ts after it, the code out of range (either side), ingest too late
-      const __m256i late = _mm256_sub_epi64(_mm256_add_epi64(late0, rel), mullo64x4(ic1, k1000));
+      // (the low 32 bits of ic1 times 1000 is its product wherever it matters: a code out of [1, 0xFFFFFE] is
+      // caught by the two code terms below either way)
+      const __m256i late = _mm256_sub_epi64(_mm256_add_epi64(late0, rel), _mm256_mul_epu32(ic1, k1000));
       const __m256i neg = _mm256_or_si256(_mm256_or_si256(_mm256_or_si256(rel, _mm256_sub_epi64(wlast, rel)),
                                                           _mm256_or_si256(ic1, _mm256_sub_epi64(cmax, ic1))),
                                           late);
@@ -797,28 +819,49 @@ static NOINLINE u32 process_events(EvB& B, const u8* const base, WCScatter<D16>:
       _mm_store_si128((__m128i*)(B.part + i), low32x4(_mm256_srli_epi64(idx, KE)));
     }
   }
-  // ---- which lines are plain: a user and a product, the type view or cart; eight lines at a time
-  u64 plain = 0, kept = 0;  // kept: the line has an event_id (a line without one is dropped)
+  // ---- which lines are plain: a user and a product, the type view or cart; eight lines at a time. (purch:
+  // the same with a type that starts "purc" in 8 bytes, the candidates for a purchase.)
+  u64 plain = 0, kept = 0, purch = 0;  // kept: the line has an event_id (a line without one is dropped)
   {
-    const __m256i zero = _mm256_setzero_si256(), c4 = _mm256_set1_epi32(4);
-    const __m256i view = _mm256_set1_epi32(0x77656976), cart = _mm256_set1_epi32(0x74726163);
+    const __m256i zero = _mm256_setzero_si256(), c4 = _mm256_set1_epi32(4), c8 = _mm256_set1_epi32(8);
+    const __m256i view = _mm256_set1_epi32(0x77656976), cart = _mm256_set1_epi32(0x74726163), purc = _mm256_set1_epi32(0x63727570);
     for (u32 i = 0; i < n; i += 8) {
-      const __m256i w4 = _mm256_load_si256((const __m256i*)(B.w4 + i));
-      const u32 simple = eq32x8(_mm256_load_si256((const __m256i*)(B.ln[4] + i)), c4) & (eq32x8(w4, view) | eq32x8(w4, cart));
+      const __m256i w4 = _mm256_load_si256((const __m256i*)(B.w4 + i)), l4 = _mm256_load_si256((const __m256i*)(B.ln[4] + i));
+      const u32 simple = eq32x8(l4, c4) & (eq32x8(w4, view) | eq32x8(w4, cart));
       const u32 empty = eq32x8(_mm256_load_si256((const __m256i*)(B.ln[1] + i)), zero) | eq32x8(_mm256_load_si256((const __m256i*)(B.ln[5] + i)), zero);
       const u32 noid = eq32x8(_mm256_load_si256((const __m256i*)(B.ln[0] + i)), zero);
       plain |= (u64)(simple & ~empty & 0xFF) << i;
+      purch |= (u64)(eq32x8(l4, c8) & eq32x8(w4, purc) & ~empty & 0xFF) << i;
       kept |= (u64)(~noid & 0xFF) << i;
     }
   }
   kept &= nmask;
   plain &= kept & ~(irr | bad);
+  purch &= kept & ~(irr | bad);
   // ---- the scatter
   auto cur = cur_out;
+  // (c: a copy of the cursor whose address never escapes, so that the compiler keeps it in registers;
+  // cur itself is handed to ev_slow below)
+  auto c = cur;
   for (u64 m = plain; m; m = _blsr_u64(m)) {
     const u32 i = (u32)_tzcnt_u64(m);
-    WCScatter<D16>::push16(cur, B.part[i], _mm_load_si128((const __m128i*)&B.rec[i]));
+    WCScatter<D16>::push16(c, B.part[i], _mm_load_si128((const __m128i*)&B.rec[i]));
   }
+  // purchases with a valid price whose category and price fit the record: the plain record and the payload.
+  // Anything else about them (a bad price, a payload that does not fit) is left to ev_slow, as before.
+  for (u64 m = purch; m; m = _blsr_u64(m)) {
+    const u32 i = (u32)_tzcnt_u64(m);
+    u64 w8;
+    memcpy(&w8, base + B.st[4][i], 8);
+    u32 price;
+    if (w8 != 0x6573616863727570ULL || !price_fast(base + B.st[6][i], B.ln[6][i], price)) continue;  // "purchase"
+    const u32 cat = cat_fast(base + B.st[5][i], B.ln[5][i]);
+    if (cat >= 32 || price >= (1u << 17)) continue;
+    plain |= 1ULL << i;
+    const u64 w1 = B.rec[i].w1 | ((u64)((cat << 17) | price) << 24);
+    WCScatter<D16>::push16(c, B.part[i], _mm_set_epi64x((long long)w1, (long long)B.rec[i].w0));
+  }
+  cur = c;
   for (u64 m = kept & ~plain; m; m = _blsr_u64(m)) {
     const u32 i = (u32)_tzcnt_u64(m);
     ev_slow(tl, tid, B, i, !((irr >> i) & 1), base, ws, wlen, cur);
@@ -1072,9 +1115,11 @@ static void parse(std::vector<MFile>& ev, std::vector<MFile>& ck) {
   for (auto& f : ev) ev_bytes += f.size;
   for (auto& f : ck) ck_bytes += f.size;
   size_t chunk = std::max<size_t>(1 << 18, std::min<size_t>(8 << 20, (ev_bytes + ck_bytes) / (NT * 24 + 1)));
+  // The click files come last, so their chunks decide how far apart the threads finish: they are smaller.
+  const size_t chunk_ck = std::max<size_t>(1 << 18, std::min<size_t>(chunk, ck_bytes / (NT * 32 + 1)));
   std::vector<Chunk> ce, cc;
   make_chunks(ev, chunk, ce);
-  make_chunks(ck, chunk, cc);
+  make_chunks(ck, chunk_ck, cc);
   const i64 ws = g_ws, we = g_we, cws = g_ws - WEEK;
   parallel_for((int)(ce.size() + cc.size()), [&](int t, int tid) {
     if (g_fail.load(std::memory_order_relaxed)) return;
@@ -1203,57 +1248,29 @@ static NOINLINE bool place(u32 j, D16* T, DS& S) {
   if (!nblk) return false;
   S.blk.push_back(S.blk[0]);  // (something harmless to prefetch after the last block)
   for (size_t bi = 0; bi < nblk; bi++) {
+    // (the blocks were written long ago: the whole next one is asked for while this one is placed)
     const char* const nx = (const char*)S.blk[bi + 1].first;
-    _mm_prefetch(nx, _MM_HINT_T0);
-    _mm_prefetch(nx + 64, _MM_HINT_T0);
-    _mm_prefetch(nx + 128, _MM_HINT_T0);
-    _mm_prefetch(nx + 192, _MM_HINT_T0);
+    const u32 nxb = S.blk[bi + 1].second * (u32)sizeof(D16);
+    for (u32 o = 0; o < nxb; o += 64) _mm_prefetch(nx + o, _MM_HINT_T0);
     const D16* r = S.blk[bi].first;
-    const u32 n = S.blk[bi].second;
-    for (u32 i = 0; i < n; i++) {
-      const u64 w0 = r[i].w0, w1 = r[i].w1;
-      D16& s = T[(w1 >> 46) & ELOM];
-      const u64 o0 = s.w0, o1 = s.w1;
+    const D16* const re = r + S.blk[bi].second;
+    u8* const Tb = (u8*)T;
+    auto put = [Tb](const D16* q) __attribute__((always_inline)) {
+      const u64 w0 = q->w0, w1 = q->w1;
+      D16* const s = (D16*)(Tb + ((w1 >> 42) & ((u64)ELOM << 4)));  // (the slot is bits 46 to 59)
+      const u64 o0 = s->w0, o1 = s->w1;
       // (an empty slot has code 0, which wraps to the largest value)
-      const bool take = (u32)(((u32)w1 & 0xFFFFFF) - 1) < (u32)(((u32)o1 & 0xFFFFFF) - 1);
-      s.w0 = take ? w0 : o0;
-      s.w1 = take ? w1 : o1;
+      const bool take = _bzhi_u32((u32)w1, 24) - 1 < _bzhi_u32((u32)o1, 24) - 1;
+      s->w0 = take ? w0 : o0;
+      s->w1 = take ? w1 : o1;
+    };
+    for (; r + 2 <= re; r += 2) {  // (in order: two records may have the same slot)
+      put(r);
+      put(r + 1);
     }
+    if (r < re) put(r);
   }
   return true;
-}
-
-// The valid event of a regular user in a slot, if there is one: its user number.
-static FORCE_INLINE bool slot_user(const D16& s, u32& un) {
-  const u32 tsf = (u32)s.w0;
-  if ((tsf & 0x7FFFFFFF) == 0) return false;
-  un = (u32)(s.w0 >> 32);
-  if (__builtin_expect((i32)tsf < 0, 0)) {
-    const XEv& x = g_tl[un >> 24].xev[un & 0xFFFFFF];
-    if (x.num == NONE) return false;
-    un = x.num;
-  }
-  return true;
-}
-// ... and whether it is an event of a dense person: the person index.
-static FORCE_INLINE bool slot_dense(const D16& s, u32& p) {
-  u32 un;
-  if (!slot_user(s, un)) return false;
-  p = un >> 9;
-  return (un & 511) < dense_cnt(g_acc[p].load(std::memory_order_relaxed));
-}
-
-// The dense person of the last event before partition pb (NONE if there is none).
-static u32 find_prev_person(u32 pb, DS& S) {
-  for (i64 j = (i64)pb - 1; j >= 0; j--) {
-    if (!place((u32)j, S.T, S)) continue;
-    u32 q = NONE;
-    for (u32 i = ESLOTS; i-- > 0;)
-      if (slot_dense(S.T[i], q)) break; else q = NONE;
-    memset(S.T, 0, sizeof(D16) * ESLOTS);
-    if (q != NONE) return q;
-  }
-  return NONE;
 }
 
 // The clicks of click partition cp that do not belong to a dense person -> the general person phase.
@@ -1328,6 +1345,9 @@ static FORCE_INLINE u32 inwin8(const u32* t, u32 lo, u32 hi) {
   return (u32)_mm256_movemask_ps(_mm256_castsi256_ps(in));
 #endif
 }
+
+// The larger of two values, never as a branch.
+static FORCE_INLINE u32 umax32(u32 a, u32 b) { return a ^ ((a ^ b) & (0u - (u32)(a < b))); }
 
 // How many of the eight values at p are below t / at most t (unsigned).
 static FORCE_INLINE u32 cnt_lt8(const u32* p, u32 t) {
@@ -1409,7 +1429,7 @@ static FORCE_INLINE void day_ranges(const u32* endr, const u32* evr, Days& D) {
   alignas(32) u32 s[16], e[16], n[16], v[16];
   u32 pe = 0, pc = 0;
   for (int d = 0; d < 16; d++) {
-    const u32 ne = std::max(pe, endr[d]), nc = std::max(pc, evr[d]);
+    const u32 ne = umax32(pe, endr[d]), nc = umax32(pc, evr[d]);
     s[d] = pe;
     e[d] = ne;
     n[d] = ne - pe;
@@ -1484,9 +1504,9 @@ struct SegStat {
   u64 n_persons = 0, n_events = 0, n_general = 0;
 };
 
-// Partitions [pb, pe): a thread's share of the scan. The first dense person met may have begun before pb:
-// its events here are left to the thread that scans the partitions before (it reads on past its own share
-// until that person ends), just as this thread reads on past pe for its last person.
+// Partitions [pb, pe): a thread's share of the scan. The first dense person met in them is left to the thread
+// that scans the partitions before, which reads on past its own share for the first dense person out there,
+// just as this thread reads on past pe (see the two places below).
 //
 // A person's events arrive in time order, one after the other. Each one costs a few instructions without a
 // branch that depends on the data: it is counted, and it starts a session if it comes more than 30 minutes
@@ -1673,8 +1693,12 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
       u64* const sclick = S.sclick.data();
       sort_person_clicks(S.pts.data(), S.pcamp.data(), S.pclick.data(), mc, S.tin.data(), sts, scamp, sclick, S.rtmp);
       // among clicks of one time the one with the smallest click_id counts: it goes last
-      for (u32 k = 1; k < mc; k++)
-        if (__builtin_expect(sts[k] == sts[k - 1], 0)) {
+      u32 tie = 0;
+      for (u32 v = 0; v < nv; v++)  // (the entries after the last click are all 0xFFFFFFFF: they are left out)
+        tie |= eq32x8(_mm256_loadu_si256((const __m256i*)(sts + 8 * v)), _mm256_loadu_si256((const __m256i*)(sts + 8 * v + 1))) &
+               (mc - 1 - 8 * v >= 8 ? 0xFFu : ((1u << (mc - 1 - 8 * v)) - 1));
+      for (u32 k = 1; __builtin_expect(tie != 0, 0) && k < mc; k++)
+        if (sts[k] == sts[k - 1]) {
           const u32 r0 = k - 1;
           u32 r1 = k + 1;
           while (r1 < mc && sts[r1] == sts[r0]) r1++;
@@ -1817,9 +1841,11 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
   };
 
   // ---- this thread's partitions
-  const u32 q_skip = pb ? find_prev_person(pb, S) : NONE;  // the events of this person at the start are not ours
-  if (q_skip != NONE) prev_p = q_skip;
-  bool skipping = q_skip != NONE;
+  // The first dense person met in a thread's partitions is not its own (but in the first segment): the thread
+  // before reads on past its partitions for that person, wherever it began. So nothing has to be looked up
+  // before the segment, and a segment costs little.
+  u32 q_skip = NONE;        // that person, once it is met
+  bool skipping = pb != 0;  // until another dense person comes
   // An event that is not of the open person's IDs: of another dense person (which becomes the open one: true),
   // or of none (false; it goes to the general phase unless it is the previous thread's to deal with).
   auto other = [&](const u32 un, const u32 ts, const u32 cat, const u32 price) -> bool {
@@ -1835,6 +1861,10 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
       return false;
     }
     if (skipping) {
+      if (q_skip == NONE) {
+        q_skip = p;
+        prev_p = p;
+      }
       if (p == q_skip) return false;
       skipping = false;
     }
@@ -1847,48 +1877,142 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
   i64 h_prev = ps.prev, h_order = ps.order;
 #define DN_OUT() (ps.ns = h_ns, ps.nev = h_nev, ps.prev = h_prev, ps.order = h_order)
 #define DN_IN() (h_base = ps.cur_base, h_cnt = ps.cur_cnt, h_ns = ps.ns, h_nev = ps.nev, h_xnext = ps.x_next, h_prev = ps.prev, h_order = ps.order)
+  // One slot, the whole way (a macro, so that the state stays in the locals above; continue leaves it).
+#define DN_SLOT(I)                                                                       \
+  do {                                                                                   \
+    const u64 w0 = T[I].w0;                                                              \
+    const u32 tsf = (u32)w0;                                                             \
+    if ((tsf & 0x7FFFFFFF) == 0) continue; /* no record, or an event that is not valid */ \
+    const u32 ts = (tsf & 0x7FFFFFFF) - 1;                                               \
+    u32 un = (u32)(w0 >> 32), cat = 0, price = 0;                                        \
+    if (__builtin_expect((i32)tsf < 0, 0)) { /* a side entry */                          \
+      const XEv& x = g_tl[un >> 24].xev[un & 0xFFFFFF];                                  \
+      if (x.num == NONE) {                                                               \
+        push_r2(c2, p2shift, person_of(x.uid), ts, x.payload);                           \
+        n_general++;                                                                     \
+        continue;                                                                        \
+      }                                                                                  \
+      un = x.num;                                                                        \
+      cat = x.payload >> 24;                                                             \
+      price = x.payload & 0xFFFFFF;                                                      \
+    } else {                                                                             \
+      const u32 pay = (u32)(T[I].w1 >> 24) & 0x3FFFFF;                                   \
+      if (__builtin_expect(pay != 0, 0)) {                                               \
+        cat = pay >> 17;                                                                 \
+        price = pay & 0x1FFFF;                                                           \
+      }                                                                                  \
+    }                                                                                    \
+    if (__builtin_expect(un - h_base >= h_cnt, 0)) { /* not an ID of the open person */  \
+      DN_OUT();                                                                          \
+      const bool mine = other(un, ts, cat, price);                                       \
+      DN_IN();                                                                           \
+      if (!mine) continue;                                                               \
+    }                                                                                    \
+    if (__builtin_expect(ts >= h_xnext, 0)) {                                            \
+      DN_OUT();                                                                          \
+      feed_extras(ts);                                                                   \
+      DN_IN();                                                                           \
+    }                                                                                    \
+    DN_FEED(h_ns, h_nev, h_prev, h_order, ts, cat, price);                               \
+  } while (0)
+  static_assert(ESLOTS % 8 == 0, "the slot table is read in groups of eight");
+  // Eight slots at a time. The vector path takes the valid events of a group up to the first one it cannot:
+  // a side entry or an ID that is not of the open person. That one goes the whole way, and the vector path
+  // goes on with the slots after it. The vector path runs only while a person is open, has no extra event
+  // still to come, and its last time fits 31 bits (so the gaps fit 32-bit lanes).
+  bool vec_ok = false;
+  __m256i v_base = _mm256_setzero_si256(), v_cnt = _mm256_setzero_si256();
+  // (the asm statements keep the compiler from building these again from scalars in every group)
+#define DN_VEC()                                                                      \
+  do {                                                                                \
+    vec_ok = h_cnt != 0 && h_xnext == NONE && (u64)h_prev < 0x80000000ULL;            \
+    v_base = _mm256_set1_epi32((int)h_base);                                          \
+    v_cnt = _mm256_set1_epi32((int)h_cnt);                                            \
+    __asm__("" : "+x"(v_base), "+x"(v_cnt));                                          \
+  } while (0)
+  __m256i k_ord = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7), k_sh1 = _mm256_setr_epi32(0, 0, 1, 2, 3, 4, 5, 6);
+  __m256i k_m31 = _mm256_set1_epi32(0x7FFFFFFF), k_min30 = _mm256_set1_epi32((int)MIN30);
+  __m256i k_price = _mm256_set1_epi64x(0x1FFFFLL << 24);
+  __asm__("" : "+x"(k_ord), "+x"(k_sh1), "+x"(k_m31), "+x"(k_min30), "+x"(k_price));
+  alignas(32) u32 pbuf[16];
   for (u32 j = pb; j < pe && !g_fail.load(std::memory_order_relaxed); j++) {
     if (!place(j, T, S)) continue;
-    for (u32 i = 0; i < ESLOTS; i++) {
-      const u64 w0 = T[i].w0;
-      const u32 tsf = (u32)w0;
-      if ((tsf & 0x7FFFFFFF) == 0) continue;  // no record, or an event that is not valid
-      const u32 ts = (tsf & 0x7FFFFFFF) - 1;
-      u32 un = (u32)(w0 >> 32), cat = 0, price = 0;
-      if (__builtin_expect((i32)tsf < 0, 0)) {  // a side entry
-        const XEv& x = g_tl[un >> 24].xev[un & 0xFFFFFF];
-        if (x.num == NONE) {
-          push_r2(c2, p2shift, person_of(x.uid), ts, x.payload);
-          n_general++;
-          continue;
+    DN_VEC();
+    for (u32 i = 0; i < ESLOTS; i += 8) {
+      u32 done = 0;  // the slots of the group that are dealt with
+      for (;;) {
+        u32 k;  // the first slot the vector path did not take
+        if (__builtin_expect(vec_ok, 1)) {
+          const __m256i* const tv = (const __m256i*)(T + i);
+          const __m256i L0 = _mm256_load_si256(tv), L1 = _mm256_load_si256(tv + 1);
+          const __m256i L2 = _mm256_load_si256(tv + 2), L3 = _mm256_load_si256(tv + 3);
+          const __m256 X = _mm256_castsi256_ps(_mm256_unpacklo_epi64(L0, L1));  // w0 of slots 0 2 | 1 3
+          const __m256 Y = _mm256_castsi256_ps(_mm256_unpacklo_epi64(L2, L3));  // ... 4 6 | 5 7
+          const __m256i TF = _mm256_permutevar8x32_epi32(_mm256_castps_si256(_mm256_shuffle_ps(X, Y, 0x88)), k_ord);  // low words
+          const __m256i UN = _mm256_permutevar8x32_epi32(_mm256_castps_si256(_mm256_shuffle_ps(X, Y, 0xDD)), k_ord);  // user numbers
+          const __m256i TV = _mm256_and_si256(TF, k_m31);
+          const u32 avail = ~((u32)_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(TV, _mm256_setzero_si256()))) | done) & 0xFF;
+          // not of the open person: un - base >= cnt, unsigned; a side entry has the top bit of its low word
+          const __m256i D = _mm256_sub_epi32(UN, v_base);
+          const __m256i OUT = _mm256_or_si256(_mm256_cmpeq_epi32(_mm256_max_epu32(D, v_cnt), D), TF);
+          const u32 irr = (u32)_mm256_movemask_ps(_mm256_castsi256_ps(OUT)) & avail;
+          k = _tzcnt_u32(irr | 0x100);
+          const u32 fm = _bzhi_u32(avail, k), n = (u32)_mm_popcnt_u32(fm);
+          // the times of the events it takes, in order, and their gaps
+          const __m256i TC = _mm256_sub_epi32(pack8(TV, fm), _mm256_set1_epi32(1));
+          const u32 prev32 = (u32)h_prev;
+          const __m256i SH = _mm256_blend_epi32(_mm256_permutevar8x32_epi32(TC, k_sh1), _mm256_castsi128_si256(_mm_cvtsi32_si128((int)prev32)), 1);
+          const __m256i G = _mm256_sub_epi32(TC, SH);
+          const u32 bad = _bzhi_u32((u32)_mm256_movemask_ps(_mm256_castsi256_ps(G)), n);
+          const u32 st = _bzhi_u32((u32)_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(G, k_min30))), n);
+          // the sessions they start (the lanes after the last start are written too, and are never read)
+          __m256i from;
+          const __m256i SS = pack8x(TC, st, from);
+          const u32 ns0 = h_ns;
+          _mm256_storeu_si256((__m256i*)(sess_ts + ns0), SS);
+          _mm256_storeu_si256((__m256i*)(sess_ev + ns0), _mm256_add_epi32(from, _mm256_set1_epi32((int)h_nev)));
+          h_ns += (u32)_mm_popcnt_u32(st);
+          h_nev += n;
+          h_order |= -(i64)bad;
+          pbuf[0] = prev32;
+          _mm256_storeu_si256((__m256i*)(pbuf + 1), TC);
+          h_prev = pbuf[n];
+          const __m256i P = _mm256_unpackhi_epi64(L0, L1), Q = _mm256_unpackhi_epi64(L2, L3);  // w1 of slots 0 2 1 3, 4 6 5 7
+          if (__builtin_expect(!_mm256_testz_si256(_mm256_or_si256(P, Q), k_price), 0)) {  // a purchase among the 8 slots
+            const __m256i z = _mm256_setzero_si256();
+            const u32 pz = (u32)_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(_mm256_and_si256(_mm256_permute4x64_epi64(P, 0xD8), k_price), z))) |
+                           (u32)_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(_mm256_and_si256(_mm256_permute4x64_epi64(Q, 0xD8), k_price), z))) << 4;
+            for (u32 m = fm & ~pz; m; m = _blsr_u32(m)) {
+              const u32 l = (u32)_tzcnt_u32(m), pay = (u32)(T[i + l].w1 >> 24) & 0x3FFFFF;
+              const u32 c = (u32)_mm_popcnt_u32(fm & ((1u << l) - 1));  // its place among the events taken
+              S.pur.push_back(DS::Pur{ns0 + (u32)_mm_popcnt_u32(st & ((2u << c) - 1)) - 1, pay >> 17, pay & 0x1FFFF});
+            }
+          }
+          if (__builtin_expect(h_ns >= SCAP, 0)) {  // (as in DN_FEED)
+            h_order = -1;
+            h_ns = 1;
+          }
+          if (k >= 8) break;
+        } else {
+          k = (u32)_tzcnt_u32(~done);
         }
-        un = x.num;
-        cat = x.payload >> 24;
-        price = x.payload & 0xFFFFFF;
-      } else {
-        const u32 pay = (u32)(T[i].w1 >> 24) & 0x3FFFFF;
-        if (__builtin_expect(pay != 0, 0)) {
-          cat = pay >> 17;
-          price = pay & 0x1FFFF;
-        }
+        DN_SLOT(i + k);
+        DN_VEC();
+        done = (2u << k) - 1;
+        if (done == 0xFF) break;
       }
-      if (__builtin_expect(un - h_base >= h_cnt, 0)) {  // not an ID of the open person
-        DN_OUT();
-        const bool mine = other(un, ts, cat, price);
-        DN_IN();
-        if (!mine) continue;
-      }
-      if (__builtin_expect(ts >= h_xnext, 0)) {
-        DN_OUT();
-        feed_extras(ts);
-        DN_IN();
-      }
-      DN_FEED(h_ns, h_nev, h_prev, h_order, ts, cat, price);
     }
     memset(T, 0, sizeof(D16) * ESLOTS);
   }
-  // ---- the rest of the open person, in the partitions after ours
-  if (ps.cur_p != NONE || h_cnt) {
+#undef DN_SLOT
+#undef DN_VEC
+  // ---- past our partitions: the first dense person met there is ours too, whether it is the open person
+  // going on or a new one (the thread that has those partitions leaves it alone, see above). Two cases have
+  // nothing to do: no dense person at all in our partitions (then the first one out there was already the
+  // first one here, and the thread before us has it), and only the one we left to the thread before, if
+  // that one is still going on out there.
+  if (pb == 0 || !skipping || q_skip != NONE) {
+    bool taken = false;  // the first dense person out there has come
     for (u32 j = pe; j < g_PE && !g_fail.load(std::memory_order_relaxed); j++) {
       if (!place(j, T, S)) continue;
       bool stop = false;
@@ -1909,14 +2033,22 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
           cat = pay >> 17;
           price = pay & 0x1FFFF;
         }
-        if (un - h_base >= h_cnt) {
+        if (un - h_base >= h_cnt) {  // not an ID of the open person
           const u32 p = un >> 9;
-          if (p != (h_base >> 9) && (un & 511) < dense_cnt(acc[p].load(std::memory_order_relaxed))) {  // the next dense person
+          if (p == ps.cur_p) continue;  // (an ID of its index that is not one of the dense person)
+          const u64 ac = acc[p].load(std::memory_order_relaxed);
+          const u32 cnt = dense_cnt(ac);
+          if ((un & 511) >= cnt) continue;  // no dense person's event: the other thread's to hand on
+          if (taken || (skipping && p == q_skip)) {  // the person after ours / the one we left is still going on
             stop = true;
             break;
           }
-          continue;
+          DN_OUT();
+          close_person();
+          open_person(p, cnt, ac);
+          DN_IN();
         }
+        taken = true;
         if (__builtin_expect(ts >= h_xnext, 0)) {
           DN_OUT();
           feed_extras(ts);
@@ -1961,7 +2093,10 @@ static void scan_all() {
     total += cnt[j];
     if (cnt[j]) used = j + 1;
   }
-  const u32 nseg = std::max<u32>(1, std::min<u32>(used, (u32)NT * 4));
+  // (A segment costs little, one partition placed a second time, so they are small, about ten partitions:
+  // the threads then end the scan close together. SS_SEGPART sets another size, for tests.)
+  const u32 segpart = getenv("SS_SEGPART") ? (u32)std::max(1, atoi(getenv("SS_SEGPART"))) : 10;
+  const u32 nseg = std::max<u32>(1, std::min<u32>(used, std::max<u32>((u32)NT, used / segpart)));
   std::vector<u32> sb(nseg + 1, used);
   {
     u64 run = 0;

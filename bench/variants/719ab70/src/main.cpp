@@ -13,15 +13,18 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <immintrin.h>
+#include <linux/futex.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -88,6 +91,63 @@ static inline void thread_times(u64& user_us, u64& sys_us) {
 static int g_phase = 0;
 static const char* g_phase_names[16] = {"init", "links", "parse", "dedup", "person", "output"};
 
+// ---- the worker pool. The NT - 1 workers are started at the first parallel section and kept to the end: a
+// section then costs a wake-up, not NT - 1 thread starts (there are about twenty sections, some of them a
+// fraction of a millisecond long). A worker that finds nothing to do spins for a moment before it sleeps,
+// as the next section is usually close. Sections are posted by the main thread only, one at a time.
+struct PoolJob {
+  void (*run)(void* ctx, int t, int tid);
+  void* ctx;
+  int ntasks;
+  int phase;
+  alignas(64) std::atomic<int> next{0};
+  alignas(64) std::atomic<int> finished{0};
+};
+static std::atomic<PoolJob*> g_job{nullptr};
+static std::atomic<u32> g_job_seq{0};  // bumped for every job; the workers sleep on it
+static bool g_pool_up = false;
+
+static inline void futex_wait(std::atomic<u32>* a, u32 seen) {
+  syscall(SYS_futex, (u32*)a, FUTEX_WAIT_PRIVATE, seen, nullptr, nullptr, 0);
+}
+static inline void futex_wake_all(std::atomic<u32>* a) { syscall(SYS_futex, (u32*)a, FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0); }
+
+// Tasks of job j until none is left.
+static void pool_take(PoolJob* j, int tid) {
+  u64 u0 = 0, s0 = 0, u1, s1;
+  bool any = false;
+  for (;;) {
+    if (j->next.load(std::memory_order_relaxed) >= j->ntasks) break;
+    const int t = j->next.fetch_add(1, std::memory_order_relaxed);
+    if (t >= j->ntasks) break;
+    if (!any && g_log) thread_times(u0, s0);
+    any = true;
+    j->run(j->ctx, t, tid);
+    if (g_log) {  // (task by task, so that the times are in before the job counts as done)
+      thread_times(u1, s1);
+      g_phase_cycles[j->phase] += u1 - u0;
+      g_phase_sys[j->phase] += s1 - s0;
+      u0 = u1;
+      s0 = s1;
+    }
+    j->finished.fetch_add(1, std::memory_order_release);
+  }
+}
+static void pool_worker(int tid) {
+  u32 seen = 0;
+  for (;;) {
+    u32 s;
+    for (u32 spins = 0; (s = g_job_seq.load(std::memory_order_acquire)) == seen; spins++) {
+      if (spins < 20000)
+        _mm_pause();
+      else
+        futex_wait(&g_job_seq, seen);
+    }
+    seen = s;
+    pool_take(g_job.load(std::memory_order_acquire), tid);
+  }
+}
+
 template <class F>
 static void parallel_for(int ntasks, F&& f) {
   if (ntasks <= 0) return;
@@ -95,28 +155,24 @@ static void parallel_for(int ntasks, F&& f) {
     for (int t = 0; t < ntasks; t++) f(t, tl_serial_tid);
     return;
   }
-  std::atomic<int> next{0};
-  const int phase = g_phase;
-  auto worker = [&](int tid) {
-    u64 u0 = 0, s0 = 0, u1, s1;
-    if (g_log) thread_times(u0, s0);
-    for (;;) {
-      int t = next.fetch_add(1, std::memory_order_relaxed);
-      if (t >= ntasks) break;
-      f(t, tid);
+  // (a job is never freed: a worker may still look at one that is over, to find it has nothing left)
+  PoolJob* const j = new PoolJob;
+  typedef typename std::remove_reference<F>::type Fn;
+  j->run = [](void* ctx, int t, int tid) { (*(Fn*)ctx)(t, tid); };
+  j->ctx = (void*)&f;
+  j->ntasks = ntasks;
+  j->phase = g_phase;
+  if (NT > 1 && ntasks > 1) {
+    if (!g_pool_up) {
+      g_pool_up = true;
+      for (int i = 1; i < NT; i++) std::thread(pool_worker, i).detach();
     }
-    if (g_log) {
-      thread_times(u1, s1);
-      g_phase_cycles[phase] += u1 - u0;
-      g_phase_sys[phase] += s1 - s0;
-    }
-  };
-  int n = std::min(NT, ntasks);
-  std::vector<std::thread> th;
-  th.reserve(n);
-  for (int i = 1; i < n; i++) th.emplace_back(worker, i);
-  worker(0);
-  for (auto& t : th) t.join();
+    g_job.store(j, std::memory_order_release);
+    g_job_seq.fetch_add(1, std::memory_order_release);
+    futex_wake_all(&g_job_seq);
+  }
+  pool_take(j, 0);
+  while (j->finished.load(std::memory_order_acquire) < ntasks) _mm_pause();  // the tasks other threads still have
 }
 
 // Zero-filled memory for the big tables and the arenas, on huge pages where the kernel grants them: from
@@ -684,9 +740,19 @@ static bool parse_ts_ref(const u8* s, u32 n, i64& out) {
 // kernels do not accept is decided by parse_ts / parse_f1, so they only have to be right when they say yes.
 
 static u32 g_ytxt[2];          // candidate years as their 4 ASCII digits (0: none)
-static i64 g_dayms[2][416];    // [candidate][month * 32 + day] -> ms at 00:00 UTC, DAYMS_NONE if no such date
+// [row][month * 32 + day] -> ms at 00:00 UTC, DAYMS_NONE if no such date. Rows 0 and 1 are the candidate
+// years; row 2, all DAYMS_NONE, is for any other year (see year_row).
+static i64 g_dayms[3][416];
 static constexpr i64 DAYMS_NONE = INT64_MIN;
-static i64 g_daycode[2][416];  // the same in whole seconds since a base chosen by the dense path, plus 1
+static i64 g_daycode[3][416];  // the same in whole seconds since a base chosen by the dense path, plus 1
+// The row of g_dayms for a year given as its 4 ASCII digits: 1 or 0 for a candidate year, else 2. Two
+// compares and two conditional moves; the day lookup then rejects the other years with the impossible dates.
+static FORCE_INLINE u32 year_row(u32 y) {
+  u32 k = 2;
+  k = y == g_ytxt[0] ? 0 : k;
+  k = y == g_ytxt[1] ? 1 : k;
+  return k;
+}
 
 static void civil_from_days(i64 days, i64& y, i64& m, i64& d) {
   i64 z = days + 719468;
@@ -708,6 +774,7 @@ static void init_fast_years(i64 lo_ms, i64 hi_ms) {
   i64 m, d;
   civil_from_days(fdiv(lo_ms, DAY), ys[0], m, d);
   civil_from_days(fdiv(hi_ms, DAY), ys[1], m, d);
+  for (int i = 0; i < 416; i++) g_dayms[2][i] = DAYMS_NONE;
   for (int k = 0; k < 2; k++) {
     g_ytxt[k] = 0;
     for (int i = 0; i < 416; i++) g_dayms[k][i] = DAYMS_NONE;
@@ -754,8 +821,7 @@ static FORCE_INLINE bool f1_pair_mc(const u8* a, const u8* b, i64& ta, i64& tb, 
   u32 ya, yb;
   memcpy(&ya, a, 4);
   memcpy(&yb, b, 4);
-  const u32 ka = ya == g_ytxt[1], kb = yb == g_ytxt[1];
-  if (!(((ya == g_ytxt[0]) | ka) & ((yb == g_ytxt[0]) | kb))) return false;
+  const u32 ka = year_row(ya), kb = year_row(yb);
   const i64 da = g_dayms[ka][L[0]], db = g_dayms[kb][L[4]];
   if ((da == DAYMS_NONE) | (db == DAYMS_NONE)) return false;
   ta = da + (i64)(L[1] * 60 + L[2]) * 1000;
@@ -794,8 +860,7 @@ static FORCE_INLINE bool f1_one_mc(const u8* a, i64& ta, i64& ca) {
   __asm__("" : "+r"(L));
   u32 ya;
   memcpy(&ya, a, 4);
-  const u32 ka = ya == g_ytxt[1];
-  if (!((ya == g_ytxt[0]) | ka)) return false;
+  const u32 ka = year_row(ya);
   const i64 da = g_dayms[ka][L[0]];
   if (da == DAYMS_NONE) return false;
   const u32 sa = L[1] * 60 + L[2];
@@ -1635,6 +1700,26 @@ static inline bool parse_price(const u8* s, u32 n, u32& out) {
   return true;
 }
 
+// cat_of for the usual form "p<1..8 digits>" without a loop; everything else goes to cat_of.
+// Needs 9 readable bytes at s.
+static FORCE_INLINE u32 cat_fast(const u8* s, u32 n) {
+  const u32 nd = n - 1;
+  u64 v;
+  if (__builtin_expect((nd - 1 > 7) | (s[0] != 'p') | ((s[1] == '0') & (n != 2)), 0)) return cat_of(s, n);
+  if (__builtin_expect(!digits_le8(s + 1, nd, v) || v >= g_cat_by_num.size(), 0)) return cat_of(s, n);
+  return g_cat_by_num[v];
+}
+// parse_price for prices of 1..8 bytes without a loop (leading zeros included); longer ones go to parse_price.
+// Needs 8 readable bytes at s.
+static FORCE_INLINE bool price_fast(const u8* s, u32 n, u32& out) {
+  u64 v;
+  if (__builtin_expect(n - 1 > 7, 0)) return parse_price(s, n, out);
+  if (!digits_le8(s, n, v) || v < 1 || v > 10000000) return false;
+  out = (u32)v;
+  return true;
+}
+
+
 // Event lines are parsed a batch at a time, in three simple loops over the batch instead of one long loop
 // body per line: keys and hashes; timestamps, grouped by the form of `ts` so each group runs one kernel
 // without the form changing under it; validation, record assembly and the scatter.
@@ -2108,11 +2193,45 @@ static FORCE_INLINE u32 count_le(const u32* ts, u32 nv, u32 x) {
 // Up to RANK_MAX clicks, the rank of each one is counted with vector compares against all of them: no
 // data-dependent branch, and most persons have only a few clicks. Beyond that, a radix sort.
 static constexpr u32 RANK_MAX = 64;
+// The rank sort for up to 4 * NG clicks, as a fixed run of steps: nothing in it depends on the number of
+// clicks or on their times. The lanes after the last click get the largest key and all land on entry n.
+template <int NG>
+static FORCE_INLINE void rank_sort_fixed(const u32* ts, const u32* camp, const u64* click, const u32 n, u32* sts,
+                                         u32* scamp, u64* sclick) {
+  alignas(32) u64 key[4 * NG];
+  __m256i kv[NG], cnt[NG];
+  const __m256i flip = _mm256_set1_epi64x((long long)0x8000000000000000ULL);
+  const __m256i big = _mm256_set1_epi64x(INT64_MAX), last = _mm256_set1_epi64x((long long)n - 1);
+  for (int g = 0; g < NG; g++) {
+    const __m256i pos = _mm256_setr_epi64x(4 * g, 4 * g + 1, 4 * g + 2, 4 * g + 3);
+    const __m256i t = _mm256_cvtepu32_epi64(_mm_loadu_si128((const __m128i*)(ts + 4 * g)));
+    const __m256i k = _mm256_xor_si256(_mm256_or_si256(_mm256_slli_epi64(t, 32), pos), flip);
+    kv[g] = _mm256_blendv_epi8(k, big, _mm256_cmpgt_epi64(pos, last));
+    _mm256_store_si256((__m256i*)(key + 4 * g), kv[g]);
+    cnt[g] = _mm256_setzero_si256();
+  }
+  for (int k = 0; k < 4 * NG; k++) {
+    const __m256i vk = _mm256_set1_epi64x((long long)key[k]);
+    for (int g = 0; g < NG; g++) cnt[g] = _mm256_sub_epi64(cnt[g], _mm256_cmpgt_epi64(kv[g], vk));
+  }
+  for (int g = 0; g < NG; g++) _mm256_store_si256((__m256i*)(key + 4 * g), cnt[g]);
+  for (u32 i = 0; i < 4 * NG; i++) {
+    const u32 r = (u32)key[i], j = i < n ? i : n - 1;  // (a lane after the last click: entry n, never used)
+    sts[r] = ts[j];
+    scamp[r] = camp[j];
+    sclick[r] = click[j];
+  }
+}
+
 static NOINLINE void sort_person_clicks(const u32* ts, const u32* camp, const u64* click, const u32 n, u32* tin,
                                         u32* sts, u32* scamp, u64* sclick, std::vector<u64>& tmp) {
   (void)tin;
   const __m256i ones = _mm256_set1_epi32(-1);
-  if (n <= RANK_MAX) {
+  if (n <= 8) {
+    rank_sort_fixed<2>(ts, camp, click, n, sts, scamp, sclick);
+  } else if (n <= 16) {
+    rank_sort_fixed<4>(ts, camp, click, n, sts, scamp, sclick);
+  } else if (n <= RANK_MAX) {
     // Keys that all differ: the time, then the position. The rank of a key is the number of keys below it,
     // counted for four keys at once against each key in turn. (Signed compares: the top bit is flipped.)
     alignas(32) u64 key[RANK_MAX + 8];
@@ -3143,6 +3262,14 @@ static int selftest() {
 
 static int bench_parse(const char* data, const char* file, int reps);
 
+// A profile-collecting build (clang -fprofile-instr-generate, used only to make pgo/clang18.profdata) writes its
+// profile at exit, which _exit skips; in every other build this symbol is absent and the call does nothing.
+extern "C" int __llvm_profile_write_file(void) __attribute__((weak));
+static inline void exit_now() {
+  if (__llvm_profile_write_file) __llvm_profile_write_file();
+  _exit(0);
+}
+
 int main(int argc, char** argv) {
   g_t0 = now_s();
   if (argc >= 2 && strcmp(argv[1], "--selftest") == 0) return selftest();
@@ -3277,7 +3404,7 @@ int main(int argc, char** argv) {
       release_memory();
       if (g_log) fprintf(stderr, "ABS end %.6f\n", now_s());
       fflush(nullptr);
-      _exit(0);
+      exit_now();
     }
   }
   if (dn::g_on) {
@@ -3339,7 +3466,7 @@ int main(int argc, char** argv) {
   release_memory();
   if (g_log) fprintf(stderr, "ABS end %.6f\n", now_s());
   fflush(nullptr);
-  _exit(0);  // nothing left to clean up that the kernel does not do anyway
+  exit_now();  // nothing left to clean up that the kernel does not do anyway
 }
 
 // ------------------------------------------------------------------------------------------

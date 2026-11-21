@@ -106,9 +106,6 @@ struct PoolJob {
 static std::atomic<PoolJob*> g_job{nullptr};
 static std::atomic<u32> g_job_seq{0};  // bumped for every job; the workers sleep on it
 static bool g_pool_up = false;
-// bench-only knobs (branch a-knobs2)
-static bool g_k_pool = true, g_k_release = true, g_k_thp = true, g_k_ckchunk = true;
-static u32 g_k_spin = 20000, g_k_chunk_kb = 8192;
 
 static inline void futex_wait(std::atomic<u32>* a, u32 seen) {
   syscall(SYS_futex, (u32*)a, FUTEX_WAIT_PRIVATE, seen, nullptr, nullptr, 0);
@@ -141,7 +138,7 @@ static void pool_worker(int tid) {
   for (;;) {
     u32 s;
     for (u32 spins = 0; (s = g_job_seq.load(std::memory_order_acquire)) == seen; spins++) {
-      if (spins < g_k_spin)
+      if (spins < 20000)
         _mm_pause();
       else
         futex_wait(&g_job_seq, seen);
@@ -165,14 +162,6 @@ static void parallel_for(int ntasks, F&& f) {
   j->ctx = (void*)&f;
   j->ntasks = ntasks;
   j->phase = g_phase;
-  if (!g_k_pool && NT > 1 && ntasks > 1) {  // (as before the pool: threads for this section only)
-    std::vector<std::thread> th;
-    const int n = std::min(NT, ntasks);
-    for (int i = 1; i < n; i++) th.emplace_back(pool_take, j, i);
-    pool_take(j, 0);
-    for (auto& t : th) t.join();
-    return;
-  }
   if (NT > 1 && ntasks > 1) {
     if (!g_pool_up) {
       g_pool_up = true;
@@ -196,7 +185,7 @@ static void* vm_alloc(size_t bytes) {
   u8* p = (u8*)mmap(nullptr, bytes + (huge ? HP : 0), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
   if (p == MAP_FAILED) die("mmap anonymous");
   if (huge) p = (u8*)(((uintptr_t)p + HP - 1) & ~(uintptr_t)(HP - 1));  // (the unused ends are never touched)
-  if (g_k_thp) madvise(p, bytes, MADV_HUGEPAGE);
+  madvise(p, bytes, MADV_HUGEPAGE);
   return p;
 }
 
@@ -751,9 +740,19 @@ static bool parse_ts_ref(const u8* s, u32 n, i64& out) {
 // kernels do not accept is decided by parse_ts / parse_f1, so they only have to be right when they say yes.
 
 static u32 g_ytxt[2];          // candidate years as their 4 ASCII digits (0: none)
-static i64 g_dayms[2][416];    // [candidate][month * 32 + day] -> ms at 00:00 UTC, DAYMS_NONE if no such date
+// [row][month * 32 + day] -> ms at 00:00 UTC, DAYMS_NONE if no such date. Rows 0 and 1 are the candidate
+// years; row 2, all DAYMS_NONE, is for any other year (see year_row).
+static i64 g_dayms[3][416];
 static constexpr i64 DAYMS_NONE = INT64_MIN;
-static i64 g_daycode[2][416];  // the same in whole seconds since a base chosen by the dense path, plus 1
+static i64 g_daycode[3][416];  // the same in whole seconds since a base chosen by the dense path, plus 1
+// The row of g_dayms for a year given as its 4 ASCII digits: 1 or 0 for a candidate year, else 2. Two
+// compares and two conditional moves; the day lookup then rejects the other years with the impossible dates.
+static FORCE_INLINE u32 year_row(u32 y) {
+  u32 k = 2;
+  k = y == g_ytxt[0] ? 0 : k;
+  k = y == g_ytxt[1] ? 1 : k;
+  return k;
+}
 
 static void civil_from_days(i64 days, i64& y, i64& m, i64& d) {
   i64 z = days + 719468;
@@ -775,6 +774,7 @@ static void init_fast_years(i64 lo_ms, i64 hi_ms) {
   i64 m, d;
   civil_from_days(fdiv(lo_ms, DAY), ys[0], m, d);
   civil_from_days(fdiv(hi_ms, DAY), ys[1], m, d);
+  for (int i = 0; i < 416; i++) g_dayms[2][i] = DAYMS_NONE;
   for (int k = 0; k < 2; k++) {
     g_ytxt[k] = 0;
     for (int i = 0; i < 416; i++) g_dayms[k][i] = DAYMS_NONE;
@@ -821,8 +821,7 @@ static FORCE_INLINE bool f1_pair_mc(const u8* a, const u8* b, i64& ta, i64& tb, 
   u32 ya, yb;
   memcpy(&ya, a, 4);
   memcpy(&yb, b, 4);
-  const u32 ka = ya == g_ytxt[1], kb = yb == g_ytxt[1];
-  if (!(((ya == g_ytxt[0]) | ka) & ((yb == g_ytxt[0]) | kb))) return false;
+  const u32 ka = year_row(ya), kb = year_row(yb);
   const i64 da = g_dayms[ka][L[0]], db = g_dayms[kb][L[4]];
   if ((da == DAYMS_NONE) | (db == DAYMS_NONE)) return false;
   ta = da + (i64)(L[1] * 60 + L[2]) * 1000;
@@ -861,8 +860,7 @@ static FORCE_INLINE bool f1_one_mc(const u8* a, i64& ta, i64& ca) {
   __asm__("" : "+r"(L));
   u32 ya;
   memcpy(&ya, a, 4);
-  const u32 ka = ya == g_ytxt[1];
-  if (!((ya == g_ytxt[0]) | ka)) return false;
+  const u32 ka = year_row(ya);
   const i64 da = g_dayms[ka][L[0]];
   if (da == DAYMS_NONE) return false;
   const u32 sa = L[1] * 60 + L[2];
@@ -3280,12 +3278,6 @@ int main(int argc, char** argv) {
   g_log = lg && *lg && *lg != '0';
   if (g_log) fprintf(stderr, "ABS start %.6f\n", g_t0);
   if (const char* e = getenv("SS_NODROP")) g_drop_parsed = !(*e && *e != '0');
-  if (const char* e = getenv("SS_POOL")) g_k_pool = atoi(e) != 0;
-  if (const char* e = getenv("SS_NORELEASE")) g_k_release = atoi(e) == 0;
-  if (const char* e = getenv("SS_NOTHP")) g_k_thp = atoi(e) == 0;
-  if (const char* e = getenv("SS_CKCHUNK")) g_k_ckchunk = atoi(e) != 0;
-  if (const char* e = getenv("SS_SPIN")) g_k_spin = (u32)atoi(e);
-  if (const char* e = getenv("SS_CHUNK_KB")) g_k_chunk_kb = (u32)std::max(64, atoi(e));
   std::string data = getenv("DATA_DIR") ? getenv("DATA_DIR") : "/data";
   std::string out = getenv("OUTPUT_DIR") ? getenv("OUTPUT_DIR") : "/output";
   if (argc >= 3) {
@@ -3409,7 +3401,7 @@ int main(int argc, char** argv) {
         for (int i = 1; i < 6; i++) fprintf(stderr, " %s %.3f", g_phase_names[i], g_phase_cycles[i].load() / 1e6);
         fprintf(stderr, " | total %.3f   sys s: total %.3f (parse %.3f)\n", tot, tots, g_phase_sys[2].load() / 1e6);
       }
-      if (g_k_release) release_memory();
+      release_memory();
       if (g_log) fprintf(stderr, "ABS end %.6f\n", now_s());
       fflush(nullptr);
       exit_now();
@@ -3471,7 +3463,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < 6; i++) fprintf(stderr, " %s %.3f", g_phase_names[i], g_phase_cycles[i].load() / 1e6);
     fprintf(stderr, " | total %.3f   sys s: total %.3f (parse %.3f)\n", tot, tots, g_phase_sys[2].load() / 1e6);
   }
-  if (g_k_release) release_memory();
+  release_memory();
   if (g_log) fprintf(stderr, "ABS end %.6f\n", now_s());
   fflush(nullptr);
   exit_now();  // nothing left to clean up that the kernel does not do anyway
