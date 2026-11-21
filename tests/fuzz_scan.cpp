@@ -32,7 +32,7 @@ static long run(long iters) {
     if (mode == 0) len = nxt() % 200;
     else if (mode == 1) len = nxt() % 9000;
     else if (mode == 2) len = nxt() % 40000;
-    else len = 4096 * (1 + nxt() % 4) + (nxt() % 3) - 1;  // around window sizes
+    else len = 64 * (1 + nxt() % 80) + (nxt() % 3) - 1;  // around block and window sizes
     buf.assign(len + 128, 0);
     // generate either random soup or near-valid lines
     size_t i = 0;
@@ -75,7 +75,7 @@ static long run(long iters) {
         if (i < len && nxt() % 100 == 0) buf[i++] = '\n';  // empty line
       }
     }
-    for (size_t k = len; k < buf.size(); k++) buf[k] = (u8)(nxt() % 3 == 0 ? '"' : ',');  // garbage after end
+    for (size_t k = len; k < buf.size(); k++) buf[k] = (u8)("\",\n,\"a"[nxt() % 6]);  // garbage after the end
     bool skip = nxt() % 2;
     std::vector<std::string> a, b;
     ref_scan<NF>(buf.data(), buf.data() + len, skip, a);

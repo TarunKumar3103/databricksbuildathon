@@ -174,6 +174,11 @@ struct Stream {
     if (__builtin_expect(cur == lim, 0)) grow(a);
     return cur++;
   }
+  // Room for k more items (k <= BLK) at the returned position; the caller advances `cur` itself.
+  inline T* reserve(u32 k, Arena& a) {
+    if (__builtin_expect((size_t)(lim - cur) < k, 0)) grow(a);
+    return cur;
+  }
   void grow(Arena& a) {
     if (beg) blocks.push_back({beg, (u32)(cur - beg)});
     beg = cur = (T*)a.block();
@@ -354,23 +359,19 @@ struct WCScatter {
   }
 };
 
-static inline u64 mix64(u64 x) {
-  x ^= x >> 31;
-  x *= 0x7fb5d329728ea185ULL;
-  x ^= x >> 27;
-  x *= 0x81dadef4bc2dd44dULL;
-  x ^= x >> 33;
+// IDs are hashed with one multiplication by an odd constant. That is a bijection on 64-bit keys, so a hash
+// can stand in for its key (the inverse multiplication gives the key back), and its HIGH bits are well mixed;
+// the low bits are not. Every partition and table index is therefore cut from the top of the hash.
+static constexpr u64 HASH_K = 0x9E3779B97F4A7C15ULL;
+static constexpr u64 inv_odd(u64 a) {
+  u64 x = a;  // correct to 3 bits; each step doubles that
+  for (int i = 0; i < 5; i++) x *= 2 - a * x;
   return x;
 }
-
-static inline u64 unmix64(u64 x) {
-  x ^= x >> 33;
-  x *= 0x4d6dff26c61d8485ULL;
-  x ^= (x >> 27) ^ (x >> 54);
-  x *= 0x4c5ff4596f4a2f4dULL;
-  x ^= (x >> 31) ^ (x >> 62);
-  return x;
-}
+static constexpr u64 HASH_KI = inv_odd(HASH_K);
+static_assert(HASH_K * HASH_KI == 1, "inverse of the hash multiplier");
+static inline u64 hash_id(u64 key) { return key * HASH_K; }
+static inline u64 unhash_id(u64 h) { return h * HASH_KI; }
 
 static inline u32 ceil_log2(u64 x) {
   u32 b = 0;
@@ -381,22 +382,23 @@ static inline u32 ceil_log2(u64 x) {
 // ------------------------------------------------------------------------------------------
 // IDs as 64-bit keys.
 //
-// Fast keys: strings of 1..9 bytes, first byte non-zero, the rest in 0x01..0x7F.
+// Fast keys: strings of 1..9 bytes whose first and last bytes are not NUL and whose bytes after the first
+// are all below 0x80.
 //   key = first byte << 56 | the other bytes' low 7 bits packed big-endian (zero padded).
+//   The padding cannot be confused with the string's own bytes because the last byte is not NUL.
 //   Integer order of fast keys equals byte-wise order of the strings.
 // Slow keys: any other string, interned; key = index + 1 (< 2^56, so the top byte is 0).
+// Both functions need n >= 1 and 9 readable bytes at s.
+
+static constexpr u64 KEY_HIGH = 0x8080808080808080ULL, KEY_M7 = 0x7F7F7F7F7F7F7F7FULL;
 
 static inline u64 key_fast(const u8* s, u32 n) {
-  u32 m = n - 1;
-  if (m > 8) return 0;
+  const u32 m = n - 1;
   u64 w;
   memcpy(&w, s + 1, 8);
-  const u64 keep = _bzhi_u64(~0ULL, 8 * m);  // the low m bytes (all of them for m == 8)
-  w &= keep;
-  u64 v = w | ~keep;
-  if ((w & 0x8080808080808080ULL) | ((v - 0x0101010101010101ULL) & ~v & 0x8080808080808080ULL)) return 0;
-  if (s[0] == 0) return 0;
-  return ((u64)s[0] << 56) | _pext_u64(__builtin_bswap64(w), 0x7F7F7F7F7F7F7F7FULL);
+  w = _bzhi_u64(w, 8 * m);  // bytes 1..n-1 (all eight for m >= 8)
+  if (m > 8 || (w & KEY_HIGH) != 0 || s[0] == 0 || s[m] == 0) return 0;
+  return ((u64)s[0] << 56) | _pext_u64(__builtin_bswap64(w), KEY_M7);
 }
 
 struct Interner {
@@ -416,12 +418,23 @@ struct Interner {
 };
 static Interner g_intern;
 
-static inline u64 make_key(const u8* s, u32 n) {
-  u64 k = key_fast(s, n);
-  if (__builtin_expect(k != 0, 1)) return k;
-  return g_intern.get(s, n);
+static FORCE_INLINE u64 make_key(const u8* s, u32 n) {
+  const u32 m = n - 1;
+  u64 w;
+  memcpy(&w, s + 1, 8);
+  w = _bzhi_u64(w, 8 * m);
+  if (__builtin_expect(m > 8 || (w & KEY_HIGH) != 0 || s[0] == 0 || s[m] == 0, 0)) return g_intern.get(s, n);
+  return ((u64)s[0] << 56) | _pext_u64(__builtin_bswap64(w), KEY_M7);
 }
 static inline bool is_slow(u64 k) { return (k >> 56) == 0; }
+
+// The string of a fast key: writes up to 9 bytes at `out` and returns the length.
+static inline u32 fast_key_bytes(u64 k, u8* out) {
+  const u64 w = __builtin_bswap64(_pdep_u64(k, KEY_M7));  // bytes 1..8, zero padded
+  out[0] = (u8)(k >> 56);
+  memcpy(out + 1, &w, 8);
+  return w ? 9 - ((u32)__builtin_clzll(w) >> 3) : 1;
+}
 
 static void key_str(u64 k, std::string& out) {
   if (is_slow(k)) {
@@ -429,13 +442,9 @@ static void key_str(u64 k, std::string& out) {
     out = g_intern.strs[k - 1];
     return;
   }
-  out.clear();
-  out.push_back((char)(k >> 56));
-  for (int g = 0; g < 8; g++) {
-    char c = (char)((k >> (49 - 7 * g)) & 0x7F);
-    if (!c) break;
-    out.push_back(c);
-  }
+  u8 b[9];
+  const u32 n = fast_key_bytes(k, b);
+  out.assign((const char*)b, n);
 }
 
 static inline int key_cmp(u64 a, u64 b) {
@@ -921,27 +930,57 @@ static inline i32 camp_of(const u8* s, u32 n) {
   return it == g_camp_slow.end() ? -1 : (i32)it->second;
 }
 
-// H: link ID -> person name key. Open addressing; the top g_Hpbits bits of the slot index pick a
-// region that is probed (linearly, wrapping) on its own.
+// nd (1..8) ASCII digits at s -> value, without a loop: the digits are right-aligned in a 64-bit word,
+// checked and converted with three multiplications. False if any of the bytes is not a digit.
+// Needs 8 readable bytes at s.
+static FORCE_INLINE bool digits_le8(const u8* s, u32 nd, u64& v) {
+  u64 w;
+  memcpy(&w, s, 8);
+  const u32 sh = 8 * (8 - nd);  // the first digit goes to byte 8 - nd; the bytes before it become '0'
+  w = (w << sh) | _bzhi_u64(0x3030303030303030ULL, sh);
+  if (((w & 0xF0F0F0F0F0F0F0F0ULL) | (((w + 0x0606060606060606ULL) & 0xF0F0F0F0F0F0F0F0ULL) >> 4)) !=
+      0x3333333333333333ULL)
+    return false;
+  w = ((w & 0x0F0F0F0F0F0F0F0FULL) * 2561) >> 8;
+  w = ((w & 0x00FF00FF00FF00FFULL) * 6553601) >> 16;
+  v = ((w & 0x0000FFFF0000FFFFULL) * 42949672960001ULL) >> 32;
+  return true;
+}
+
+// camp_of for the usual form "c_<1..8 digits>" without a loop; everything else goes to camp_of.
+// Needs 10 readable bytes at s.
+static FORCE_INLINE i32 camp_fast(const u8* s, u32 n) {
+  const u32 nd = n - 2;
+  u16 pre;
+  memcpy(&pre, s, 2);
+  u64 v;
+  if (__builtin_expect((nd - 1 > 7) | (pre != 0x5F63) | ((s[2] == '0') & (n != 3)), 0)) return camp_of(s, n);
+  if (__builtin_expect(!digits_le8(s + 2, nd, v) || v >= g_camp_by_num.size(), 0)) return camp_of(s, n);
+  return g_camp_by_num[v];
+}
+
+// H: link ID -> person. Both are stored as hashes (hash_id of the ID's key, hash_id of the person's name
+// key); while the links are being built, the value is the ID's union-find node instead. Open addressing; the
+// top g_Hpbits bits of the slot index pick a region that is probed (linearly, wrapping) on its own.
 struct HSlot {
-  u64 key;
+  u64 key;  // 0: empty (no ID has key 0)
   u64 val;
 };
 static HSlot* g_H = nullptr;
 static u32 g_Hbits = 0, g_Hpbits = 0;
-// Blocked Bloom filter of the IDs whose person name differs from the ID itself (the only ones that
-// need H). Three bits per key in one 64-bit word.
+// Blocked Bloom filter of the IDs whose person differs from the ID itself (the only ones that need H).
+// Three bits per ID in one 64-bit word; the word is picked by the top bits of the hash, the bits by the
+// 18 bits below them.
 static u64* g_F = nullptr;
-static u64 g_Fmask = 0;
-static inline u64 f_bits(u64 h) { return (1ULL << ((h >> 40) & 63)) | (1ULL << ((h >> 46) & 63)) | (1ULL << ((h >> 52) & 63)); }
-static inline bool f_maybe(u64 h) {
-  const u64 b = f_bits(h);
-  return (g_F[h & g_Fmask] & b) == b;
+static u32 g_Fshift = 63;  // word index = hash >> g_Fshift
+static FORCE_INLINE u64 f_bits(u64 h, u32 fs) {
+  return (1ULL << ((h >> (fs - 6)) & 63)) | (1ULL << ((h >> (fs - 12)) & 63)) | (1ULL << ((h >> (fs - 18)) & 63));
 }
 
 static inline u64 h_slot_index(u64 h) { return h >> (64 - g_Hbits); }
 
-static inline u64 person_of_h(u64 k, u64 h) {
+// The value stored for the ID with hash h, or h itself if the ID is not in H.
+static inline u64 h_lookup(u64 h) {
   u32 sbits = g_Hbits - g_Hpbits;
   u64 smask = (1ULL << sbits) - 1;
   u64 idx = h_slot_index(h);
@@ -949,37 +988,31 @@ static inline u64 person_of_h(u64 k, u64 h) {
   u64 i = idx & smask;
   for (;;) {
     const HSlot& s = g_H[base + i];
-    if (s.key == k) return s.val;
-    if (s.key == 0) return k;
+    if (s.key == h) return s.val;
+    if (s.key == 0) return h;
     i = (i + 1) & smask;
   }
 }
 
-// Calls emit(i, person) for i in [0, n) where person = person of key_at(i), with the H probes
+// Calls emit(i, value) for i in [0, n) where value = h_lookup(hash of key_at(i)), with the H probes
 // software-prefetched D items ahead.
 template <class KeyAt, class Emit>
 static inline void lookup_pipeline(size_t n, KeyAt&& key_at, Emit&& emit) {
-  if (!g_H) {
-    for (size_t i = 0; i < n; i++) emit(i, key_at(i));
-    return;
-  }
   constexpr size_t D = 32;
-  u64 ks[D], hs[D];
+  u64 hs[D];
   size_t pre = n < D ? n : D;
   for (size_t i = 0; i < pre; i++) {
-    ks[i] = key_at(i);
-    hs[i] = mix64(ks[i]);
+    hs[i] = hash_id(key_at(i));
     _mm_prefetch((const char*)&g_H[h_slot_index(hs[i])], _MM_HINT_T0);
   }
   for (size_t i = 0; i < n; i++) {
     size_t s = i & (D - 1);
-    u64 person = person_of_h(ks[s], hs[s]);
+    u64 v = h_lookup(hs[s]);
     if (i + D < n) {
-      ks[s] = key_at(i + D);
-      hs[s] = mix64(ks[s]);
+      hs[s] = hash_id(key_at(i + D));
       _mm_prefetch((const char*)&g_H[h_slot_index(hs[s])], _MM_HINT_T0);
     }
-    emit(i, person);
+    emit(i, v);
   }
 }
 
@@ -1017,25 +1050,25 @@ struct u64x2 {
   u64 a, b;
 };
 
-struct R1 {  // event line, partitioned by event_id; eid = mix64(event_id key)
+struct R1 {  // event line, partitioned by event_id; eid = hash_id(event_id key)
   u64 eid;
   i64 ingest;
-  u64 uid;      // user_id key (valid lines only)
+  u64 uid;      // hash_id(user_id key) (valid lines only)
   u32 ts;       // ms since window start, TS_INVALID if the line is not a valid event
   u32 payload;  // purchase: cat << 24 | price; else 0
 };
 struct C0 {  // valid click line, unpartitioned
-  u64 uid;
+  u64 uid;  // hash_id(user_id key)
   u64 click;
   u32 ts;  // ms since window start - 7 days
   u32 camp;
 };
-struct R2 {  // surviving event, partitioned by person; h = mix64(person key)
+struct R2 {  // surviving event, partitioned by person; h = hash_id(person name key)
   u64 h;
   u32 ts;
   u32 payload;
 };
-struct R2C {  // valid click, partitioned by person; h = mix64(person key)
+struct R2C {  // valid click, partitioned by person; h = hash_id(person name key)
   u64 h;
   u64 click;
   u32 ts;
@@ -1242,8 +1275,8 @@ static void build_links(std::vector<MFile>& files) {
     size_t expect = g_tl[t].links.size() * 2 / P + 16;
     for (auto& v : mine) v.reserve(expect + expect / 4);
     for (auto& pr : g_tl[t].links) {
-      mine[mix64(pr.first) >> (64 - pbits)].push_back(pr.first);
-      mine[mix64(pr.second) >> (64 - pbits)].push_back(pr.second);
+      mine[hash_id(pr.first) >> (64 - pbits)].push_back(pr.first);
+      mine[hash_id(pr.second) >> (64 - pbits)].push_back(pr.second);
     }
   });
   std::vector<std::vector<u64>> distinct(P);
@@ -1257,7 +1290,7 @@ static void build_links(std::vector<MFile>& files) {
     d.reserve(raw);
     for (int t = 0; t < NT; t++)
       for (u64 k : kp[t][p]) {
-        u64 i = (mix64(k) >> 8) & mask;
+        u64 i = (hash_id(k) << pbits) >> (64 - bits);  // the hash bits below the partition's
         for (;;) {
           if (tab[i] == k) break;
           if (tab[i] == 0) {
@@ -1290,12 +1323,13 @@ static void build_links(std::vector<MFile>& files) {
       u32 id = (u32)(off[p] + j);
       g_nodes[id].parent.store(id, std::memory_order_relaxed);
       g_nodes[id].key = k;
-      u64 idx = h_slot_index(mix64(k));
+      const u64 h = hash_id(k);
+      u64 idx = h_slot_index(h);
       u64 base = idx & ~smask, i = idx & smask;
       for (;;) {
         HSlot& s = g_H[base + i];
         if (s.key == 0) {
-          s.key = k;
+          s.key = h;
           s.val = id;
           break;
         }
@@ -1322,7 +1356,7 @@ static void build_links(std::vector<MFile>& files) {
       uf_unite(ids[2 * i], ids[2 * i + 1]);
     }
   });
-  // finalize: H value = name key of the root
+  // finalize: H value = hash of the root's name key
   u64 nslots = 1ULL << g_Hbits;
   int ntask = 256;
   std::vector<size_t> nremap(ntask, 0);
@@ -1331,7 +1365,7 @@ static void build_links(std::vector<MFile>& files) {
     size_t c = 0;
     for (u64 i = a; i < b; i++) {
       if (g_H[i].key) {
-        g_H[i].val = g_nodes[uf_find((u32)g_H[i].val)].key;
+        g_H[i].val = hash_id(g_nodes[uf_find((u32)g_H[i].val)].key);
         c += g_H[i].val != g_H[i].key;
       }
     }
@@ -1339,16 +1373,13 @@ static void build_links(std::vector<MFile>& files) {
   });
   size_t remap = 0;
   for (size_t c : nremap) remap += c;
-  u64 words = 64;
+  u64 words = 1 << 10;
   while (words * 8 < remap) words <<= 1;  // >= 8 bits per key
   g_F = (u64*)vm_alloc(words * 8);
-  g_Fmask = words - 1;
+  g_Fshift = 64 - ceil_log2(words);
   for (u64 i = 0; i < nslots; i++) {
     const HSlot& sl = g_H[i];
-    if (sl.key && sl.val != sl.key) {
-      const u64 h = mix64(sl.key);
-      g_F[h & g_Fmask] |= f_bits(h);
-    }
+    if (sl.key && sl.val != sl.key) g_F[sl.key >> g_Fshift] |= f_bits(sl.key, g_Fshift);
   }
   LOG("links: %zu ids remap to another name; filter %llu KB", remap, (unsigned long long)(words * 8 / 1024));
 }
@@ -1393,21 +1424,25 @@ static void build_links(std::vector<MFile>& files);
 // Event lines are parsed a batch at a time, in three simple loops over the batch instead of one long loop
 // body per line: keys and hashes; timestamps, grouped by the form of `ts` so each group runs one kernel
 // without the form changing under it; validation, record assembly and the scatter.
+// What stands in for a timestamp that does not parse: no window contains TS_NONE, and ING_NONE is later than
+// 24 hours after any ts a window can contain (windows lie in the years 0000-9999, about +-2.6e14 ms), and
+// later than every ingest_ts that does parse.
+static constexpr i64 TS_NONE = INT64_MIN, ING_NONE = INT64_MAX / 2;
+
 struct EvBatch {
   static constexpr u32 CAP = 64;
   alignas(32) u32 off[CAP][8];  // field offsets from the chunk base
   alignas(32) u32 len[CAP][8];  // field lengths
   u64 eh[CAP], uid[CAP];
-  i64 ts[CAP], ing[CAP];
-  u8 ok[CAP];      // ts is a valid timestamp
-  u8 idx[4][CAP];  // lines by form of ts: 20 bytes, 13 bytes, 25 bytes, other
+  i64 ts[CAP], ing[CAP];  // TS_NONE / ING_NONE if not a timestamp
+  u8 idx[4][CAP];         // lines by form of ts: 20 bytes, 13 bytes, 25 bytes, other
 };
 
 static NOINLINE void ts_exact(EvBatch& B, u32 i, const u8* base) {
   const u32* off = B.off[i];
   const u32* len = B.len[i];
-  B.ok[i] = parse_ts(base + off[2], len[2], B.ts[i]);
-  if (!parse_f1(base + off[3], len[3], B.ing[i])) B.ing[i] = INT64_MAX;
+  if (!parse_ts(base + off[2], len[2], B.ts[i])) B.ts[i] = TS_NONE;
+  if (!parse_f1(base + off[3], len[3], B.ing[i])) B.ing[i] = ING_NONE;
 }
 
 static NOINLINE void process_events(EvBatch& B, const u32 n, const u8* const base, WCScatter<R1>::Cursor& cur_out,
@@ -1416,9 +1451,9 @@ static NOINLINE void process_events(EvBatch& B, const u32 n, const u8* const bas
   for (u32 i = 0; i < n; i++) {
     const u32* off = B.off[i];
     const u32* len = B.len[i];
-    B.eh[i] = mix64(make_key(base + off[0], len[0]));
+    B.eh[i] = hash_id(make_key(base + off[0], len[0]));
     u64 uid = 0;
-    if (__builtin_expect(len[1] != 0, 1)) uid = make_key(base + off[1], len[1]);
+    if (__builtin_expect(len[1] != 0, 1)) uid = hash_id(make_key(base + off[1], len[1]));
     B.uid[i] = uid;
   }
   // ---- timestamps
@@ -1436,7 +1471,6 @@ static NOINLINE void process_events(EvBatch& B, const u32 n, const u8* const bas
     if (__builtin_expect(B.len[i][3] == 20 && f1_pair(base + off[2], base + off[3], ta, tb), 1)) {
       B.ts[i] = ta;
       B.ing[i] = tb;
-      B.ok[i] = 1;
     } else {
       ts_exact(B, i, base);
     }
@@ -1448,7 +1482,6 @@ static NOINLINE void process_events(EvBatch& B, const u32 n, const u8* const bas
     if (__builtin_expect(B.len[i][3] == 20 && digits13(base + off[2], ta) && f1_one(base + off[3], tb), 1)) {
       B.ts[i] = ta;
       B.ing[i] = tb;
-      B.ok[i] = 1;
     } else {
       ts_exact(B, i, base);
     }
@@ -1462,14 +1495,15 @@ static NOINLINE void process_events(EvBatch& B, const u32 n, const u8* const bas
     const u32* off = B.off[i];
     const u32* len = B.len[i];
     const i64 ts = B.ts[i], ing = B.ing[i];
+    const u64 uid = B.uid[i];
     const u8* s4 = base + off[4];
     const u32 n4 = len[4];
     u32 w4;
     memcpy(&w4, s4, 4);
-    // user and product present, ts valid and in the window, not more than 24 h late (an unparsable
-    // ingest_ts counts as late)
-    bool valid = (B.ok[i] != 0) & (len[1] != 0) & (len[5] != 0) & ((u64)(ts - ws) < wlen) & (ing != INT64_MAX) &
-                 ((i64)((u64)ing - (u64)ts) <= DAY);
+    // ts in the window, not more than 24 h late, user and product present (TS_NONE is in no window, ING_NONE
+    // is always late, and the hash of a user ID is 0 only if there is none)
+    const u64 rel = (u64)ts - (u64)ws;
+    bool valid = (rel < wlen) & ((i64)((u64)ing - (u64)ts) <= DAY) & (uid != 0) & (len[5] != 0);
     u32 payload = 0;
     if (__builtin_expect(!((n4 == 4) & ((w4 == 0x77656976u) | (w4 == 0x74726163u))), 0)) {  // not view / cart
       u64 w8;
@@ -1480,10 +1514,10 @@ static NOINLINE void process_events(EvBatch& B, const u32 n, const u8* const bas
       else
         valid = false;
     }
-    const u64 tspl = valid ? ((u64)(u32)(ts - ws) | ((u64)payload << 32)) : (u64)TS_INVALID;
+    const u64 tspl = valid ? ((u64)(u32)rel | ((u64)payload << 32)) : (u64)TS_INVALID;
     const u64 eh = B.eh[i];
     WCScatter<R1>::push32(cur, (u32)(eh >> p1shift),
-                          _mm256_set_epi64x((long long)tspl, (long long)B.uid[i], (long long)ing, (long long)eh));
+                          _mm256_set_epi64x((long long)tspl, (long long)uid, (long long)ing, (long long)eh));
   }
   cur_out = cur;
 }
@@ -1514,6 +1548,99 @@ static NOINLINE u64 parse_event_chunk(const u8* begin, const u8* end, bool skip_
   return nl;
 }
 
+// Click lines, in batches like the event lines: timestamps by form, then keys, campaign and the record.
+struct CkBatch {
+  static constexpr u32 CAP = 64;
+  alignas(32) u32 off[CAP][8];
+  alignas(32) u32 len[CAP][8];
+  i64 ts[CAP];     // INT64_MIN if not a timestamp
+  u8 idx[4][CAP];  // lines by form of ts: 20 bytes, 13 bytes, 25 bytes, other
+};
+
+static NOINLINE void ck_ts_exact(CkBatch& B, u32 i, const u8* base) {
+  if (!parse_ts(base + B.off[i][3], B.len[i][3], B.ts[i])) B.ts[i] = INT64_MIN;
+}
+
+// Writes the valid clicks of the batch at `out` (room for n records) and returns the end.
+static NOINLINE C0* process_clicks(CkBatch& B, const u32 n, const u8* const base, C0* out, const i64 cws,
+                                   const i64 we) {
+  static const u8 CLS[32] = {3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 1, 3, 3, 3, 3, 3, 3, 0, 3, 3, 3, 3, 2, 3, 3, 3, 3, 3, 3};
+  u32 cnt[4] = {0, 0, 0, 0};
+  for (u32 i = 0; i < n; i++) {
+    const u32 n3 = B.len[i][3];
+    const u32 c = CLS[n3 < 31 ? n3 : 31];
+    B.idx[c][cnt[c]++] = (u8)i;
+  }
+  {  // F1, two lines at a time
+    u32 j = 0;
+    for (; j + 2 <= cnt[0]; j += 2) {
+      const u32 i0 = B.idx[0][j], i1 = B.idx[0][j + 1];
+      i64 ta, tb;
+      if (__builtin_expect(f1_pair(base + B.off[i0][3], base + B.off[i1][3], ta, tb), 1)) {
+        B.ts[i0] = ta;
+        B.ts[i1] = tb;
+      } else {
+        ck_ts_exact(B, i0, base);
+        ck_ts_exact(B, i1, base);
+      }
+    }
+    if (j < cnt[0]) ck_ts_exact(B, B.idx[0][j], base);
+  }
+  for (u32 j = 0; j < cnt[1]; j++) {  // 13 digits
+    const u32 i = B.idx[1][j];
+    i64 t;
+    if (__builtin_expect(digits13(base + B.off[i][3], t), 1))
+      B.ts[i] = t;
+    else
+      ck_ts_exact(B, i, base);
+  }
+  for (u32 j = 0; j < cnt[2]; j++) ck_ts_exact(B, B.idx[2][j], base);
+  for (u32 j = 0; j < cnt[3]; j++) ck_ts_exact(B, B.idx[3][j], base);
+  // ---- keys, campaign, record: written unconditionally, kept only if the click is valid
+  const u64 wlen = (u64)(we - cws);
+  for (u32 i = 0; i < n; i++) {
+    const u32* off = B.off[i];
+    const u32* len = B.len[i];
+    const u64 click = make_key(base + off[0], len[0]);
+    const u64 uid = hash_id(make_key(base + off[1], len[1]));
+    const i32 camp = camp_fast(base + off[2], len[2]);
+    const u64 rel = (u64)B.ts[i] - (u64)cws;  // in [0, wlen) iff the click is inside [window start - 7 days, window end)
+    const u64 tc = (u64)(u32)rel | ((u64)(u32)camp << 32);
+    out->uid = uid;
+    out->click = click;
+    memcpy(&out->ts, &tc, 8);
+    out += (rel < wlen) & (camp >= 0);
+  }
+  return out;
+}
+
+// One chunk of a clicks file -> C0 records. Returns the number of lines with a click_id and a user_id.
+static NOINLINE u64 parse_click_chunk(const u8* begin, const u8* end, bool skip_header, TL& tl, const i64 cws,
+                                      const i64 we) {
+  CkBatch B;
+  u32 n = 0;
+  u64 nl = 0;
+  const u8* base = begin;
+  auto run = [&](u32 m) __attribute__((always_inline)) {
+    C0* d = tl.c0.reserve(CkBatch::CAP, tl.arena);
+    tl.c0.cur = process_clicks(B, m, base, d, cws, we);
+    nl += m;
+  };
+  scan::scan_lines<4>(begin, end, skip_header, [&](const u8* sb, __m256i st, __m256i ln) __attribute__((always_inline)) {
+    _mm256_store_si256((__m256i*)B.off[n], st);
+    _mm256_store_si256((__m256i*)B.len[n], ln);
+    base = sb;
+    // a line without click_id or user_id is dropped: its slot is reused
+    n += (_mm256_movemask_epi8(_mm256_cmpeq_epi32(ln, _mm256_setzero_si256())) & 0xFF) == 0;
+    if (__builtin_expect(n == CkBatch::CAP, 0)) {
+      run(n);
+      n = 0;
+    }
+  });
+  if (n) run(n);
+  return nl;
+}
+
 static void parse_events_clicks(std::vector<MFile>& ev, std::vector<MFile>& ck, std::vector<MFile>& lk) {
   size_t ev_bytes = 0, ck_bytes = 0;
   for (auto& f : ev) ev_bytes += f.size;
@@ -1540,23 +1667,7 @@ static void parse_events_clicks(std::vector<MFile>& ev, std::vector<MFile>& ck, 
       const MFile& f = ck[c.file];
       size_t b = line_start_at_or_after(f, c.nominal), e = line_start_at_or_after(f, c.nominal_end);
       if (b >= e) return;
-      u64 nl = 0;
-      scan_chunk<4>(f.data + b, f.data + e, b == 0, [&](const u8* sb, const u32* fo, const u32* fl) {
-        if (fl[0] == 0 || fl[1] == 0) return;
-        nl++;
-        i64 ts;
-        if (!parse_ts((sb + fo[3]), fl[3], ts) || ts < cws || ts >= we) return;
-        i32 camp = camp_of((sb + fo[2]), fl[2]);
-        if (camp < 0) return;
-        u64 click = make_key((sb + fo[0]), fl[0]);
-        u64 uid = make_key((sb + fo[1]), fl[1]);
-        u64 tc = (u64)(u32)(ts - cws) | ((u64)(u32)camp << 32);
-        C0* d = tl.c0.slot(tl.arena);
-        d->uid = uid;
-        d->click = click;
-        memcpy(&d->ts, &tc, 8);
-      });
-      tl.n_click_lines += nl;
+      tl.n_click_lines += parse_click_chunk(f.data + b, f.data + e, b == 0, tl, cws, we);
       drop_parsed(f, c.nominal, c.nominal_end);
     }
   };
@@ -1597,56 +1708,62 @@ static void parse_events_clicks(std::vector<MFile>& ev, std::vector<MFile>& ck, 
 // ------------------------------------------------------------------------------------------
 // dedup (per event_id partition) and person lookups; click person lookups
 
-// Person lookup for a batch of items. Three simple loops instead of one loop with data-dependent
-// branches: (1) hash every key and prefetch its filter word; (2) split the batch, without branching, into
-// items whose ID is its own person name and items the filter flags, prefetching the H slot of the latter;
-// (3) emit both lists. done(person, item) is called once per item, in no particular order.
-template <class Item, class Done>
+// Person lookup and scatter for a stream of items, a batch at a time. Each item comes with the hash of its
+// user ID. Two simple loops instead of one with data-dependent branches: (1) split the batch, without
+// branching, into items whose ID is its own person and items the filter flags, prefetching the H slot of the
+// latter; (2) emit both lists. emit(cursor, person hash, item) is called once per item, in no particular
+// order. The filter word of an item is prefetched when the item is added.
+template <class Item, class Rec, class Emit>
 struct Router {
   static constexpr u32 CAP = 128;
-  u64 key[CAP], h[CAP];
+  using Cursor = typename WCScatter<Rec>::Cursor;
+  u64 key[CAP];
   Item item[CAP];
   u8 ld[CAP + 1], lh[CAP + 1];
   u32 n = 0;
-  Done& done;
-  explicit Router(Done& d) : done(d) {}
-  inline void add(u64 k, const Item& it) {
-    key[n] = k;
+  Cursor& cur;
+  Emit& emit;
+  Router(Cursor& c, Emit& e) : cur(c), emit(e) {}
+  FORCE_INLINE void add(u64 uh, const Item& it) {
+    key[n] = uh;
     item[n] = it;
+    _mm_prefetch((const char*)&g_F[uh >> g_Fshift], _MM_HINT_T0);  // (a null g_F is harmless here)
     if (__builtin_expect(++n == CAP, 0)) run();
   }
   NOINLINE void run() {
     const u32 m = n;
     n = 0;
+    Cursor c = cur;  // in registers for the loops below
     if (!g_H) {
-      for (u32 i = 0; i < m; i++) done(key[i], item[i]);
+      for (u32 i = 0; i < m; i++) emit(c, key[i], item[i]);
+      cur = c;
       return;
     }
-    for (u32 i = 0; i < m; i++) {
-      const u64 x = mix64(key[i]);
-      h[i] = x;
-      _mm_prefetch((const char*)&g_F[x & g_Fmask], _MM_HINT_T0);
-    }
+    const u64* const F = g_F;
+    const HSlot* const H = g_H;
+    const u32 fs = g_Fshift, hshift = 64 - g_Hbits;
     u32 nd = 0, nh = 0;
     for (u32 i = 0; i < m; i++) {
-      const u64 x = h[i];
-      const u32 maybe = f_maybe(x);
+      const u64 x = key[i];
+      const u64 b = f_bits(x, fs);
+      const u32 maybe = (F[x >> fs] & b) == b;
       ld[nd] = (u8)i;
       lh[nh] = (u8)i;
       nd += maybe ^ 1;
       nh += maybe;
       // prefetch the H slot of flagged items only (the others get a harmless address)
-      const uintptr_t slot = (uintptr_t)&g_H[h_slot_index(x)], dummy = (uintptr_t)h;
+      const uintptr_t slot = (uintptr_t)&H[x >> hshift], dummy = (uintptr_t)key;
       _mm_prefetch((const char*)(dummy ^ ((slot ^ dummy) & (0 - (uintptr_t)maybe))), _MM_HINT_T0);
     }
     for (u32 j = 0; j < nd; j++) {
       const u32 i = ld[j];
-      done(key[i], item[i]);
+      emit(c, key[i], item[i]);
     }
     for (u32 j = 0; j < nh; j++) {
       const u32 i = lh[j];
-      done(person_of_h(key[i], h[i]), item[i]);
+      emit(c, h_lookup(key[i]), item[i]);
     }
+    cur = c;
   }
 };
 
@@ -1692,12 +1809,12 @@ static void dedup_and_route() {
     if (oi >= (int)P1) {
       const CTask& ct = ctasks[oi - P1];
       auto& blocks = g_tl[ct.t].c0.blocks;
-      auto done = [&](u64 person, const u64x2& v) __attribute__((always_inline)) {
-        const u64 ph = mix64(person);
-        tl.r2c.push32((u32)(ph >> p2shift), _mm256_set_epi64x(0, (long long)v.b, (long long)v.a, (long long)ph),
-                      tl.arena);
+      auto cur = tl.r2c.cursor(tl.arena);
+      auto emit = [p2shift](WCScatter<R2C>::Cursor& c, u64 ph, const u64x2& v) __attribute__((always_inline)) {
+        WCScatter<R2C>::push32(c, (u32)(ph >> p2shift),
+                               _mm256_set_epi64x(0, (long long)v.b, (long long)v.a, (long long)ph));
       };
-      Router<u64x2, decltype(done)> router(done);
+      Router<u64x2, R2C, decltype(emit)> router(cur, emit);
       for (size_t b = ct.b0; b < ct.b1; b++) {
         const C0* r = blocks[b].first;
         for (u32 j = 0; j < blocks[b].second; j++) {
@@ -1708,6 +1825,7 @@ static void dedup_and_route() {
         router.run();
         tl.arena.free_blocks.push_back(blocks[b].first);
       }
+      tl.r2c.close(cur);
       tl.r2c.flush(tl.arena);
       return;
     }
@@ -1740,11 +1858,11 @@ static void dedup_and_route() {
           seen[i >> 6] = w | (1ULL << (i & 63));
         }
       }
-    auto done = [&](u64 person, const u64& tp) __attribute__((always_inline)) {
-      const u64 ph = mix64(person);
-      tl.r2.push16((u32)(ph >> p2shift), _mm_set_epi64x((long long)tp, (long long)ph), tl.arena);
+    auto cur = tl.r2.cursor(tl.arena);
+    auto emit = [p2shift](WCScatter<R2>::Cursor& c, u64 ph, const u64& tp) __attribute__((always_inline)) {
+      WCScatter<R2>::push16(c, (u32)(ph >> p2shift), _mm_set_epi64x((long long)tp, (long long)ph));
     };
-    Router<u64, decltype(done)> router(done);
+    Router<u64, R2, decltype(emit)> router(cur, emit);
     auto route = [&](const R1& r) __attribute__((always_inline)) {
       u64 tp;
       memcpy(&tp, &r.ts, 8);
@@ -1799,6 +1917,7 @@ static void dedup_and_route() {
         if (tab[q].best != nullptr && tab[q].best->ts != TS_INVALID) route(*tab[q].best);
     }
     router.run();
+    tl.r2.close(cur);
     tl.r2.flush(tl.arena);
     for (int t = 0; t < NT; t++) g_tl[t].r1.release(p, tl.arena);
   });
@@ -2179,7 +2298,7 @@ static void person_phase() {
       S.active.clear();
       // purchases -> category sums per day of their session
       for (const Purch& q : S.purch) catsum[(size_t)bday[q.bucket] * NCAT + q.cat] += q.price;
-      const u64 pkey = unmix64(S.hs[lid]);
+      const u64 pkey = unhash_id(S.hs[lid]);
       const size_t nd = S.days.size();
       const size_t base = out.rows.size();
       out.rows.resize(base + nd);
@@ -2229,14 +2348,7 @@ static inline void put_key(std::vector<u8>& buf, size_t& at, u64 k) {
     return;
   }
   if (buf.size() < at + 16) buf.resize((at + 16) * 2);
-  u8* o = &buf[at + 4];
-  u32 n = 0;
-  o[n++] = (u8)(k >> 56);
-  for (int g = 0; g < 8; g++) {
-    u8 c = (u8)((k >> (49 - 7 * g)) & 0x7F);
-    if (!c) break;
-    o[n++] = c;
-  }
+  const u32 n = fast_key_bytes(k, &buf[at + 4]);
   memcpy(&buf[at], &n, 4);
   at += 4 + n;
 }
@@ -2499,7 +2611,90 @@ static int selftest() {
   }
   fprintf(stderr, "selftest F1 kernels: %ld cases, %ld mismatches; accepted %ld of %ld valid in-year values\n", n2, bad2,
           accepted, in_year);
-  return (bad || bad2) ? 1 : 0;
+  // ---- digits_le8 and camp_fast against the loops
+  long n3 = 0, bad3 = 0;
+  {
+    std::vector<i32> saved_num = g_camp_by_num;
+    g_camp_by_num.assign(5000, -1);
+    for (u32 i = 0; i < 5000; i += 3) g_camp_by_num[i] = (i32)(i * 7 + 1);
+    u8 t[40];
+    for (long it = 0; it < 4000000; it++) {
+      for (int k = 0; k < 40; k++) t[k] = (u8)("0123456789,\"c_ /:9a"[next() % 19]);
+      const u32 nd = 1 + (u32)(next() % 8);
+      for (u32 k = 0; k < nd; k++)
+        if (next() % 12) t[k] = (u8)('0' + next() % 10);
+      u64 v = 0, ref = 0;
+      bool okr = true;
+      for (u32 k = 0; k < nd; k++) {
+        if (!is_dig(t[k])) okr = false;
+        ref = ref * 10 + (u64)(t[k] - '0');
+      }
+      const bool ok = digits_le8(t, nd, v);
+      n3++;
+      if (ok != okr || (ok && v != ref)) {
+        if (bad3 < 10) fprintf(stderr, "DIGITS MISMATCH '%.*s'\n", (int)nd, (const char*)t);
+        bad3++;
+      }
+      // a campaign id, mostly well-formed
+      char c[40];
+      int len = snprintf(c, sizeof c, "c_%u", (unsigned)(next() % ((next() & 1) ? 6000 : 3000000000u)));
+      if (next() % 6 == 0) c[next() % len] = "0c_9 x"[next() % 6];
+      if (next() % 9 == 0) {
+        memmove(c + 3, c + 2, len - 1);  // a leading zero
+        c[2] = '0';
+        len++;
+      }
+      memset(t, ',', sizeof t);
+      memcpy(t, c, len);
+      n3++;
+      if (camp_fast(t, (u32)len) != camp_of(t, (u32)len)) {
+        if (bad3 < 10) fprintf(stderr, "CAMPAIGN MISMATCH '%.*s'\n", len, c);
+        bad3++;
+      }
+    }
+    g_camp_by_num = saved_num;
+  }
+  fprintf(stderr, "selftest digits / campaign ids: %ld cases, %ld mismatches\n", n3, bad3);
+  // ---- fast keys: the key gives the string back, and keys order like the strings
+  long n4 = 0, bad4 = 0, nfast = 0;
+  {
+    u8 a[32], b[32], back[16];
+    std::string prev;
+    u64 kprev = 0;
+    for (long it = 0; it < 4000000; it++) {
+      const u32 na = 1 + (u32)(next() % ((next() % 8) ? 9 : 11));
+      for (u32 k = 0; k < 32; k++) a[k] = (u8)("az09AZ_-\x7f\x01~ c"[next() % 14]);
+      for (u32 k = 0; k < na; k++) {
+        const u32 r = (u32)(next() % 64);
+        if (r == 0) a[k] = 0;
+        if (r == 1) a[k] = (u8)(0x80 + next() % 128);
+      }
+      memcpy(b, a, 32);
+      const u64 ka = key_fast(a, na);
+      const bool want = na <= 9 && a[0] != 0 && a[na - 1] != 0 && [&] {
+        for (u32 k = 1; k < na; k++)
+          if (a[k] >= 0x80) return false;
+        return true;
+      }();
+      n4++;
+      bool wrong = (ka != 0) != want;
+      if (ka) {
+        nfast++;
+        const u32 nb = fast_key_bytes(ka, back);
+        if (nb != na || memcmp(back, a, na) != 0 || is_slow(ka)) wrong = true;
+        const std::string sa((const char*)a, na);
+        if (kprev && ((ka < kprev) != (sa < prev) || (ka == kprev) != (sa == prev))) wrong = true;
+        prev = sa;
+        kprev = ka;
+      }
+      if (wrong) {
+        if (bad4 < 10) fprintf(stderr, "KEY MISMATCH (length %u)\n", na);
+        bad4++;
+      }
+    }
+  }
+  fprintf(stderr, "selftest keys: %ld cases (%ld fast), %ld mismatches\n", n4, nfast, bad4);
+  return (bad || bad2 || bad3 || bad4) ? 1 : 0;
 }
 
 // ------------------------------------------------------------------------------------------

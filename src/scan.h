@@ -59,6 +59,16 @@ static inline u64 prefix_xor(u64 x) {
   return (u64)_mm_cvtsi128_si64(_mm_clmulepi64_si128(_mm_set_epi64x(0, (long long)x), _mm_set1_epi8((char)0xFF), 0));
 }
 
+// Index of the lowest set bit. Written as an instruction so the compiler does not put a register-clearing
+// instruction in front of it (it does that for the BMI count instructions to break a false dependency on the
+// destination that these processors no longer have for tzcnt); the flattening loop below is long enough for
+// one instruction in five to matter.
+static inline __attribute__((always_inline)) u32 tz64(u64 x) {
+  u64 r;
+  __asm__("tzcnt %1, %0" : "=r"(r) : "r"(x) : "cc");
+  return (u32)r;
+}
+
 // index of the first set bit at or after `from` and below `limit` in the bit stream w; `limit` if none.
 // Bits at and above `limit` in the last word are zero.
 static inline u32 next_bit(const u64* w, u32 from, u32 limit) {
@@ -104,88 +114,124 @@ static inline __attribute__((always_inline)) void scan_lines(const u8* begin, co
   Qw[1] = 0;
   bool skip_open = false;  // the open line already has too many fields: no entries are kept for it
   bool line_bad = false;   // the open line touched a flagged block in an earlier window
-  u32 carry = 0;           // quote parity since the start of the open line
-  u64 prev_top = 1;        // was the byte before this block a separator (or the chunk start)?
+  __m128i vcarry = _mm_setzero_si128();  // bit 0: quote parity since the start of the open line
   alignas(32) u32 st[8] = {0, 0, 0, 0, 0, 0, 0, 0}, ln[8] = {0, 0, 0, 0, 0, 0, 0, 0};  // slow paths only
   const u64 PATMASK = (2ULL << NF) - 2;  // entries 1..NF of a line
   const u64 PAT = 1ULL << NF;            // only the last of them is a newline
   const __m256i vc = _mm256_set1_epi8(','), vn = _mm256_set1_epi8('\n'), vq = _mm256_set1_epi8('"');
   const __m256i MONE = _mm256_set1_epi32(-1);
   const __m256i BITS = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
-  for (u32 w = 0; w < total; w += WB * 64) {
-    const u32 wend = (total - w < WB * 64) ? total : w + WB * 64;
-    u64 badw = 0;
-    // ---------------- stage 1
-    for (u32 off = w, bi = 0; off < wend; off += 64, bi++) {
-      const u8* blk = p + off;
-      _mm_prefetch((const char*)(blk + 2048), _MM_HINT_T0);
-      const __m256i a = _mm256_loadu_si256((const __m256i*)blk);
-      const __m256i b = _mm256_loadu_si256((const __m256i*)(blk + 32));
-      u64 mc = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, vc)) |
-               ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, vc)) << 32);
-      u64 mn = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, vn)) |
-               ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, vn)) << 32);
-      u64 mq = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, vq)) |
-               ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, vq)) << 32);
-      const u32 rem = total - off;
-      if (rem < 64) {
-        const u64 m = (1ULL << rem) - 1;
-        mc &= m;
-        mn &= m;
-        mq &= m;
-      }
-      const u64 sep = mc | mn;
-      const u64 starts = (sep << 1) | prev_top;
-      u64 ends = sep >> 1;
-      u64 qn = mq >> 1;  // the byte after position i is a quote
-      if (rem < 64) {
-        ends |= 1ULL << (rem - 1);  // the chunk end is a virtual separator
-      } else if (rem == 64) {
-        ends |= 1ULL << 63;
+  const __m128i ONES = _mm_set1_epi8((char)0xFF);
+  // Bit masks of the 64 bytes at `off`: separators, newlines, quotes.
+  auto block_masks = [&](size_t off, u64& bsep, u64& bmn, u64& bmq) __attribute__((always_inline)) {
+    const u8* blk = p + off;
+    const __m256i a = _mm256_loadu_si256((const __m256i*)blk);
+    const __m256i b = _mm256_loadu_si256((const __m256i*)(blk + 32));
+    const u64 mc = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, vc)) |
+                   ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, vc)) << 32);
+    bmn = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, vn)) |
+          ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, vn)) << 32);
+    bmq = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, vq)) |
+          ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, vq)) << 32);
+    bsep = mc | bmn;
+  };
+  // The masks of a block are computed one iteration early: what follows the last byte of a block is then
+  // found in the low bits of the next block's masks.
+  u64 sep, mn, mq;
+  block_masks(0, sep, mn, mq);
+  if (total < 64) {
+    const u64 m = (1ULL << total) - 1;
+    sep &= m;
+    mn &= m;
+    mq &= m;
+  }
+  u32 w = 0;  // start of the current window
+  u64 badw = 0;
+  // The rest of the work for the block at `off`, whose masks are sep / mn / mq. qn: the byte after position i
+  // is a quote. ends2: the byte two after position i is a separator or the chunk end. A quote is regular when
+  // the byte before it or the byte after it is a separator; seen from the byte before the quote, that is
+  // "this byte is a separator or the one two ahead is" (the very first byte of the chunk needs no check: the
+  // chunk start counts as a separator).
+  auto finish_block = [&](const u32 off, const u64 qn, const u64 ends2) __attribute__((always_inline)) {
+    const __m128i vpx = _mm_clmulepi64_si128(_mm_xor_si128(_mm_cvtsi64_si128((long long)mq), vcarry), ONES, 0);
+    const u64 px = (u64)_mm_cvtsi128_si64(vpx);  // quote parity up to and including each position
+    const u64 irregular = (qn & ~(sep | ends2)) | (px & sep);
+    if (__builtin_expect(irregular == 0, 1)) {
+      // every separator of the block sits at even parity, so the parity at the block end is also the
+      // parity since the last newline
+      vcarry = _mm_srli_epi64(vpx, 63);
+    } else {
+      badw |= 1ULL << ((off - w) >> 6);
+      u64 carry = (u64)_mm_cvtsi128_si64(vcarry) & 1;
+      if (mn) {
+        const u32 last = 63 - (u32)__builtin_clzll(mn);
+        carry = (u64)__builtin_popcountll(last == 63 ? 0 : (mq >> (last + 1))) & 1;
       } else {
-        const u8 nx = blk[64];
-        ends |= (u64)((nx == ',') | (nx == '\n')) << 63;
-        qn |= (u64)(nx == '"') << 63;
+        carry ^= (u64)__builtin_popcountll(mq) & 1;
       }
-      prev_top = sep >> 63;
-      const u64 px = prefix_xor(mq) ^ (0 - (u64)carry);
-      const u64 irregular = (mq & ~(starts | ends)) | (px & sep);
-      if (__builtin_expect(irregular == 0, 1)) {
-        // every separator of the block sits at even parity, so the parity at the block end is also the
-        // parity since the last newline
-        carry = (u32)(px >> 63);
-      } else {
-        badw |= 1ULL << bi;
-        if (mn) {
-          const u32 last = 63 - (u32)__builtin_clzll(mn);
-          carry = (u32)__builtin_popcountll(last == 63 ? 0 : (mq >> (last + 1))) & 1;
-        } else {
-          carry ^= (u32)__builtin_popcountll(mq) & 1;
-        }
-      }
-      // append the separators of this block: newline bits, quote-after bits, offsets
-      const u32 cnt = (u32)__builtin_popcountll(sep);
-      const u64 nb = _pext_u64(mn, sep), qb = _pext_u64(qn, sep);
-      {
-        const u32 wi = ns >> 6, sh = ns & 63;
-        Nw[wi] |= nb << sh;
-        Nw[wi + 1] = (nb >> 1) >> (63 - sh);
-        Qw[wi] |= qb << sh;
-        Qw[wi + 1] = (qb >> 1) >> (63 - sh);
-      }
-      {
-        u64 m = sep;
-        u32* o = Spos + ns;
-        for (u32 done = 0;; done += 8) {
+      vcarry = _mm_cvtsi64_si128((long long)carry);
+    }
+    // append the separators of this block: newline bits, quote-after bits, offsets
+    const u32 cnt = (u32)__builtin_popcountll(sep);
+    const u64 nb = _pext_u64(mn, sep), qb = _pext_u64(qn, sep);
+    {
+      const size_t wi = ns >> 6;
+      const u32 lsh = ns & 63, rsh = ~ns & 63;  // rsh = 63 - lsh
+      Nw[wi] |= nb << lsh;
+      Nw[wi + 1] = (nb >> 1) >> rsh;
+      Qw[wi] |= qb << lsh;
+      Qw[wi + 1] = (qb >> 1) >> rsh;
+    }
+    {
+      u64 m = sep;
+      u32* o = Spos + (size_t)ns;
+      for (u32 done = 0;; done += 8) {
 #pragma GCC unroll 8
-          for (int j = 0; j < 8; j++) {
-            o[done + j] = off + (u32)_tzcnt_u64(m);
-            m = _blsr_u64(m);
-          }
-          if (done + 8 >= cnt) break;
+        for (int j = 0; j < 8; j++) {
+          o[done + j] = off + tz64(m);
+          m = _blsr_u64(m);
         }
+        if (done + 8 >= cnt) break;
       }
-      ns += cnt;
+    }
+    ns += cnt;
+  };
+  const u32 fast_end = total >= 128 ? total - 127 : 0;  // blocks below it are followed by 64 more bytes
+  for (; w < total; w += WB * 64) {
+    const u32 wend = (total - w < WB * 64) ? total : w + WB * 64;
+    badw = 0;
+    // ---------------- stage 1
+    u32 off = w;
+    for (const u32 fend = wend < fast_end ? wend : fast_end; off < fend; off += 64) {
+      _mm_prefetch((const char*)(p + off + 2048), _MM_HINT_T0);
+      u64 nsep, nmn, nmq;
+      block_masks((size_t)off + 64, nsep, nmn, nmq);
+      finish_block(off, (mq >> 1) | (nmq << 63), (sep >> 2) | (nsep << 62));
+      sep = nsep;
+      mn = nmn;
+      mq = nmq;
+    }
+    for (; off < wend; off += 64) {  // the last one or two blocks of the chunk
+      const u32 rem = total - off;
+      u64 nsep = 0, nmn = 0, nmq = 0;
+      u64 virt = sep, nvirt = 0;  // separators, with the chunk end as one more
+      if (rem > 64) {
+        block_masks((size_t)off + 64, nsep, nmn, nmq);
+        const u32 rem2 = rem - 64;  // 1..63
+        const u64 m = (1ULL << rem2) - 1;
+        nsep &= m;
+        nmn &= m;
+        nmq &= m;
+        nvirt = nsep | (1ULL << rem2);
+      } else if (rem == 64) {
+        nvirt = 1;
+      } else {
+        virt |= 1ULL << rem;
+      }
+      finish_block(off, (mq >> 1) | (nmq << 63), (virt >> 2) | (nvirt << 62));
+      sep = nsep;
+      mn = nmn;
+      mq = nmq;
     }
     // ---------------- stage 2
     u32 si = 0;  // entry of the newline before the current line
