@@ -13,15 +13,18 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <immintrin.h>
+#include <linux/futex.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -88,6 +91,63 @@ static inline void thread_times(u64& user_us, u64& sys_us) {
 static int g_phase = 0;
 static const char* g_phase_names[16] = {"init", "links", "parse", "dedup", "person", "output"};
 
+// ---- the worker pool. The NT - 1 workers are started at the first parallel section and kept to the end: a
+// section then costs a wake-up, not NT - 1 thread starts (there are about twenty sections, some of them a
+// fraction of a millisecond long). A worker that finds nothing to do spins for a moment before it sleeps,
+// as the next section is usually close. Sections are posted by the main thread only, one at a time.
+struct PoolJob {
+  void (*run)(void* ctx, int t, int tid);
+  void* ctx;
+  int ntasks;
+  int phase;
+  alignas(64) std::atomic<int> next{0};
+  alignas(64) std::atomic<int> finished{0};
+};
+static std::atomic<PoolJob*> g_job{nullptr};
+static std::atomic<u32> g_job_seq{0};  // bumped for every job; the workers sleep on it
+static bool g_pool_up = false;
+
+static inline void futex_wait(std::atomic<u32>* a, u32 seen) {
+  syscall(SYS_futex, (u32*)a, FUTEX_WAIT_PRIVATE, seen, nullptr, nullptr, 0);
+}
+static inline void futex_wake_all(std::atomic<u32>* a) { syscall(SYS_futex, (u32*)a, FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0); }
+
+// Tasks of job j until none is left.
+static void pool_take(PoolJob* j, int tid) {
+  u64 u0 = 0, s0 = 0, u1, s1;
+  bool any = false;
+  for (;;) {
+    if (j->next.load(std::memory_order_relaxed) >= j->ntasks) break;
+    const int t = j->next.fetch_add(1, std::memory_order_relaxed);
+    if (t >= j->ntasks) break;
+    if (!any && g_log) thread_times(u0, s0);
+    any = true;
+    j->run(j->ctx, t, tid);
+    if (g_log) {  // (task by task, so that the times are in before the job counts as done)
+      thread_times(u1, s1);
+      g_phase_cycles[j->phase] += u1 - u0;
+      g_phase_sys[j->phase] += s1 - s0;
+      u0 = u1;
+      s0 = s1;
+    }
+    j->finished.fetch_add(1, std::memory_order_release);
+  }
+}
+static void pool_worker(int tid) {
+  u32 seen = 0;
+  for (;;) {
+    u32 s;
+    for (u32 spins = 0; (s = g_job_seq.load(std::memory_order_acquire)) == seen; spins++) {
+      if (spins < 20000)
+        _mm_pause();
+      else
+        futex_wait(&g_job_seq, seen);
+    }
+    seen = s;
+    pool_take(g_job.load(std::memory_order_acquire), tid);
+  }
+}
+
 template <class F>
 static void parallel_for(int ntasks, F&& f) {
   if (ntasks <= 0) return;
@@ -95,28 +155,24 @@ static void parallel_for(int ntasks, F&& f) {
     for (int t = 0; t < ntasks; t++) f(t, tl_serial_tid);
     return;
   }
-  std::atomic<int> next{0};
-  const int phase = g_phase;
-  auto worker = [&](int tid) {
-    u64 u0 = 0, s0 = 0, u1, s1;
-    if (g_log) thread_times(u0, s0);
-    for (;;) {
-      int t = next.fetch_add(1, std::memory_order_relaxed);
-      if (t >= ntasks) break;
-      f(t, tid);
+  // (a job is never freed: a worker may still look at one that is over, to find it has nothing left)
+  PoolJob* const j = new PoolJob;
+  typedef typename std::remove_reference<F>::type Fn;
+  j->run = [](void* ctx, int t, int tid) { (*(Fn*)ctx)(t, tid); };
+  j->ctx = (void*)&f;
+  j->ntasks = ntasks;
+  j->phase = g_phase;
+  if (NT > 1 && ntasks > 1) {
+    if (!g_pool_up) {
+      g_pool_up = true;
+      for (int i = 1; i < NT; i++) std::thread(pool_worker, i).detach();
     }
-    if (g_log) {
-      thread_times(u1, s1);
-      g_phase_cycles[phase] += u1 - u0;
-      g_phase_sys[phase] += s1 - s0;
-    }
-  };
-  int n = std::min(NT, ntasks);
-  std::vector<std::thread> th;
-  th.reserve(n);
-  for (int i = 1; i < n; i++) th.emplace_back(worker, i);
-  worker(0);
-  for (auto& t : th) t.join();
+    g_job.store(j, std::memory_order_release);
+    g_job_seq.fetch_add(1, std::memory_order_release);
+    futex_wake_all(&g_job_seq);
+  }
+  pool_take(j, 0);
+  while (j->finished.load(std::memory_order_acquire) < ntasks) _mm_pause();  // the tasks other threads still have
 }
 
 // Zero-filled memory for the big tables and the arenas, on huge pages where the kernel grants them: from

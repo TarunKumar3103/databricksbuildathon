@@ -1093,9 +1093,11 @@ static void parse(std::vector<MFile>& ev, std::vector<MFile>& ck) {
   for (auto& f : ev) ev_bytes += f.size;
   for (auto& f : ck) ck_bytes += f.size;
   size_t chunk = std::max<size_t>(1 << 18, std::min<size_t>(8 << 20, (ev_bytes + ck_bytes) / (NT * 24 + 1)));
+  // The click files come last, so their chunks decide how far apart the threads finish: they are smaller.
+  const size_t chunk_ck = std::max<size_t>(1 << 18, std::min<size_t>(chunk, ck_bytes / (NT * 32 + 1)));
   std::vector<Chunk> ce, cc;
   make_chunks(ev, chunk, ce);
-  make_chunks(ck, chunk, cc);
+  make_chunks(ck, chunk_ck, cc);
   const i64 ws = g_ws, we = g_we, cws = g_ws - WEEK;
   parallel_for((int)(ce.size() + cc.size()), [&](int t, int tid) {
     if (g_fail.load(std::memory_order_relaxed)) return;
