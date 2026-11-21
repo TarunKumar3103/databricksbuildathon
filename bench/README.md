@@ -40,8 +40,8 @@ faults, as `f150k`. Bench 6 left memory out to make room for twelve builds.) `ro
 and `campaign_daily` row counts, the same for every run unless `DIFFER` follows.
 
 Its `top_category` holds the phase split of each build from `SS_LOG`: `a:149+1514+805` is the user CPU in ms
-of links, parse, and dedup or scan, medians over the rounds. If `BENCH_TIMELINE` names a build, the timeline of
-its run with the median wall time follows, as `k@20M:5/38/221/292/297/301`: the ms since the process started
+of links, parse, and dedup or scan, medians over the rounds. If `BENCH_TIMELINE` names a build (or several, comma-separated), the
+timeline of its run with the median wall time follows, as `k@20M:5/38/221/292/297/301`: the ms since the process started
 at which the log says the input was mapped, the last links line, the parse done, the dense scan done and the
 output written, then the in-process time from `ABS start` to `ABS end` (after the arenas are released). The
 wall time in the first field minus the last number is process start and teardown. (Bench 1 printed `a:365=149+1514+805+6+14`: the

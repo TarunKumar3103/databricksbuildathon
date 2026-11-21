@@ -1,13 +1,12 @@
 # Written by bench/mkbench.py. tag, binary in /usr/local/bench, then ENV=VALUE settings.
 # The first build also writes the dev output that the report rows are added to.
-v    ss-719ab70-clang18-pgo               # v4 719ab70 as its Dockerfile (clang 18.1.3 + its profile): scored 0.39 at 16:34
-b    ss-64d49ec-clang18-pgo               # b-ts 64d49ec as its Dockerfile (719ab70 + add_group reads n once): scored 0.40 at 16:48
-bn   ss-64d49ec-clang18-pgo-nopie         # b with -fno-pie (Ubuntu's clang compiles PIE code even for -static)
-b3   ss-64d49ec-clang18-pgo-O3            # b with -O3 in place of -O2
-bv   ss-64d49ec-clang18-pgo-vec           # b with the loop and SLP vectorizers on (no -fno-vectorize -fno-slp-vectorize)
-bt   ss-64d49ec-clang18-pgo-exttsp        # b with -mllvm -enable-ext-tsp-block-placement (profile-driven block layout)
-bc   ss-64d49ec-clang18-pgo-nocmovconv    # b with -mllvm -x86-cmov-converter=false (cmovs never turned back into branches)
-ba   ss-64d49ec-clang18-pgo-align32       # b with -falign-loops=32
-b19  ss-64d49ec-clang19-pgo               # 64d49ec with clang 19.1.1 (Ubuntu 24.04 clang-19) and a profile made with it
-b20  ss-64d49ec-clang20-pgo               # 64d49ec with clang 20.1.2 (Ubuntu 24.04 clang-20) and a profile made with it
-b20n ss-64d49ec-clang20-pgo-nopie         # b20 with -fno-pie
+v    ss-719ab70-clang18-pgo          # v4 719ab70 as its Dockerfile: scored 0.39 at 16:34, the anchor
+s    ss-3fb5c91-clang18-pgo          # b-ts 3fb5c91 (719ab70 + 64d49ec's add_group + scanner separator bits), A's baseline for the scan
+a    ss-57d15ec-clang18-pgo          # v4 57d15ec = 3fb5c91 + A's scan commit 28eda9a: scored 0.41
+h    ss-cf4f788-clang18-pgo          # v4 cf4f788 = 57d15ec + B's c5195d4 timestamp commit: head of v4, A's entry: scored 0.38 at 17:48
+hn   ss-cf4f788-clang18-pgo-nopie    # h with -fno-pie (bench 7: about 1% at 60M)
+t    ss-c5195d4-clang18-pgo          # b-ts c5195d4 = 3fb5c91 + the F1 timestamp kernels (no A's scan): -3.0% modelled against 719ab70
+t2   ss-9672e5a-clang18-pgo          # b-ts 9672e5a = c5195d4 + ingest code stored as 2^24 - code
+z    ss-358a234-clang18-pgo          # b-zmm 358a234 = c5195d4 + 512-bit block compares in the scanner
+h7   ss-cf4f788-clang18-pgo SS_THREADS=7   # h with 7 threads: whether the cgroup's CPU quota of 8 holds 8 threads back
+h4   ss-cf4f788-clang18-pgo SS_THREADS=4   # h with 4 threads, one per core: what the second hyperthread of each core gives

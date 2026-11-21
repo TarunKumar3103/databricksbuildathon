@@ -305,6 +305,8 @@ struct Variant {
 struct Run {
   double wall = 0, user = 0, sys = 0, inproc = -1, ph[5] = {-1, -1, -1, -1, -1}, psys = -1;
   double tl[6] = {-1, -1, -1, -1, -1, -1};  // ms: files mapped, links, parse, scan, output written, end of run
+  double thr_ms = -1;  // time the cgroup's CPU quota held the run back (cpu.stat throttled_usec, ms)
+  long nthr = -1;      // and in how many periods
   long rss_mb = 0, minflt = 0;
   long long ud = -1, cd = -1;
   int status = 0;
@@ -395,7 +397,7 @@ struct Row {
   long long a = 0, b = 0, c = 0;
 };
 static int32_t g_day = 0;
-static std::string tl_tag;
+static std::vector<std::string> tl_tags;  // builds whose phase timeline the report gives (BENCH_TIMELINE, comma-separated)
 static bool write_report(const std::string& out, std::vector<Row> rows) {
   const std::string dir = out + "/user_daily";
   mkdir(dir.c_str(), 0777);
@@ -453,13 +455,83 @@ static int32_t day_of(const std::string& manifest) {  // days since 1970 of wind
   return era * 146097 + (int)doe - 719468;
 }
 
+// the word in [brackets] of a sysfs choice file ("always [madvise] never" -> "madvise")
+static std::string chosen(const std::string& path) {
+  const std::string s = first_line(path);
+  size_t a = s.find('['), b = s.find(']');
+  return a != std::string::npos && b != std::string::npos && b > a ? s.substr(a + 1, b - a - 1) : (s.empty() ? "-" : s);
+}
+// "fstype" or "fstype:huge=x" of the mount at path, from mountinfo
+static std::string mount_of(const std::string& mi, const std::string& path) {
+  size_t a = 0;
+  while (a < mi.size()) {
+    size_t b = mi.find('\n', a);
+    if (b == std::string::npos) b = mi.size();
+    const std::string l = mi.substr(a, b - a);
+    a = b + 1;
+    char root[512], mp[512];
+    if (sscanf(l.c_str(), "%*s %*s %*s %511s %511s", root, mp) != 2 || path != mp) continue;
+    size_t d = l.find(" - ");
+    if (d == std::string::npos) continue;
+    char fs[64], src[256], opts[1024];
+    if (sscanf(l.c_str() + d + 3, "%63s %255s %1023s", fs, src, opts) < 3) continue;
+    std::string r = fs;
+    const char* h = strstr(opts, "huge=");
+    if (h) r += ":" + std::string(h, strcspn(h, ","));
+    return r;
+  }
+  return "none";
+}
+static std::string status_field(const char* key) {  // a line of /proc/self/status
+  const std::string s = slurp("/proc/self/status");
+  size_t p = s.find(key);
+  if (p == std::string::npos) return "-";
+  p += strlen(key);
+  while (p < s.size() && (s[p] == ':' || s[p] == ' ' || s[p] == '\t')) p++;
+  return s.substr(p, s.find('\n', p) - p);
+}
+static double mtime_s(const char* path) {
+  struct stat st;
+  return stat(path, &st) == 0 ? st.st_mtim.tv_sec + st.st_mtim.tv_nsec / 1e9 : -1;
+}
+
 int main() {
   g_t0 = now_s();
+  std::string facts;  // facts about the machine and the container, for the last row
+  {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    const double real0 = ts.tv_sec + ts.tv_nsec / 1e9;
+    // how long after the container's files and cgroup were made this process started (ms)
+    const double hn = mtime_s("/etc/hostname"), hs = mtime_s("/etc/hosts"), cg = mtime_s("/sys/fs/cgroup");
+    facts += fmt(" up=hn%.0f,hs%.0f,cg%.0f", hn > 0 ? (real0 - hn) * 1e3 : -1, hs > 0 ? (real0 - hs) * 1e3 : -1,
+                 cg > 0 ? (real0 - cg) * 1e3 : -1);
+    const std::string mi = slurp("/proc/self/mountinfo");
+    facts += fmt(" mnt=data:%s,scr:%s,out:%s,tmp:%s", mount_of(mi, "/data").c_str(), mount_of(mi, "/scratch").c_str(),
+                 mount_of(mi, "/output").c_str(), mount_of(mi, "/tmp").c_str());
+    facts += fmt(" thp=%s/%s/shm:%s", chosen("/sys/kernel/mm/transparent_hugepage/enabled").c_str(),
+                 chosen("/sys/kernel/mm/transparent_hugepage/defrag").c_str(),
+                 chosen("/sys/kernel/mm/transparent_hugepage/shmem_enabled").c_str());
+    facts += fmt(" cpu=%s mem=%s nodes=%s", status_field("Cpus_allowed_list").c_str(),
+                 status_field("Mems_allowed_list").c_str(), first_line("/sys/devices/system/node/online").c_str());
+    const std::string cst = slurp("/sys/fs/cgroup/cpu.stat");
+    facts += fmt(" burst=%s", first_line("/sys/fs/cgroup/cpu.max.burst").c_str());
+    (void)cst;
+  }
   const std::string data = env_or("DATA_DIR", "/data"), out = env_or("OUTPUT_DIR", "/output");
   const std::string scratch = env_or("SCRATCH_DIR", "/scratch"), dir = env_or("BENCH_DIR", "/usr/local/bench");
   const double tmax = atof(env_or("BENCH_TMAX", "150").c_str());
   const std::string seed = env_or("BENCH_SEED", "20261122");
-  tl_tag = env_or("BENCH_TIMELINE", "");  // the build whose phase timeline the report gives
+  {
+    const std::string t = env_or("BENCH_TIMELINE", "");
+    size_t a = 0;
+    while (a <= t.size()) {
+      size_t b = t.find(',', a);
+      if (b == std::string::npos) b = t.size();
+      if (b > a) tl_tags.push_back(t.substr(a, b - a));
+      a = b + 1;
+    }
+  }
   g_day = day_of(slurp(data + "/manifest.json"));
   std::vector<Variant> vs = load_variants(dir);
   std::string notes;
@@ -559,7 +631,9 @@ int main() {
         mkdir(odir.c_str(), 0777);
         std::vector<std::string> e = {"DATA_DIR=" + gdir, "OUTPUT_DIR=" + odir, "SS_LOG=1"};
         for (auto& x : vs[vi].env) e.push_back(x);
+        const std::string cs0 = slurp("/sys/fs/cgroup/cpu.stat");
         Proc p = run_proc(vs[vi].bin, {}, e, std::max(5.0, std::min(120.0, tmax + 60 - el())));
+        const std::string cs1 = slurp("/sys/fs/cgroup/cpu.stat");
         Run u;
         u.status = p.status;
         u.wall = p.wall * 1000;
@@ -571,6 +645,12 @@ int main() {
         u.ud = table_rows(odir + "/user_daily");
         u.cd = table_rows(odir + "/campaign_daily");
         u.ok = p.status == 0 && !p.timed_out;
+        {
+          const long long t0 = stat_field(cs0, "throttled_usec"), t1 = stat_field(cs1, "throttled_usec");
+          const long long n0 = stat_field(cs0, "nr_throttled"), n1 = stat_field(cs1, "nr_throttled");
+          if (t0 >= 0 && t1 >= 0) u.thr_ms = (t1 - t0) / 1000.0;
+          if (n0 >= 0 && n1 >= 0) u.nthr = (long)(n1 - n0);
+        }
         res[vi].push_back(u);
       }
     }
@@ -587,7 +667,7 @@ int main() {
         a += fmt(" %s=missing", vs[vi].tag.c_str());
         continue;
       }
-      std::vector<double> w, us, ss, ip, fl;
+      std::vector<double> w, us, ss, ip, fl, th;
       long rss = 0;
       char route = '?';
       int bad = 0;
@@ -602,6 +682,7 @@ int main() {
         ss.push_back(u.sys);
         if (u.inproc >= 0) ip.push_back(u.inproc);
         fl.push_back((double)u.minflt);
+        if (u.thr_ms >= 0) th.push_back(u.thr_ms);
         rss = std::max(rss, u.rss_mb);
         route = u.route;
         if (u.ph[0] >= 0)
@@ -618,10 +699,13 @@ int main() {
       (void)rss;  // (benches 1 to 5 printed the peak memory too, as 626M)
       a += fmt(" %s=%.0f,u%.2f,s%.2f,%c%s", vs[vi].tag.c_str(), mw, median(us), median(ss), route,
                bad ? fmt("!%d", bad).c_str() : (w.size() == (size_t)z.rounds ? "" : fmt("%zu", w.size()).c_str()));
+      if (!th.empty() && *std::max_element(th.begin(), th.end()) > 0)  // throttled ms per run: median and most
+        a += fmt(",T%.1f/%.1f", median(th), *std::max_element(th.begin(), th.end()));
       if (!ph[0].empty())  // CPU ms of links, parse, dedup or scan (the person phase and the output are a few ms)
         b += fmt("%s%s:%.0f+%.0f+%.0f", b.empty() ? "" : " ", vs[vi].tag.c_str(), median(ph[0]) * 1000,
                  median(ph[1]) * 1000, median(ph[2]) * 1000);
-      if (vs[vi].tag == tl_tag && !w.empty()) {  // the timeline of the run with the median wall time
+      if (!w.empty() && std::find(tl_tags.begin(), tl_tags.end(), vs[vi].tag) != tl_tags.end()) {
+        // the timeline of the run with the median wall time
         const Run* best = nullptr;
         for (auto& u : res[vi])
           if (u.ok && (!best || std::fabs(u.wall - mw) < std::fabs(best->wall - mw))) best = &u;
@@ -634,7 +718,13 @@ int main() {
     b += tlines;
     rows.push_back(Row{a, b.empty() ? "-" : b, med3[0], med3[1], med3[2]});
   }
-  rows.push_back(Row{fmt("!%d %s%s tot=%.0fs", sizeno + 1, env_s.c_str(), notes.c_str(), el()), gen_s.empty() ? "-" : gen_s.substr(1),
+  {  // the container's CPU throttling over the whole bench
+    const std::string cst = slurp("/sys/fs/cgroup/cpu.stat");
+    facts += fmt(" thr=%lld/%lldp,%.0fms", stat_field(cst, "nr_throttled"), stat_field(cst, "nr_periods"),
+                 stat_field(cst, "throttled_usec") / 1000.0);
+  }
+  rows.push_back(Row{fmt("!%d %s%s tot=%.0fs", sizeno + 1, env_s.c_str(), notes.c_str(), el()),
+                     (gen_s.empty() ? std::string("-") : gen_s.substr(1)) + facts,
                      (long long)dev_ms, ncpu, (long long)el()});
   if (!write_report(out, rows)) fprintf(stderr, "bench: report not written\n");
   for (auto& r : rows) fprintf(stderr, "BENCH %s || %s\n", r.uid.c_str(), r.cat.c_str());
