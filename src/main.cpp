@@ -134,7 +134,9 @@ static void* vm_alloc(size_t bytes) {
 
 // Records are kept in blocks of one page. Every thread has an open block per partition, on average half
 // full at the end, and all of that memory has to be zeroed by the kernel first: small blocks keep it small.
-static constexpr size_t BLOCK_BYTES = 2048;
+// Not smaller than this, though: with 2 KB blocks the passes that read the records back measured 3% more
+// CPU time (twice as many block boundaries to cross), for only 30 MB less memory.
+static constexpr size_t BLOCK_BYTES = 4096;
 
 struct Arena {
   u8* cur = nullptr;
