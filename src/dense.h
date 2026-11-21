@@ -818,27 +818,44 @@ static NOINLINE u32 process_events(EvB& B, const u8* const base, WCScatter<D16>:
       _mm_store_si128((__m128i*)(B.part + i), low32x4(_mm256_srli_epi64(idx, KE)));
     }
   }
-  // ---- which lines are plain: a user and a product, the type view or cart; eight lines at a time
-  u64 plain = 0, kept = 0;  // kept: the line has an event_id (a line without one is dropped)
+  // ---- which lines are plain: a user and a product, the type view or cart; eight lines at a time. (purch:
+  // the same with a type that starts "purc" in 8 bytes, the candidates for a purchase.)
+  u64 plain = 0, kept = 0, purch = 0;  // kept: the line has an event_id (a line without one is dropped)
   {
-    const __m256i zero = _mm256_setzero_si256(), c4 = _mm256_set1_epi32(4);
-    const __m256i view = _mm256_set1_epi32(0x77656976), cart = _mm256_set1_epi32(0x74726163);
+    const __m256i zero = _mm256_setzero_si256(), c4 = _mm256_set1_epi32(4), c8 = _mm256_set1_epi32(8);
+    const __m256i view = _mm256_set1_epi32(0x77656976), cart = _mm256_set1_epi32(0x74726163), purc = _mm256_set1_epi32(0x63727570);
     for (u32 i = 0; i < n; i += 8) {
-      const __m256i w4 = _mm256_load_si256((const __m256i*)(B.w4 + i));
-      const u32 simple = eq32x8(_mm256_load_si256((const __m256i*)(B.ln[4] + i)), c4) & (eq32x8(w4, view) | eq32x8(w4, cart));
+      const __m256i w4 = _mm256_load_si256((const __m256i*)(B.w4 + i)), l4 = _mm256_load_si256((const __m256i*)(B.ln[4] + i));
+      const u32 simple = eq32x8(l4, c4) & (eq32x8(w4, view) | eq32x8(w4, cart));
       const u32 empty = eq32x8(_mm256_load_si256((const __m256i*)(B.ln[1] + i)), zero) | eq32x8(_mm256_load_si256((const __m256i*)(B.ln[5] + i)), zero);
       const u32 noid = eq32x8(_mm256_load_si256((const __m256i*)(B.ln[0] + i)), zero);
       plain |= (u64)(simple & ~empty & 0xFF) << i;
+      purch |= (u64)(eq32x8(l4, c8) & eq32x8(w4, purc) & ~empty & 0xFF) << i;
       kept |= (u64)(~noid & 0xFF) << i;
     }
   }
   kept &= nmask;
   plain &= kept & ~(irr | bad);
+  purch &= kept & ~(irr | bad);
   // ---- the scatter
   auto cur = cur_out;
   for (u64 m = plain; m; m = _blsr_u64(m)) {
     const u32 i = (u32)_tzcnt_u64(m);
     WCScatter<D16>::push16(cur, B.part[i], _mm_load_si128((const __m128i*)&B.rec[i]));
+  }
+  // purchases with a valid price whose category and price fit the record: the plain record and the payload.
+  // Anything else about them (a bad price, a payload that does not fit) is left to ev_slow, as before.
+  for (u64 m = purch; m; m = _blsr_u64(m)) {
+    const u32 i = (u32)_tzcnt_u64(m);
+    u64 w8;
+    memcpy(&w8, base + B.st[4][i], 8);
+    u32 price;
+    if (w8 != 0x6573616863727570ULL || !price_fast(base + B.st[6][i], B.ln[6][i], price)) continue;  // "purchase"
+    const u32 cat = cat_fast(base + B.st[5][i], B.ln[5][i]);
+    if (cat >= 32 || price >= (1u << 17)) continue;
+    plain |= 1ULL << i;
+    const u64 w1 = B.rec[i].w1 | ((u64)((cat << 17) | price) << 24);
+    WCScatter<D16>::push16(cur, B.part[i], _mm_set_epi64x((long long)w1, (long long)B.rec[i].w0));
   }
   for (u64 m = kept & ~plain; m; m = _blsr_u64(m)) {
     const u32 i = (u32)_tzcnt_u64(m);
