@@ -207,5 +207,17 @@ elif mode == "aliaslinks":
                 p = l.split(","); p[1] = realias(p[1], random.choice(AL)); body[i] = ",".join(p)
         return body
     lk(fl); ev(fe); ck(fc)
+elif mode == "window":
+    # another window in the manifest: longer than the 16 days the dense scan has lanes for, moved (events that
+    # were just outside become valid and are out of time order), not starting at midnight, or shorter
+    import json, datetime
+    mp = os.path.join(out, "manifest.json")
+    m = json.load(open(mp))
+    def shift(t, hours):
+        d = datetime.datetime.strptime(t, "%Y-%m-%dT%H:%M:%SZ") + datetime.timedelta(hours=hours)
+        return d.strftime("%Y-%m-%dT%H:%M:%SZ")
+    a, b = random.choice([(0, 49), (-30, 30), (-72, 72), (7, 7), (-5, -5), (0, 48), (-24, 24), (50, -50), (0, -100), (13, 0)])
+    m["window_start"], m["window_end"] = shift(m["window_start"], a), shift(m["window_end"], b)
+    json.dump(m, open(mp, "w"))
 else:
     sys.exit("unknown mode")
