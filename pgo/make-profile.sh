@@ -5,7 +5,7 @@
 # organisers' generator as $GENERATE. The training data is generated, never the dev or practice set.
 set -eu
 R=$(cd "$(dirname "$0")/.." && pwd); G=${GENERATE:-generate}; T=$(mktemp -d)
-F="-std=c++17 -O2 -fno-vectorize -fno-slp-vectorize -march=cascadelake -mtune=cascadelake -static -pthread"
+F="-std=c++17 -O2 -fno-vectorize -fno-slp-vectorize -march=cascadelake -mtune=cascadelake -static -pthread -fno-pie"
 clang++ $F -fprofile-instr-generate -fprofile-update=atomic -o "$T/train" "$R/src/main.cpp"
 "$G" --seed 4242 --events 3000000 --clicks 750000 --output "$T/d" > /dev/null   # dense route
 "$G" --seed 4243 --events 1000000 --clicks 250000 --output "$T/g" > /dev/null   # general route (the fallback)

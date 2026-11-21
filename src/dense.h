@@ -1539,13 +1539,15 @@ struct DS {
   std::vector<u64> xk;    // ... and before the sort, if the person has extra clicks
   std::vector<u64> rtmp;  // scratch of the sort
   // Per campaign (the last one is organic), two lines of 16 counters, one per day of the window: sessions
-  // it assisted, sessions credited to it. The click loop adds to lines16, 64 bytes per campaign: a person
-  // adds at most 48 to a counter (a day has room for 48 sessions), so every LINES_EVERY persons the 16-bit
-  // counters are added to the 32-bit ones in `lines` and cleared. Those go to the thread's tables when the
-  // scan is over.
+  // it assisted, sessions credited to it. The click loop adds to lines16, 64 bytes per campaign. A person
+  // adds to a day's counters at most the sessions it has that day, so no counter is above the sessions per
+  // day of the persons since the 16-bit counters were last cleared: that sum is kept in day_sum, and before it
+  // can pass 16 bits the counters are added to the 32-bit ones in `lines` and cleared (flush_lines; with 8
+  // threads that happens about once per 40M events). `lines` goes to the thread's tables when the scan is over.
   u16* lines16 = nullptr;
   u32* lines = nullptr;
-  u32 since = 0;  // persons since the last flush
+  alignas(32) u16 day_sum[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  u32 since = 0;  // persons closed (the check of day_sum is made every LINES_EVERY of them)
   std::vector<u64> xq;     // the person's extra events in time order
   // the click partition at hand: the clicks of its dense persons as keys, grouped by person index, and the
   // number of each one's click_id in the same places
@@ -1555,8 +1557,11 @@ struct DS {
   std::vector<std::pair<const C16*, u32>> cblk;
 };
 
-static constexpr u32 LINES_EVERY = 1024;
-static_assert(48 * LINES_EVERY <= 0xFFFF, "a 16-bit counter must hold what the persons between two flushes can add");
+// day_sum is looked at every LINES_EVERY persons, and the counters are flushed if a day's sum is above
+// LINES_LIMIT: a person has at most 48 sessions on a day (their starts are more than 30 minutes apart), so the
+// sum cannot pass 16 bits before the next look.
+static constexpr u32 LINES_EVERY = 64;
+static constexpr u32 LINES_LIMIT = 0xFFFF - 48 * LINES_EVERY;
 // lines16 into lines, for the NC campaigns and the organic line.
 static NOINLINE void flush_lines(DS& S, const u32 NC) {
   u16* const l16 = S.lines16;
@@ -1571,7 +1576,7 @@ static NOINLINE void flush_lines(DS& S, const u32 NC) {
     _mm256_store_si256((__m256i*)a, z);
     _mm256_store_si256((__m256i*)(a + 16), z);
   }
-  S.since = 0;
+  _mm256_store_si256((__m256i*)S.day_sum, z);
 }
 
 static std::atomic<u8>* g_ck_emitted = nullptr;
@@ -1982,13 +1987,18 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
     sess_ev[ns] = ps.nev;
     n_events += ps.nev;
     n_persons++;
-    if (__builtin_expect(++S.since > LINES_EVERY, 0)) {  // (before this person adds to the 16-bit lines)
-      flush_lines(S, NC);
-      S.since = 1;
-    }
     // ---- its sessions by day. Sessions are in time order, so a day's sessions are a run of them.
     Days D;
     days_of(sess_ts, sess_ev, ns, bnd0, bnd1, D);
+    {  // (before this person adds to the 16-bit lines)
+      __m256i ds = _mm256_load_si256((const __m256i*)S.day_sum);
+      if (__builtin_expect((S.since++ & (LINES_EVERY - 1)) == 0, 0) &&
+          !_mm256_testz_si256(_mm256_subs_epu16(ds, _mm256_set1_epi16((short)LINES_LIMIT)), _mm256_set1_epi16(-1))) {
+        flush_lines(S, NC);
+        ds = _mm256_setzero_si256();
+      }
+      _mm256_store_si256((__m256i*)S.day_sum, _mm256_add_epi16(ds, D.n16));
+    }
     vmax_s = _mm256_max_epu32(vmax_s, _mm256_max_epu32(D.n0, D.n1));
     vmax_e = _mm256_max_epu32(vmax_e, _mm256_max_epu32(D.v0, D.v1));
     // ---- its clicks: the keys of its index in the click partition
