@@ -650,7 +650,7 @@ struct Cols {
 struct EvB : Cols<7, 64> {
   alignas(32) u64 eq[CAP + 8], uq[CAP + 8];  // the 8 bytes after the prefix of event_id / user_id
   alignas(32) u32 w4[CAP + 8];               // the first 4 bytes of event_type
-  alignas(32) u8 pfx[CAP + 8];               // nonzero: a prefix byte is not the expected one
+  alignas(32) u8 pe[CAP + 8], pu[CAP + 8];   // the first bytes of event_id and of user_id
   alignas(32) u64 idx[CAP + 8];    // event index
   alignas(32) u32 num[CAP + 8];    // user number
   alignas(32) i64 ts[CAP + 8];     // ms, TS_NONE if not a timestamp
@@ -963,6 +963,27 @@ static FORCE_INLINE m4 ids4(const u64* raw, const u32* ln, __m256i& val) {
   const __m256i sh = _mm256_sub_epi64(_mm256_set1_epi64x(72), _mm256_slli_epi64(_mm256_cvtepu32_epi64(_mm_load_si128((const __m128i*)ln)), 3));
   return b36x4(_mm256_load_si256((const __m256i*)raw), sh, val);
 }
+// The lines (a bit each) whose byte in f is c; f has 64 bytes.
+static FORCE_INLINE u64 eq8x64(const u8* f, u8 c) {
+  const __m256i v = _mm256_set1_epi8((char)c);
+  const u32 a = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_load_si256((const __m256i*)f), v));
+  const u32 b = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_load_si256((const __m256i*)(f + 32)), v));
+  return (u64)a | ((u64)b << 32);
+}
+// ... whose 16-bit value in f is c; f has 64 of them.
+static FORCE_INLINE u64 eq16x64(const u16* f, u16 c) {
+  const __m256i v = _mm256_set1_epi16((short)c);
+  u64 m = 0;
+  for (int k = 0; k < 4; k++) {
+#if defined(__AVX512VL__) && defined(__AVX512BW__)
+    m |= (u64)_cvtmask16_u32(_mm256_cmpeq_epi16_mask(_mm256_load_si256((const __m256i*)(f + 16 * k)), v)) << (16 * k);
+#else
+    const __m256i e = _mm256_cmpeq_epi16(_mm256_load_si256((const __m256i*)(f + 16 * k)), v);
+    m |= (u64)_pext_u32((u32)_mm256_movemask_epi8(e), 0x55555555u) << (16 * k);
+#endif
+  }
+  return m;
+}
 // The lines (a bit each) whose byte in f is not 0; f has 64 bytes.
 static FORCE_INLINE u64 nonzero64(const u8* f) {
   const __m256i z = _mm256_setzero_si256();
@@ -983,11 +1004,12 @@ static NOINLINE u32 process_events(EvB& B, const u8* const base, WCScatter<D16>:
     const u8* const s1 = base + B.st[1][i];
     memcpy(&B.eq[i], s0 + 1, 8);
     memcpy(&B.uq[i], s1 + 1, 8);
-    B.pfx[i] = (u8)((s0[0] ^ 'e') | (s1[0] ^ 'u'));
+    B.pe[i] = s0[0];
+    B.pu[i] = s1[0];
     memcpy(&B.w4[i], base + B.st[4][i], 4);
   }
   // ---- IDs -> event index, user number; four lines at a time
-  u64 irr = nonzero64(B.pfx);  // lines with an ID that is not regular
+  u64 irr = ~(eq8x64(B.pe, 'e') & eq8x64(B.pu, 'u'));  // lines with an ID that is not regular (a prefix byte to begin with)
   {
     const __m256i ekey = _mm256_set1_epi64x((long long)g_ekey), ukey = _mm256_set1_epi64x((long long)g_ukey);
     const __m256i M = _mm256_set1_epi64x((long long)M40);
@@ -1168,8 +1190,8 @@ static NOINLINE u64 parse_event_chunk(const u8* begin, const u8* end, bool skip_
 struct CkB : Cols<4, 64> {
   alignas(32) u64 kq[CAP + 8], uq[CAP + 8];  // the 8 bytes after the prefix of click_id / user_id
   alignas(32) u64 cq[CAP + 8];               // the 8 bytes after the "c_" of campaign_id
-  alignas(32) u8 pfx[CAP + 8];               // nonzero: a prefix byte is not the expected one
-  alignas(32) u8 cpx[CAP + 8];               // nonzero: campaign_id does not start with "c_"
+  alignas(32) u8 pk[CAP + 8], pu[CAP + 8];   // the first bytes of click_id and of user_id
+  alignas(32) u16 c2[CAP + 8];               // the first two bytes of campaign_id
   alignas(32) u64 kv[CAP + 8];   // number of the click_id
   alignas(32) u64 cv[CAP + 8];   // number of the campaign_id (when it is canonical)
   alignas(32) u32 num[CAP + 8];  // user number
@@ -1325,13 +1347,12 @@ static NOINLINE u32 process_clicks(CkB& B, const u8* const base, WCScatter<C16>:
     memcpy(&B.kq[i], s0 + 1, 8);
     memcpy(&B.uq[i], s1 + 1, 8);
     memcpy(&B.cq[i], s2 + 2, 8);
-    u16 c2;
-    memcpy(&c2, s2, 2);
-    B.pfx[i] = (u8)((s0[0] ^ 'k') | (s1[0] ^ 'u'));
-    B.cpx[i] = (u8)(c2 != 0x5F63);  // "c_"
+    memcpy(&B.c2[i], s2, 2);
+    B.pk[i] = s0[0];
+    B.pu[i] = s1[0];
   }
-  u64 irr = nonzero64(B.pfx);
-  u64 cslow = nonzero64(B.cpx);  // campaign IDs that are not "c_" + a canonical number: camp_of decides
+  u64 irr = ~(eq8x64(B.pk, 'k') & eq8x64(B.pu, 'u'));
+  u64 cslow = ~eq16x64(B.c2, 0x5F63);  // campaign IDs that are not "c_" + a canonical number: camp_of decides
   {
     const __m256i ukey = _mm256_set1_epi64x((long long)g_ukey);
     const __m256i M = _mm256_set1_epi64x((long long)M40);
@@ -1416,11 +1437,12 @@ static NOINLINE u32 process_clicks(CkB& B, const u8* const base, WCScatter<C16>:
   const u64 ncamp_tab = g_camp_by_num.size();
   const i32* const camp_tab = ncamp_tab ? g_camp_by_num.data() : &no_camp;
   // the campaigns: a canonical number looks up the table (out of it: not a campaign); anything else -> camp_of
+  // (as arithmetic, not as a select: a select becomes a branch with the profile, and a line out of the table
+  // is not rare enough to predict)
   for (u32 i = 0; i < n; i++) {
     const u64 cn = B.cv[i];
-    const bool in_tab = cn < ncamp_tab;
-    const i32 c = camp_tab[in_tab ? cn : 0];
-    B.camp[i] = in_tab ? c : -1;
+    const u64 in = cn < ncamp_tab;
+    B.camp[i] = camp_tab[cn & (0 - in)] | (i32)((u32)in - 1);
   }
   for (u64 m = cslow & kept; m; m = _blsr_u64(m)) {
     const u32 i = (u32)_tzcnt_u64(m);
