@@ -143,7 +143,26 @@ static void pool_take(PoolJob* j, int tid) {
     j->finished.fetch_add(1, std::memory_order_release);
   }
 }
+// A worker thread's malloc heap may use huge pages (-DSS_HEAPHUGE=0: not). glibc gives every thread but the
+// first a heap of its own, a 64 MB reservation at a multiple of 64 MB (that is how free() finds the heap of a
+// pointer), and with SS_TOPPAD at 64 MB the whole of it is writable from its first use, so the kernel can back
+// it with 2 MB pages. A thread touches 5 to 20 MB of its heap at 20M events (block lists, scan scratch, output
+// buffers): one page fault per 4 KB otherwise, and all of it is still there when the process exits, where the
+// kernel frees it page by page on one CPU.
+#ifndef SS_HEAPHUGE
+#define SS_HEAPHUGE 1
+#endif
+static void heap_huge() {
+#if SS_HEAPHUGE
+  void* const p = malloc(64);
+  if (!p) return;
+  const uintptr_t base = (uintptr_t)p & ~(((uintptr_t)64 << 20) - 1);
+  madvise((void*)base, (size_t)64 << 20, MADV_HUGEPAGE);  // (advice only: harmless whatever lies there)
+  free(p);
+#endif
+}
 static void pool_worker(int tid) {
+  heap_huge();
   u32 seen = 0;
   for (;;) {
     u32 s;
