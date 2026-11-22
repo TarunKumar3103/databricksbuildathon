@@ -473,7 +473,7 @@ int main() {
   const double tmax = atof(env_or("BENCH_TMAX", "150").c_str());
   const std::string seed = env_or("BENCH_SEED", "20261122");
   tl_tag = env_or("BENCH_TIMELINE", "");  // the build whose phase timeline the report gives
-  // probe builds (bench 9, several since bench 10): BENCH_STAGES lists the builds with stage counters, whose lines
+  // probe builds (bench 9, several since bench 11): BENCH_STAGES lists the builds with stage counters, whose lines
   // are printed in short form (the values of BENCH_STAGES_KEYS, in that order, joined by '/'), except that the
   // one BENCH_STAGES_FULL names ("tag@60": build tag at the 60M size) also gets its whole line; BENCH_SOL is the
   // floor build

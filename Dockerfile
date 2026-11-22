@@ -1,4 +1,4 @@
-# BENCH BUILD (branch b-bench10, from b-probe and c-bench). Never submit this commit for a score: the dev check rejects it by design.
+# BENCH BUILD (branch b-bench11, from b-probe and c-bench). Never submit this commit for a score: the dev check rejects it by design.
 #
 # The container writes the correct dev output plus rows whose user_id starts with "!". Before writing those
 # rows it generates 20M- and 60M-event sets on /scratch with the organisers' generator and times every build
@@ -20,7 +20,7 @@ FROM debian:bookworm-slim
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
 COPY --from=build /out/ /usr/local/bench/
 ENV DATA_DIR=/data OUTPUT_DIR=/output SCRATCH_DIR=/scratch
-# bench 10 (B): six rounds at 20M and four at 60M, the timeline of build v, the stage lines of builds s and ps, the
+# bench 11 (B): six rounds at 20M and four at 60M, the timeline of build v, the stage lines of builds s and ps, the
 # floors of build f
 ENV BENCH_SIZES=20:5:6,60:15:4 BENCH_TIMELINE=v BENCH_STAGES=s,ps BENCH_STAGES_FULL=s@60 BENCH_SOL=f
 CMD ["/usr/local/bench/bench"]

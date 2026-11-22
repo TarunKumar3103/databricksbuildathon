@@ -98,11 +98,12 @@ threads: `touch` one byte per page (the page faults alone), `read` every byte on
 `masks` the scanner's three masks per 64 bytes, `cols` the event files through the column scanner with no
 field work, `retouch` the faults again after the pages are dropped.
 
-## Bench 10 (B, branch b-bench10): the scatter
+## Bench 11 (B, branch b-bench11): the scatter
 
-Bench 9 put the scatter at 272 thread-ms of the parse's 1,387 at 20M, most of it waiting on memory. Nine
-builds, each with a profile of its own made by pgo/make-profile.sh's recipe: `v` (v4 8384d32 as its
-Dockerfile, sha256 eb129ec6..., scored 0.38), `p4`, `p8`, `p16` (b-pf 0e5c528 built with `-DSS_PFD=4`, `8`,
+Bench 9 put the scatter at 272 thread-ms of the parse's 1,387 at 20M, most of it waiting on memory. Ten
+builds: `v` (v4 8384d32 as its Dockerfile, sha256 eb129ec6..., scored 0.38), `h` (v4 cf4452a as its
+Dockerfile, sha256 1f8a1564...: A's two scan commits on top of v, for the 60M row A asked for), and, each with
+a profile of its own made by pgo/make-profile.sh's recipe, `p4`, `p8`, `p16` (b-pf 0e5c528 built with `-DSS_PFD=4`, `8`,
 `16`: each record's staging line is prefetched for writing that many records ahead, events and clicks), `z`
 (b-pf 0e5c528 with `-DSS_PREFAULT=1`: each thread faults its arena in, a write per 4 KB, when the parse first
 maps it, about 90% of what the parse will put there, so that the drain's non-temporal stores do not meet the
