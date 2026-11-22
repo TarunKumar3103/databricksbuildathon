@@ -722,6 +722,23 @@ static FORCE_INLINE bool digits13(const u8* s, i64& out) {
   return true;
 }
 
+// Two of them at once, a in the low lane and b in the high one: bit 0 of the result if a is 13 digits, bit 1 if
+// b is; then oa / ob are their values (as digits13 gives them).
+static FORCE_INLINE u32 digits13x2(const u8* a, const u8* b, i64& oa, i64& ob) {
+  const __m256i v = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128((const __m128i*)a)), _mm_loadu_si128((const __m128i*)b), 1);
+  const __m256i d = _mm256_sub_epi8(v, _mm256_set1_epi8('0'));
+  const u32 isd = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d));
+  const __m256i s = _mm256_slli_si256(d, 3);  // per lane: three zero bytes, then the 13 digits
+  const __m256i t1 = _mm256_maddubs_epi16(s, _mm256_set1_epi16(0x010A));       // pairs: 10 * hi + lo
+  const __m256i t2 = _mm256_madd_epi16(t1, _mm256_set1_epi32(0x00010064));      // four digits: 100 * hi + lo
+  const __m256i t3 = _mm256_packus_epi32(t2, t2);
+  const __m256i t4 = _mm256_madd_epi16(t3, _mm256_set1_epi32(0x00012710));      // eight digits: 10000 * hi + lo
+  const __m256i r = _mm256_add_epi64(_mm256_mul_epu32(t4, _mm256_set1_epi64x(100000000)), _mm256_srli_epi64(t4, 32));
+  oa = _mm256_extract_epi64(r, 0);
+  ob = _mm256_extract_epi64(r, 2);
+  return (u32)((isd & 0x1FFF) == 0x1FFF) | ((u32)(((isd >> 16) & 0x1FFF) == 0x1FFF) << 1);
+}
+
 static FORCE_INLINE bool parse_f1(const u8* s, u32 n, i64& out) {
   if (n != 20 || s[19] != 'Z') return false;
   return civil19(s, out);

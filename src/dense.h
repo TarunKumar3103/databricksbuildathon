@@ -628,9 +628,12 @@ struct Cols {
     const u32 n0 = n;
     for (int k = 0; k < NF; k++) {
       const __m256i qm = movm32x8(q[k]);  // -1: quoted
-      _mm256_storeu_si256((__m256i*)(st[k] + n0), _mm256_sub_epi32(_mm256_add_epi32(C[k], one), qm));
-      _mm256_storeu_si256((__m256i*)(ln[k] + n0),
-                          _mm256_add_epi32(_mm256_sub_epi32(_mm256_sub_epi32(C[k + 1], C[k]), one), _mm256_add_epi32(qm, qm)));
+      __m256i d = _mm256_add_epi32(C[k], one);  // the byte after the separator
+#if defined(__AVX512VL__)
+      __asm__("" : "+v"(d));  // (kept as a value: re-associated, it costs one more operation per field)
+#endif
+      _mm256_storeu_si256((__m256i*)(st[k] + n0), _mm256_sub_epi32(d, qm));
+      _mm256_storeu_si256((__m256i*)(ln[k] + n0), _mm256_add_epi32(_mm256_sub_epi32(C[k + 1], d), _mm256_add_epi32(qm, qm)));
     }
     n = n0 + 8;
   }
@@ -867,13 +870,26 @@ static NOINLINE void ev_ts_rows(EvB& B, const u8* const base, const u32 n, const
       lx |= (u64)(live & ~(done | off | dg)) << i0;
     }
   }
-  for (u64 m = l13; m; m = _blsr_u64(m)) {
+  for (u64 m = l13; m;) {  // two at a time
     const u32 i = (u32)_tzcnt_u64(m);
-    i64 t;
-    if (__builtin_expect(digits13(base + B.st[2][i], t), 1))
-      B.ts[i] = t;
-    else
-      ev_ts_exact(B, i, base);
+    m = _blsr_u64(m);
+    const u32 j = m ? (u32)_tzcnt_u64(m) : i;
+    m = _blsr_u64(m);
+    i64 ta, tb;
+    const u32 ok = digits13x2(base + B.st[2][i], base + B.st[2][j], ta, tb);
+    if (__builtin_expect(ok == 3, 1)) {
+      B.ts[i] = ta;
+      B.ts[j] = tb;
+    } else {
+      if (ok & 1)
+        B.ts[i] = ta;
+      else
+        ev_ts_exact(B, i, base);
+      if (ok & 2)
+        B.ts[j] = tb;
+      else
+        ev_ts_exact(B, j, base);
+    }
   }
   for (u64 m = l25; m; m = _blsr_u64(m)) {
     const u32 i = (u32)_tzcnt_u64(m);
@@ -1421,13 +1437,26 @@ static NOINLINE void ck_ts_rows(CkB& B, const u8* const base, const u32 n, const
       lx |= (u64)(live & ~(done | off | dg)) << i0;
     }
   }
-  for (u64 m = l13; m; m = _blsr_u64(m)) {
+  for (u64 m = l13; m;) {  // two at a time
     const u32 i = (u32)_tzcnt_u64(m);
-    i64 t;
-    if (__builtin_expect(digits13(base + B.st[3][i], t), 1))
-      B.ts[i] = t;
-    else
-      ck_ts_exact(B, i, base);
+    m = _blsr_u64(m);
+    const u32 j = m ? (u32)_tzcnt_u64(m) : i;
+    m = _blsr_u64(m);
+    i64 ta, tb;
+    const u32 ok = digits13x2(base + B.st[3][i], base + B.st[3][j], ta, tb);
+    if (__builtin_expect(ok == 3, 1)) {
+      B.ts[i] = ta;
+      B.ts[j] = tb;
+    } else {
+      if (ok & 1)
+        B.ts[i] = ta;
+      else
+        ck_ts_exact(B, i, base);
+      if (ok & 2)
+        B.ts[j] = tb;
+      else
+        ck_ts_exact(B, j, base);
+    }
   }
   for (u64 m = l25; m; m = _blsr_u64(m)) {
     const u32 i = (u32)_tzcnt_u64(m);
