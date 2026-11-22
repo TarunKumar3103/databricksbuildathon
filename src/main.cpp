@@ -480,6 +480,7 @@ static OverflowIds g_overflow;
 
 // Long keys name slots in an exact byte dictionary. A published string never moves,
 // so a reader can compare bytes without a lock while other workers are inserting.
+static constexpr u64 CLICK_VIEW = 1ULL << 54;
 static constexpr u64 OVERFLOW_ID = 1ULL << 55;
 struct IdEntry {
   u32 size;
@@ -567,6 +568,9 @@ static std::string_view id_view(u64 k, u8* fast, std::string& overflow) {
   if (!is_slow(k)) {
     const u32 n = fast_key_bytes(k, fast);
     return {reinterpret_cast<const char*>(fast), n};
+  }
+  if ((k & (OVERFLOW_ID | CLICK_VIEW)) == CLICK_VIEW) {
+    return {reinterpret_cast<const char*>(k ^ CLICK_VIEW), 33};
   }
   if (k & OVERFLOW_ID) {
     std::lock_guard<std::mutex> lock(g_overflow.mu);
@@ -1308,6 +1312,44 @@ struct R2C {  // valid click, partitioned by person; h = hash_id(person name key
 };
 
 static u32 g_P1bits, g_P2bits;
+// For equal-width event IDs, keep a hash prefix and an offset into the original
+// read-only mappings. The prefix filters candidates; full byte comparison decides
+// equality. Other widths use the regular dictionary.
+static uintptr_t event_base;
+static u64 event_offset_mask;
+
+static void init_event_views(const std::vector<MFile>& files) {
+  uintptr_t lo = UINTPTR_MAX, hi = 0;
+  for (const auto& f : files) {
+    if (!f.size) continue;
+    const uintptr_t start = reinterpret_cast<uintptr_t>(f.data);
+    lo = std::min(lo, start);
+    hi = std::max(hi, start + f.size);
+  }
+  if (hi > lo && lo && hi - lo < (1ULL << 36)) {
+    event_base = lo - 1;  // no real offset is zero
+    event_offset_mask = (1ULL << ceil_log2(hi - event_base + 1)) - 1;
+  }
+}
+
+static inline u32 event_partitions() {
+  const u32 count = 1u << g_P1bits;
+  return event_offset_mask ? count + count / 4 : count;
+}
+
+static inline bool same_event_view(u64 a, u64 b) {
+  if (a == b) return true;
+  if (!a || ((a ^ b) & ~event_offset_mask)) return false;
+  return memcmp(reinterpret_cast<const void*>(event_base + (a & event_offset_mask)),
+                reinterpret_cast<const void*>(event_base + (b & event_offset_mask)), 33) == 0;
+}
+
+static inline u64 click_key(const u8* s, u32 n) {
+  const uintptr_t ptr = reinterpret_cast<uintptr_t>(s);
+  if (n == 33 && ptr < CLICK_VIEW) return CLICK_VIEW | ptr;
+  return make_key(s, n);
+}
+
 
 struct CStat {
   u32 sess, purch;
@@ -1851,6 +1893,7 @@ struct EvBatch {
   alignas(32) u32 off[CAP][8];  // field offsets from the chunk base
   alignas(32) u32 len[CAP][8];  // field lengths
   alignas(32) R1 rec[CAP];      // the records, filled in step by step (ingest: ING_NONE if not a timestamp)
+  u32 part[CAP];
   i64 ts[CAP];                  // TS_NONE if not a timestamp
   u8 idx[4][CAP];               // lines by form of ts: 20 bytes, 13 bytes, 25 bytes, other
 };
@@ -1868,7 +1911,15 @@ static NOINLINE void process_events(EvBatch& B, const u32 n, const u8* const bas
   for (u32 i = 0; i < n; i++) {
     const u32* off = B.off[i];
     const u32* len = B.len[i];
-    B.rec[i].eid = hash_id(make_key(base + off[0], len[0]));
+    const u8* id = base + off[0];
+    if (len[0] == 33 && event_offset_mask) {
+      const u64 hash = hash_id(id_hash(id, 33));
+      B.rec[i].eid = (hash & ~event_offset_mask) | (reinterpret_cast<uintptr_t>(id) - event_base);
+      B.part[i] = (1u << g_P1bits) + (u32)(hash >> (p1shift + 2));
+    } else {
+      B.rec[i].eid = hash_id(make_key(id, len[0]));
+      B.part[i] = (u32)(B.rec[i].eid >> p1shift);
+    }
     u64 uid = 0;
     if (__builtin_expect(len[1] != 0, 1)) uid = hash_id(make_key(base + off[1], len[1]));
     B.rec[i].uid = uid;
@@ -1948,7 +1999,7 @@ static NOINLINE void process_events(EvBatch& B, const u32 n, const u8* const bas
   auto cur = cur_out;
   for (u32 i = 0; i < n; i++) {
     const __m256i r = _mm256_load_si256((const __m256i*)&B.rec[i]);
-    WCScatter<R1>::push32(cur, (u32)(B.rec[i].eid >> p1shift), r);
+    WCScatter<R1>::push32(cur, B.part[i], r);
   }
   cur_out = cur;
 }
@@ -2041,7 +2092,7 @@ static NOINLINE void process_clicks(CkBatch& B, const u32 n, const u8* const bas
   for (u32 i = 0; i < n; i++) {
     const u32* off = B.off[i];
     const u32* len = B.len[i];
-    const u64 click = make_key(base + off[0], len[0]);
+    const u64 click = click_key(base + off[0], len[0]);
     const u64 uid = hash_id(make_key(base + off[1], len[1]));
     const i32 camp = camp_fast(base + off[2], len[2]);
     const u64 rel = (u64)B.ts[i] - (u64)cws;  // in [0, wlen) iff the click is inside [window start - 7 days, window end)
@@ -2083,6 +2134,16 @@ static NOINLINE u64 parse_click_chunk(const u8* begin, const u8* end, bool skip_
   return nl + n;
 }
 
+static void drop_inputs(const std::vector<MFile>& files) {
+  if (!g_drop_parsed) return;
+  std::vector<Chunk> chunks;
+  make_chunks(files, 8 << 20, chunks);
+  parallel_for((int)chunks.size(), [&](int i, int) {
+    const auto& c = chunks[i];
+    drop_parsed(files[c.file], c.nominal, c.nominal_end);
+  });
+}
+
 static void parse_events_clicks(std::vector<MFile>& ev, std::vector<MFile>& ck) {
   size_t ev_bytes = 0, ck_bytes = 0;
   for (auto& f : ev) ev_bytes += f.size;
@@ -2101,14 +2162,14 @@ static void parse_events_clicks(std::vector<MFile>& ev, std::vector<MFile>& ck) 
       size_t b = line_start_at_or_after(f, c.nominal), e = line_start_at_or_after(f, c.nominal_end);
       if (b >= e) return;
       tl.n_event_lines += parse_event_chunk(f.data + b, f.data + e, b == 0, tl, p1shift, ws, we);
-      drop_parsed(f, c.nominal, c.nominal_end);
+
     } else {
       const Chunk& c = cc[t - ce.size()];
       const MFile& f = ck[c.file];
       size_t b = line_start_at_or_after(f, c.nominal), e = line_start_at_or_after(f, c.nominal_end);
       if (b >= e) return;
       tl.n_click_lines += parse_click_chunk(f.data + b, f.data + e, b == 0, tl, cws, we);
-      drop_parsed(f, c.nominal, c.nominal_end);
+
     }
   });
   parallel_for(NT, [&](int t, int) { g_tl[t].r1.finish(g_tl[t].arena); });
@@ -2125,7 +2186,7 @@ static void parse_events_clicks(std::vector<MFile>& ev, std::vector<MFile>& ck) 
 // The bit map and the table stay in L1/L2 whatever the partition size, and nothing is written back to the
 // records.
 static void dedup_and_route() {
-  u32 P1 = 1u << g_P1bits;
+  const u32 P1 = event_partitions();
   const u32 p2shift = 64 - g_P2bits;
   std::vector<size_t> sizes(P1, 0);
   for (u32 p = 0; p < P1; p++)
@@ -2144,7 +2205,10 @@ static void dedup_and_route() {
     std::vector<std::pair<const R1*, u32>> blk;  // the partition's blocks
   };
   std::vector<Scratch> scr(NT);
-  parallel_for((int)P1, [&](int oi, int tid) {
+  auto process = [&](int oi, int tid, auto borrowed) {
+    constexpr bool view = decltype(borrowed)::value;
+    auto fingerprint = [](u64 e) { return view ? (e & ~event_offset_mask) : e; };
+    auto equal = [](u64 a, u64 b) { return view ? same_event_view(a, b) : a == b; };
     TL& tl = g_tl[tid];
     int p = order[oi];
     const size_t n = sizes[p];
@@ -2162,7 +2226,7 @@ static void dedup_and_route() {
     memset(seen, 0, words * 8);
     u64* ids = S.ids.data();
     size_t nids = 0;
-    const u32 P1bits = g_P1bits, ishift = 64 - mbits;
+    const u32 P1bits = g_P1bits - (view ? 2 : 0), ishift = 64 - mbits;
     S.blk.clear();
     for (int t = 0; t < NT; t++)
       for (auto& b : g_tl[t].r1.blocks[p])
@@ -2182,7 +2246,7 @@ static void dedup_and_route() {
       const u32 cnt = blk[k].second;
       for (u32 j = 0; j < cnt; j++) {
         const u64 e = rec[j].eid;
-        const u64 i = (e << P1bits) >> ishift;
+        const u64 i = (fingerprint(e) << P1bits) >> ishift;
         u64 w = seen[i >> 6];
         ids[nids] = e;
         // test and set bit i of the word; the old bit is added to nids
@@ -2225,10 +2289,10 @@ static void dedup_and_route() {
       const u32 tshift = 64 - tbits;
       for (size_t k = 0; k < nids; k++) {
         const u64 e = ids[k];
-        const u64 i = (e << P1bits) >> ishift;
+        const u64 i = (fingerprint(e) << P1bits) >> ishift;
         cand[i >> 6] |= 1ULL << (i & 63);
-        u64 q = (e << P1bits) >> tshift;
-        while (tab[q].eid != e && tab[q].eid != 0) q = (q + 1) & tmask;
+        u64 q = (fingerprint(e) << P1bits) >> tshift;
+        while (tab[q].eid != 0 && !equal(tab[q].eid, e)) q = (q + 1) & tmask;
         tab[q].eid = e;  // eid is a bijective hash of a non-empty key; 0 would need key 0, which no ID has
       }
       const R1* cl[WCScatter<R1>::BLK];  // the records of a block whose ID may be in the table
@@ -2238,7 +2302,7 @@ static void dedup_and_route() {
         u32 nc = 0;
         for (u32 j = 0; j < cnt; j++) {
           const R1& r = rec[j];
-          const u64 i = (r.eid << P1bits) >> ishift;
+          const u64 i = (fingerprint(r.eid) << P1bits) >> ishift;
           const u32 c = (u32)(cand[i >> 6] >> (i & 63)) & 1;
           cl[nc] = &r;
           nc += c;
@@ -2247,9 +2311,9 @@ static void dedup_and_route() {
         for (u32 k = 0; k < nc; k++) {
           const R1& r = *cl[k];
           const u64 e = r.eid;
-          u64 q = (e << P1bits) >> tshift;
-          while (tab[q].eid != e && tab[q].eid != 0) q = (q + 1) & tmask;
-          if (__builtin_expect(tab[q].eid == e, 1)) {
+          u64 q = (fingerprint(e) << P1bits) >> tshift;
+          while (tab[q].eid != 0 && !equal(tab[q].eid, e)) q = (q + 1) & tmask;
+          if (__builtin_expect(tab[q].eid != 0, 1)) {
             const R1* best = tab[q].best;  // the first copy with the smallest ingest_ts stays
             tab[q].best = r.ingest < best->ingest ? &r : best;
           } else {
@@ -2264,6 +2328,10 @@ static void dedup_and_route() {
     tl.r2.close(cur);
     tl.r2.flush(tl.arena);
     for (int t = 0; t < NT; t++) g_tl[t].r1.release(p, tl.arena);
+  };
+  parallel_for((int)P1, [&](int oi, int tid) {
+    if ((u32)order[oi] >= (1u << g_P1bits)) process(oi, tid, std::true_type{});
+    else process(oi, tid, std::false_type{});
   });
   parallel_for(NT, [&](int t, int) {
     TL& tl = g_tl[t];
@@ -3432,14 +3500,15 @@ int main(int argc, char** argv) {
   size_t id_input_bytes = ev_bytes;
   for (const auto& f : ck) id_input_bytes += f.size;
   for (const auto& f : lk) id_input_bytes += f.size;
-  init_ids(id_input_bytes);
+  init_event_views(ev);
+  init_ids(event_offset_mask ? id_input_bytes / 12 : id_input_bytes);
   LOG("mapped %zu event files (%zu bytes), %zu click files, %zu link files; P1=%u P2=%u threads=%d",
       ev.size(), ev_bytes, ck.size(), lk.size(), 1u << g_P1bits, 1u << g_P2bits, NT);
   std::thread setup([&] {
     load_lookups(data);
     g_tl.resize(NT);
     for (auto& t : g_tl) {
-      t.r1.init(1u << g_P1bits);
+      t.r1.init(event_partitions());
       t.r2.init(1u << g_P2bits);
       t.r2c.init(1u << g_P2bits);
     }
@@ -3460,10 +3529,12 @@ int main(int argc, char** argv) {
   if (getenv("SS_STOP") && !strcmp(getenv("SS_STOP"), "parse")) return 0;
   g_phase = 3;
   dedup_and_route();
+  drop_inputs(ev);
   LOG("dedup + routing done");
   if (getenv("SS_STOP") && !strcmp(getenv("SS_STOP"), "dedup")) return 0;
   g_phase = 4;
   person_phase();
+  drop_inputs(ck);
   LOG("person phase done");
   g_phase = 5;
   write_outputs(out);
@@ -3491,6 +3562,7 @@ static int bench_parse(const char* data, const char* file, int reps) {
   NT = 1;
   load_lookups(data);
   std::vector<MFile> ev{map_file(file)}, ck;
+  init_event_views(ev);
   init_ids(ev[0].size);
   g_P1bits = 11;
   g_P2bits = 10;
@@ -3506,7 +3578,7 @@ static int bench_parse(const char* data, const char* file, int reps) {
     t = TL();
     t.arena.cur = mem;
     t.arena.end = mem + slab;
-    t.r1.init(1u << g_P1bits);
+    t.r1.init(event_partitions());
     t.r2.init(1u << g_P2bits);
     t.r2c.init(1u << g_P2bits);
     u64 c0 = __rdtsc();
