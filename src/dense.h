@@ -1518,7 +1518,23 @@ static FORCE_INLINE u32 ck_count_le(const u64* sk, const u32 mc, const u32 x) {
 
 // the scan: per event partition, records -> slots (dedup, order) -> persons, sessions, rows
 
-struct DS {
+// A click partition loaded for the scan: the clicks of its dense persons as keys, grouped by person index,
+// and the number of each one's click_id in the same places (see load_clicks).
+struct CkPart {
+  u32 cp = NONE;
+  std::vector<u32> coff, cpos;
+  std::vector<u64> ckey, cclk;
+  std::vector<std::pair<const C16*, u32>> cblk;
+};
+// The few click partitions with very many clicks (a handful of persons click thousands of times) are loaded
+// once, by a task of their own at the start of the scan, and every thread reads that copy: each of their
+// persons would otherwise make the thread that closes it load the whole partition again. A thread that needs
+// one before it is ready loads its own copy, like any other partition.
+static constexpr u32 CK_BIG = 1u << 15;         // clicks from which a partition is loaded for all
+static CkPart** g_ck_big = nullptr;             // per click partition: its shared copy, or null
+static std::atomic<u8>* g_ck_big_ready = nullptr;  // ... 1 once it can be read
+
+struct DS : CkPart {
   D16* T = nullptr;
   std::vector<std::pair<const D16*, u32>> blk;
   // the open person: its sessions so far
@@ -1550,12 +1566,7 @@ struct DS {
   alignas(32) u16 day_sum[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
   u32 since = 0;  // persons closed (the check of day_sum is made every LINES_EVERY of them)
   std::vector<u64> xq;     // the person's extra events in time order
-  // the click partition at hand: the clicks of its dense persons as keys, grouped by person index, and the
-  // number of each one's click_id in the same places
-  u32 cp = NONE;
-  std::vector<u32> coff, cpos;
-  std::vector<u64> ckey, cclk;
-  std::vector<std::pair<const C16*, u32>> cblk;
+  // (the click partition at hand is the CkPart this is built on)
 };
 
 // day_sum is looked at every LINES_EVERY persons, and the counters are flushed if a day's sum is above
@@ -1635,7 +1646,7 @@ static NOINLINE void emit_other_clicks(u32 cp, WCScatter<R2C>::Cursor& c2c, u32 
 // Click partition cp for the scan, in S: the clicks of its dense persons as keys, grouped by person index (a
 // counting sort), each person's in the order they come: those of index g are ckey[coff[g] .. cpos[g]). The
 // first thread to load a partition also hands its other clicks to the general person phase.
-static NOINLINE void load_clicks(DS& S, u32 cp, WCScatter<R2C>::Cursor& c2c, u32 p2shift) {
+static NOINLINE void load_clicks(CkPart& S, u32 cp, WCScatter<R2C>::Cursor& c2c, u32 p2shift) {
   S.cp = cp;
   const u32 G = 1u << KC;
   if (S.coff.size() < G + 2) {
@@ -2034,11 +2045,15 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
     vmax_e = _mm256_max_epu32(vmax_e, _mm256_max_epu32(D.v0, D.v1));
     // ---- its clicks: the keys of its index in the click partition
     const u32 cp = p >> KC;
-    if (__builtin_expect(cp != S.cp, 0)) load_clicks(S, cp, c2c, p2shift);
-    const u32 c0 = S.coff[p & ((1u << KC) - 1)];
-    const u32 mc0 = S.cpos[p & ((1u << KC) - 1)] - c0;  // its clicks in the partition
-    u32 mc = mc0;                                             // ... and with its extra clicks
-    const u64* keys = S.ckey.data() + c0;
+    const CkPart* K = &S;
+    if (__builtin_expect(g_ck_big[cp] != nullptr, 0) && g_ck_big_ready[cp].load(std::memory_order_acquire))
+      K = g_ck_big[cp];
+    else if (__builtin_expect(cp != S.cp, 0))
+      load_clicks(S, cp, c2c, p2shift);
+    const u32 c0 = K->coff[p & ((1u << KC) - 1)];
+    const u32 mc0 = K->cpos[p & ((1u << KC) - 1)] - c0;  // its clicks in the partition
+    u32 mc = mc0;                                              // ... and with its extra clicks
+    const u64* keys = K->ckey.data() + c0;
     const Extra* ex = nullptr;
     if (__builtin_expect((acc[p].load(std::memory_order_relaxed) & ACC_EXTRA) != 0, 0)) {
       ex = &g_extra.find(p)->second;
@@ -2086,7 +2101,7 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
           if (same) continue;
           auto click_of = [&](const u64 key) -> u64 {  // the click number, as click_less takes it
             const u32 o = ck_ord(key);
-            return o >= mc0 ? (CLICK_IS_KEY | ex->ck[o - mc0][1]) : S.cclk[c0 + o];
+            return o >= mc0 ? (CLICK_IS_KEY | ex->ck[o - mc0][1]) : K->cclk[c0 + o];
           };
           u32 best = r0;
           u64 bc = click_of(sk[r0]);
@@ -2547,13 +2562,71 @@ static void scan_all() {
   std::vector<DS> scr(NT);
   std::vector<SegStat> st(nseg), st_ends(nseg);
   std::vector<SegEnd> ends(nseg);
-  parallel_for((int)nseg, [&](int s, int tid) {
+  // The end of a segment (the person it left open) is dealt with as soon as everything it needs is there:
+  // the segment itself, and the segments after it up to the first one whose kept-aside events end inside it
+  // (a person with very many events fills whole segments). The thread that scans the last of those takes
+  // the end as well, between two segments, so the few long ends are spread over the scan and not left for
+  // after it. Whichever thread gets there first claims an end; a last round takes what a race left over.
+  // the click partitions that are loaded once for all threads (SS_CKBIG sets another size, for tests)
+  const size_t ck_big = getenv("SS_CKBIG") ? (size_t)std::max(1, atoi(getenv("SS_CKBIG"))) : (size_t)CK_BIG;
+  std::vector<std::unique_ptr<CkPart>> big;
+  std::vector<u32> big_cp;
+  std::vector<CkPart*> big_of(g_PC, nullptr);
+  std::unique_ptr<std::atomic<u8>[]> big_ready(new std::atomic<u8>[g_PC]);
+  for (u32 cp = 0; cp < g_PC; cp++) {
+    big_ready[cp].store(0, std::memory_order_relaxed);
+    size_t n = 0;
+    for (int t = 0; t < NT; t++) n += g_tl[t].ck.size(cp);
+    if (n >= ck_big) {
+      big.emplace_back(new CkPart);
+      big_of[cp] = big.back().get();
+      big_cp.push_back(cp);
+    }
+  }
+  g_ck_big = big_of.data();
+  g_ck_big_ready = big_ready.get();
+  const int nbig = (int)big_cp.size();
+  std::unique_ptr<std::atomic<u8>[]> seg_done(new std::atomic<u8>[nseg]), end_claim(new std::atomic<u8>[nseg]);
+  for (u32 s = 0; s < nseg; s++) {
+    seg_done[s].store(0, std::memory_order_relaxed);
+    end_claim[s].store(0, std::memory_order_relaxed);
+  }
+  auto closed_head = [&](u32 t) { return ends[t].head_p != NONE && !ends[t].head_open; };  // (t is done)
+  auto try_end = [&](u32 s, int tid) {
+    if (end_claim[s].load(std::memory_order_relaxed)) return;
+    if (!seg_done[s].load()) return;
+    for (u32 t = s + 1; t < nseg; t++) {  // (scan_segment<true> reads no further than this)
+      if (!seg_done[t].load()) return;
+      if (closed_head(t)) break;
+    }
+    if (end_claim[s].exchange(1)) return;
+    if (ends[s].has_tail) scan_segment<true>(sb[s], sb[s + 1], tid, scr[tid], st_ends[s], ends.data(), s, nseg);
+  };
+  parallel_for(nbig + (int)nseg, [&](int task, int tid) {
+    if (task < nbig) {  // (first in the queue: the threads take the segments after these)
+      const u32 cp = big_cp[task];
+      TL& tl = g_tl[tid];
+      auto c2c = tl.r2c.cursor(tl.arena);
+      load_clicks(*big_of[cp], cp, c2c, 64 - g_P2bits);
+      tl.r2c.close(c2c);
+      tl.r2c.flush(tl.arena);
+      big_ready[cp].store(1, std::memory_order_release);
+      return;
+    }
+    const int s = task - nbig;
     if (sb[s] < sb[s + 1]) scan_segment<false>(sb[s], sb[s + 1], tid, scr[tid], st[s], ends.data(), (u32)s, nseg);
+    seg_done[s].store(1);
+    // the ends this segment was the last thing missing for: its own, and those of the segments before it
+    // as far back as their kept-aside events reach this one
+    try_end((u32)s, tid);
+    for (int k = s - 1; k >= 0; k--) {
+      try_end((u32)k, tid);
+      if (!seg_done[k].load() || closed_head((u32)k)) break;
+    }
   });
-  // the ends of the segments: the persons that the segments left open
-  parallel_for((int)nseg, [&](int s, int tid) {
-    if (ends[s].has_tail) scan_segment<true>(sb[s], sb[s + 1], tid, scr[tid], st_ends[s], ends.data(), (u32)s, nseg);
-  });
+  parallel_for((int)nseg, [&](int s, int tid) { try_end((u32)s, tid); });
+  g_ck_big = nullptr;
+  g_ck_big_ready = nullptr;
   // the campaigns' lines of days -> the tables by day and campaign that the general phase and the output use
   parallel_for(NT, [&](int t, int) {
     if (!scr[t].lines) return;
