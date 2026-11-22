@@ -195,7 +195,7 @@ static void* vm_alloc(size_t bytes) {
 // CPU time (twice as many block boundaries to cross), for only 30 MB less memory.
 static constexpr size_t BLOCK_BYTES = 4096;
 
-// (SS_PREFAULT, bench 10: this many bytes of each thread's first slab are faulted in, a write per 4 KB, as soon as
+// (SS_PREFAULT, bench 11: this many bytes of each thread's first slab are faulted in, a write per 4 KB, as soon as
 // the slab is mapped, so that the scatter's non-temporal stores do not meet the page faults one by one.)
 static size_t g_arena_prefault = 0;
 struct Arena {
