@@ -1189,6 +1189,99 @@ static NOINLINE void ck_ts_exact(CkB& B, u32 i, const u8* base) {
   if (!parse_ts(base + B.st[3][i], B.ln[3][i], B.ts[i])) B.ts[i] = INT64_MIN;
 }
 
+// The ts of one click line by the kernel for its form, as the batch did them before the eight-line pass.
+static NOINLINE void ck_ts_form(CkB& B, u32 i, const u8* base) {
+  const u8* const a = base + B.st[3][i];
+  const u32 l = B.ln[3][i];
+  i64 t;
+  if (l == 20 ? f1_one(a, t) : l == 13 ? digits13(a, t) : l == 25 ? f3_one(a, t) : false)
+    B.ts[i] = t;
+  else
+    ck_ts_exact(B, i, base);
+}
+
+// The click ts of eight lines at a time, as ev_ts_rows does an event line's two: here one vector holds bytes
+// 4..19 of the ts of line p and of line p + 4, so the columns come out in the lines' order. Writes B.ts for every
+// line of kept (and some others).
+static NOINLINE void ck_ts_rows(CkB& B, const u8* const base, const u32 n, const u64 kept) {
+  alignas(32) u32 vm[CkB::CAP / 2 + 8], vy[CkB::CAP + 8];  // check bits of lines p and p + 4; the years
+  u64 dts = 0;  // the day of ts exists
+  {
+    const F1Lim<0xFFFFFFFFu, 2>& K = k_f1lim<0xFFFFFFFFu, 2>;
+    const __m256i kb = _mm256_load_si256((const __m256i*)K.base), kl = _mm256_load_si256((const __m256i*)K.lim);
+    const __m256i sh = _mm256_setr_epi8(4, 5, 7, 8, 10, 11, 13, 14, 1, 2, -1, -1, -1, -1, -1, -1, 4, 5, 7, 8, 10, 11, 13, 14, 1, 2,
+                                        -1, -1, -1, -1, -1, -1);
+    const __m256i w10 = _mm256_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0,
+                                         0, 0, 0, 0, 0);
+    const __m256i bnd = _mm256_setr_epi16(31, 23, 59, 59, 12, 0, 0, 0, 31, 23, 59, 59, 12, 0, 0, 0);
+    const __m256i w2 = _mm256_setr_epi16(24, 1, 60, 1, 1, 0, 0, 0, 24, 1, 60, 1, 1, 0, 0, 0);
+    const __m256i c24 = _mm256_set1_epi32(24), w3600 = _mm256_set1_epi32(3600);
+    const __m256i k1000 = _mm256_set1_epi64x(1000), y0 = _mm256_set1_epi64x(g_vts.y0ms);
+    for (u32 i0 = 0; i0 < n; i0 += 8) {
+      __m256i Q[4];
+#define CTS_ROW(p)                                                                                                          \
+  {                                                                                                                         \
+    const u8* const a = base + B.st[3][i0 + (p)];                                                                           \
+    const u8* const b = base + B.st[3][i0 + (p) + 4];                                                                       \
+    const __m256i v = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128((const __m128i*)(a + 4))),            \
+                                              _mm_loadu_si128((const __m128i*)(b + 4)), 1);                                 \
+    const __m256i d = _mm256_sub_epi8(v, kb);                                                                               \
+    const __m256i ok = _mm256_cmpeq_epi8(_mm256_min_epu8(d, kl), d);                                                        \
+    const __m256i q = _mm256_maddubs_epi16(_mm256_shuffle_epi8(d, sh), w10);                                                \
+    vm[i0 / 2 + (p)] = (u32)_mm256_movemask_epi8(_mm256_andnot_si256(_mm256_cmpgt_epi16(q, bnd), ok));                     \
+    Q[p] = _mm256_madd_epi16(q, w2);                                                                                        \
+    memcpy(&vy[i0 + (p)], a, 4);                                                                                            \
+    memcpy(&vy[i0 + (p) + 4], b, 4);                                                                                        \
+  }
+      CTS_ROW(0) CTS_ROW(1) CTS_ROW(2) CTS_ROW(3)
+#undef CTS_ROW
+      const __m256i u01 = _mm256_unpacklo_epi32(Q[0], Q[1]), w01 = _mm256_unpackhi_epi32(Q[0], Q[1]);
+      const __m256i u23 = _mm256_unpacklo_epi32(Q[2], Q[3]), w23 = _mm256_unpackhi_epi32(Q[2], Q[3]);
+      const __m256i X = _mm256_unpacklo_epi64(u01, u23), Y = _mm256_unpackhi_epi64(u01, u23), Z = _mm256_unpacklo_epi64(w01, w23);
+      const __m256i e = vts_month(Z), xm = _mm256_sub_epi32(X, c24);
+      dts |= (u64)ltu32x8(xm, _mm256_srli_epi32(e, 16)) << i0;
+      const __m256i secs = _mm256_add_epi32(_mm256_madd_epi16(_mm256_add_epi16(e, xm), w3600), Y);
+      _mm256_store_si256((__m256i*)(B.ts + i0), _mm256_add_epi64(_mm256_mul_epu32(_mm256_cvtepu32_epi64(_mm256_castsi256_si128(secs)), k1000), y0));
+      _mm256_store_si256((__m256i*)(B.ts + i0 + 4), _mm256_add_epi64(_mm256_mul_epu32(_mm256_cvtepu32_epi64(_mm256_extracti128_si256(secs, 1)), k1000), y0));
+    }
+  }
+  u64 l13 = 0, l25 = 0, lx = 0;
+  {
+    const __m256i lo16 = _mm256_set1_epi32(0xFFFF), lo15 = _mm256_set1_epi32(0x7FFF), ym = _mm256_set1_epi32((int)g_ymain);
+    const __m256i c20 = _mm256_set1_epi32(20), c13 = _mm256_set1_epi32(13), c25 = _mm256_set1_epi32(25);
+    const __m256i order = _mm256_setr_epi32(0, 2, 4, 6, 1, 3, 5, 7);  // the halves of lines p and p + 4 into line order
+    for (u32 i0 = 0; i0 < n; i0 += 8) {
+      const __m256i m = _mm256_permutevar8x32_epi32(_mm256_cvtepu16_epi32(_mm_load_si128((const __m128i*)(vm + i0 / 2))), order);
+      const __m256i l3 = _mm256_load_si256((const __m256i*)(B.ln[3] + i0));
+      const u32 live = (u32)(kept >> i0) & 0xFF;
+      const u32 yt = eq32x8(_mm256_load_si256((const __m256i*)(vy + i0)), ym) & (u32)(dts >> i0) & live;
+      const u32 done = yt & eq32x8(m, lo16) & eq32x8(l3, c20);
+      const u32 off = yt & eq32x8(_mm256_and_si256(m, lo15), lo15) & eq32x8(l3, c25);
+      const u32 dg = live & eq32x8(l3, c13);
+      l13 |= (u64)dg << i0;
+      l25 |= (u64)off << i0;
+      lx |= (u64)(live & ~(done | off | dg)) << i0;
+    }
+  }
+  for (u64 m = l13; m; m = _blsr_u64(m)) {
+    const u32 i = (u32)_tzcnt_u64(m);
+    i64 t;
+    if (__builtin_expect(digits13(base + B.st[3][i], t), 1))
+      B.ts[i] = t;
+    else
+      ck_ts_exact(B, i, base);
+  }
+  for (u64 m = l25; m; m = _blsr_u64(m)) {
+    const u32 i = (u32)_tzcnt_u64(m);
+    i64 add;
+    if (__builtin_expect(f3_offset(base + B.st[3][i], add), 1))
+      B.ts[i] += add;
+    else
+      ck_ts_exact(B, i, base);
+  }
+  for (u64 m = lx; m; m = _blsr_u64(m)) ck_ts_form(B, (u32)_tzcnt_u64(m), base);
+}
+
 // A valid click with an ID that is not regular: kept aside.
 static NOINLINE void ck_slow(TL& tl, CkB& B, u32 i, const u8* base, u32 rel, u32 camp) {
   const u8* const s1 = base + B.st[1][i];
@@ -1244,8 +1337,18 @@ static NOINLINE u32 process_clicks(CkB& B, const u8* const base, WCScatter<C16>:
       cslow |= (u64)bc << i;
     }
   }
-  u32 cnt[4] = {0, 0, 0, 0};
   u64 kept = 0;  // the line has a click_id and a user_id
+  if (g_vts.on) {
+    // ts eight lines at a time (ck_ts_rows)
+    const __m256i zero = _mm256_setzero_si256();
+    for (u32 i = 0; i < n; i += 8) {
+      const u32 some = 0xFF & ~(eq32x8(_mm256_load_si256((const __m256i*)(B.ln[0] + i)), zero) |
+                                eq32x8(_mm256_load_si256((const __m256i*)(B.ln[1] + i)), zero));
+      kept |= (u64)((u32)(nmask >> i) & some) << i;
+    }
+    ck_ts_rows(B, base, n, kept);
+  } else {
+  u32 cnt[4] = {0, 0, 0, 0};
   {
     const __m256i c20 = _mm256_set1_epi32(20), c13 = _mm256_set1_epi32(13), c25 = _mm256_set1_epi32(25), zero = _mm256_setzero_si256();
     for (u32 i = 0; i < n; i += 8) {
@@ -1293,6 +1396,7 @@ static NOINLINE u32 process_clicks(CkB& B, const u8* const base, WCScatter<C16>:
       ck_ts_exact(B, i, base);
   }
   for (u32 j = 0; j < cnt[3]; j++) ck_ts_exact(B, B.lst[3][j], base);
+  }
   const u64 wlen = (u64)(we - cws);
   static const i32 no_camp = -1;  // (the table can be empty)
   const u64 ncamp_tab = g_camp_by_num.size();
@@ -3174,6 +3278,29 @@ static long selftest(Next&& next) {
               fprintf(stderr, "VTS MISMATCH ts='%.*s' ing='%.*s' got %lld/%lld want %lld/%lld (main year %s)\n", (int)B.ln[2][i],
                       (const char*)buf.data() + B.st[2][i], (int)B.ln[3][i], (const char*)buf.data() + B.st[3][i],
                       (long long)ts, (long long)ic, (long long)B.ts[i], (long long)B.icode[i], ytxt[g_ymain_row & 1]);
+            bad3++;
+          }
+        }
+        // the same lines' ts as click lines (field 3), some of them not kept
+        static CkB C;
+        C.n = nl;
+        for (u32 i = 0; i < nl; i++) {
+          C.st[3][i] = B.st[2][i];
+          C.ln[3][i] = B.ln[2][i];
+        }
+        C.pad();
+        const u64 ckept = nmask & (next() % 4 == 0 ? next() : ~0ULL);
+        for (u32 i = 0; i < nl; i++) C.ts[i] = 12345;
+        ck_ts_rows(C, buf.data(), nl, ckept);
+        for (u32 i = 0; i < nl; i++) {
+          if (!((ckept >> i) & 1)) continue;
+          const i64 ts = C.ts[i];
+          ck_ts_exact(C, i, buf.data());
+          n3++;
+          if (ts != C.ts[i]) {
+            if (bad3 < 10)
+              fprintf(stderr, "VTS CLICK MISMATCH ts='%.*s' got %lld want %lld (main year %s)\n", (int)C.ln[3][i],
+                      (const char*)buf.data() + C.st[3][i], (long long)ts, (long long)C.ts[i], ytxt[g_ymain_row & 1]);
             bad3++;
           }
         }
