@@ -98,3 +98,13 @@ Every build has a profile of its own (`pgobuild.sh`). The rows are short so that
   scan's user CPU in ms. A letter after it is the route if it was not the dense one, `!n` counts failed runs,
   `,n` the good runs if a round did not run. `top_category` has the timelines of `BENCH_TIMELINE`'s builds.
 - `!3`: the whole bench in seconds, CPU throttling, and the generation of the sets.
+
+## Bench 11 (A, branch a-bench11): the new head at 60M, and larger event partitions with the scan on 4 threads
+
+Same harness and rows as bench 10. Eleven builds: `j` v4 8384d32 (0.38), `k` v4 286f27c, `m` v4 cf4452a (head:
+segment ends taken as soon as their segments are through, the largest click partitions loaded once), `w` (m
+with the partitions' record counts taken in parallel), `n` (cf4452a with the knobs of
+`bench/variants/cf4452a-knobs/knobs.py` at their defaults) and the same binary as `nb` (no click partition
+shared), `g5` / `g20` (segments of 5 / 20 partitions), `s4` (the scan on 4 pinned threads); `e15` (event
+partitions of 2^15 indexes: half the staging lines, 512 KB slot tables) and `e154` (e15 with the scan on 4
+pinned threads, so one slot table per core). Four rounds at both sizes.

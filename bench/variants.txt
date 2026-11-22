@@ -1,16 +1,13 @@
-# Bench 10 (chat A). tag, binary in /usr/local/bench, then ENV=VALUE settings.
+# Bench 11 (chat A). tag, binary in /usr/local/bench, then ENV=VALUE settings.
 # The first build also writes the dev output that the report rows are added to.
-j    ss-8384d32-clang18-pgo             # v4 8384d32 as its Dockerfile: scored 0.38 at 18:53
-k    ss-286f27c-clang18-pgo             # v4 286f27c as its Dockerfile: j + the segment ends as a pass of their own (head of v4)
-n    ss-286f27c-knobs                   # 286f27c with the bench knobs (bench/variants/286f27c-knobs/knobs.py), all at their defaults: should equal k
-pw   ss-286f27c-knobs SS_PW=1           # a record's staging line is asked for (for writing) when its partition is known
-lw   ss-286f27c-knobs SS_LW=1           # load_clicks asks for the lines its keys go to, eight clicks ahead
-p0   ss-286f27c-knobs SS_PF=0           # place() and load_clicks ask for no block ahead
-p2   ss-286f27c-knobs SS_PF=2           # ... for the block after the next
-h2   ss-286f27c-knobs SS_PFH=2          # ... for the next block with prefetcht2 (not into the first-level cache)
-h3   ss-286f27c-knobs SS_PFH=3          # ... with prefetchnta
-s4   ss-286f27c-knobs SS_ST=4           # the scan's segments on 4 threads, one pinned to each core
-s6   ss-286f27c-knobs SS_ST=6           # ... on 6 threads, not pinned
-e13  ss-286f27c-ke13 SS_SEGPART=20      # event partitions of 2^13 indexes: 128 KB slot tables, twice the staging lines
-e12  ss-286f27c-ke12 SS_SEGPART=40      # ... of 2^12: 64 KB slot tables
-c32  ss-286f27c-cap32                   # parse batches of 32 lines instead of 64
+j    ss-8384d32-clang18-pgo                # v4 8384d32 as its Dockerfile: scored 0.38 at 18:53
+k    ss-286f27c-clang18-pgo                # v4 286f27c: j + the segment ends as a pass after the scan
+m    ss-cf4452a-clang18-pgo                # v4 cf4452a (head): k + ends taken as soon as their segments are through + the largest click partitions loaded once
+w    ss-cf4452a-parcount                   # m + the partitions' record counts taken in parallel at the start of the scan
+n    ss-cf4452a-knobs                      # cf4452a with the bench knobs (bench/variants/cf4452a-knobs/knobs.py) at their defaults: should equal m
+nb   ss-cf4452a-knobs SS_CKBIG=2000000000  # no click partition is shared: what loading the largest one once is worth
+g5   ss-cf4452a-knobs SS_SEGPART=5         # segments of 5 partitions instead of 10 (their ends cost little now)
+g20  ss-cf4452a-knobs SS_SEGPART=20        # ... of 20
+s4   ss-cf4452a-knobs SS_ST=4              # the scan on 4 threads, one pinned to each core
+e15  ss-cf4452a-ke15 SS_SEGPART=5          # event partitions of 2^15 indexes: half the staging lines, 512 KB slot tables
+e154 ss-cf4452a-ke15 SS_SEGPART=5 SS_ST=4  # ... with the scan on 4 pinned threads (one slot table per core)
