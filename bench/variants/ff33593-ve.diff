@@ -1,0 +1,264 @@
+diff --git a/src/main.cpp b/src/main.cpp
+index abedf98..dca1c74 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -1932,32 +1932,47 @@ static void finish_links(size_t nlinks) {
+       (unsigned long long)nslots, remap, (unsigned long long)(words * 8 / 1024));
+ }
+ 
+-// The general link phase: every ID of every link line goes into H.
+-static void build_links(std::vector<MFile>& files) {
++// The general link phase: every ID of every link line goes into H. In three steps, so that the link lines can be
++// parsed in the same pool run as the event lines (which do not need H): links_begin counts the lines and makes
++// H, links_chunk parses one chunk, links_end (once every chunk is in) points every ID at its person.
++struct LinkJob {
+   std::vector<Chunk> chunks;
+-  make_chunks(files, 1 << 18, chunks);
+-  if (chunks.empty()) return;
+-  const int nchunks = (int)chunks.size();
++  std::vector<size_t> part;
++};
++static void links_begin(std::vector<MFile>& files, LinkJob& J) {
++  make_chunks(files, 1 << 18, J.chunks);
++  if (J.chunks.empty()) return;
++  const int nchunks = (int)J.chunks.size();
+   // An upper bound on the number of link lines sizes the table: at most two new IDs per line.
+-  std::vector<size_t> part(nchunks, 0);
++  J.part.assign(nchunks, 0);
+   parallel_for(nchunks, [&](int t, int) {
+-    const Chunk& c = chunks[t];
+-    part[t] = count_newlines(files[c.file].data + c.nominal, c.nominal_end - c.nominal);
++    const Chunk& c = J.chunks[t];
++    J.part[t] = count_newlines(files[c.file].data + c.nominal, c.nominal_end - c.nominal);
+   });
+   size_t max_lines = files.size();  // a last line without a newline
+-  for (size_t c : part) max_lines += c;
++  for (size_t c : J.part) max_lines += c;
+   g_Hbits = std::max<u32>(10, ceil_log2(max_lines * 2 + 2));  // more slots than IDs even if every ID is new
+   g_H = (HSlot*)vm_alloc(sizeof(HSlot) << g_Hbits);
+-  parallel_for(nchunks, [&](int t, int) {
+-    const Chunk& c = chunks[t];
+-    const MFile& f = files[c.file];
+-    size_t b = line_start_at_or_after(f, c.nominal), e = line_start_at_or_after(f, c.nominal_end);
+-    part[t] = b < e ? parse_link_chunk(f.data + b, f.data + e, b == 0) : 0;
+-  });
++}
++static void links_chunk(std::vector<MFile>& files, LinkJob& J, int t) {
++  const Chunk& c = J.chunks[t];
++  const MFile& f = files[c.file];
++  size_t b = line_start_at_or_after(f, c.nominal), e = line_start_at_or_after(f, c.nominal_end);
++  J.part[t] = b < e ? parse_link_chunk(f.data + b, f.data + e, b == 0) : 0;
++}
++static void links_end(LinkJob& J) {
++  if (J.chunks.empty()) return;
+   size_t nlinks = 0;
+-  for (size_t c : part) nlinks += c;
++  for (size_t c : J.part) nlinks += c;
+   finish_links(nlinks);
+ }
++static void build_links(std::vector<MFile>& files) {
++  LinkJob J;
++  links_begin(files, J);
++  if (J.chunks.empty()) return;
++  parallel_for((int)J.chunks.size(), [&](int t, int) { links_chunk(files, J, t); });
++  links_end(J);
++}
+ 
+ namespace dn {
+ static std::atomic<u64>* g_acc = nullptr;  // per person index: what the links say about it (dense.h)
+@@ -2286,6 +2301,47 @@ static u64 column_events(const u8*, const u8*, bool, TL&, u32, i64, i64);
+ static u64 column_clicks(const u8*, const u8*, bool, TL&, i64, i64);
+ static bool use_column_times();
+ 
++// The link lines and the event lines in one pool run (links first: the event lines do not need H), then H is
++// finished, then the click lines, which look their persons up in H.
++static void parse_links_events_clicks(std::vector<MFile>& lk, LinkJob& J, std::vector<MFile>& ev, std::vector<MFile>& ck) {
++  size_t ev_bytes = 0, ck_bytes = 0;
++  for (auto& f : ev) ev_bytes += f.size;
++  for (auto& f : ck) ck_bytes += f.size;
++  size_t chunk = std::max<size_t>(1 << 18, std::min<size_t>(8 << 20, (ev_bytes + ck_bytes) / (NT * 24 + 1)));
++  if (const char* e = getenv("SS_CHUNK_KB")) chunk = (size_t)std::max(64, atoi(e)) << 10;  // (bench knob)
++  std::vector<Chunk> ce, cc;
++  make_chunks(ev, chunk, ce);
++  make_chunks(ck, std::max<size_t>(1 << 18, std::min(chunk, ck_bytes / (NT * 32 + 1))), cc);
++  const u32 p1shift = 64 - g_P1bits;
++  const i64 ws = g_ws, we = g_we, cws = g_ws - WEEK;
++  const auto event_parser = use_column_times() ? column_events : parse_event_chunk;
++  const auto click_parser = use_column_times() ? column_clicks : parse_click_chunk;
++  const int nl = (int)J.chunks.size();
++  parallel_for(nl + (int)ce.size(), [&](int t, int tid) {
++    if (t < nl) {
++      links_chunk(lk, J, t);
++      return;
++    }
++    TL& tl = g_tl[tid];
++    const Chunk& c = ce[t - nl];
++    const MFile& f = ev[c.file];
++    size_t b = line_start_at_or_after(f, c.nominal), e = line_start_at_or_after(f, c.nominal_end);
++    if (b >= e) return;
++    tl.n_event_lines += event_parser(f.data + b, f.data + e, b == 0, tl, p1shift, ws, we);
++  });
++  links_end(J);
++  LOG("links done");
++  parallel_for((int)cc.size(), [&](int t, int tid) {
++    TL& tl = g_tl[tid];
++    const Chunk& c = cc[t];
++    const MFile& f = ck[c.file];
++    size_t b = line_start_at_or_after(f, c.nominal), e = line_start_at_or_after(f, c.nominal_end);
++    if (b >= e) return;
++    tl.n_click_lines += click_parser(f.data + b, f.data + e, b == 0, tl, cws, we);
++  });
++  parallel_for(NT, [&](int t, int) { g_tl[t].r1.finish(g_tl[t].arena); });
++}
++
+ static void parse_events_clicks(std::vector<MFile>& ev, std::vector<MFile>& ck) {
+   size_t ev_bytes = 0, ck_bytes = 0;
+   for (auto& f : ev) ev_bytes += f.size;
+@@ -3117,6 +3173,115 @@ static u64 scan_batches(const u8* begin, const u8* end, bool header, B& batch, C
+ 
+ static inline u64 batch_mask(u32 n) { return n == 64 ? UINT64_MAX : (1ULL << n) - 1; }
+ 
++#if defined(__AVX512VL__) && defined(__AVX512DQ__) && defined(__AVX512BW__)
++// The batch's validity checks eight lines (or four 64-bit values) at a time with mask registers: ts in the
++// window, not more than 24 hours late, user and product present, type exactly view or cart (from the first four
++// bytes, gathered). Lines of another type (purchases, bad types) are checked one by one as before. Keys, hashes
++// and the partition stay per line. Each record is written with one 32-byte store.
++static NOINLINE u32 emit_event_columns(dn::EvB& b, const u8* base, WCScatter<R1>::Cursor& cur,
++                                        u32 p1shift, i64 ws, i64 we) {
++  const u32 n = b.n;
++  dn::ev_ts_rows(b, base, n, batch_mask(n));
++  const u64 span = static_cast<u64>(we - ws);
++  alignas(32) R1 records[dn::EvB::CAP];
++  alignas(32) i64 ing[dn::EvB::CAP + 8];
++  u32 part[dn::EvB::CAP + SS_PFD + 1];
++  u64 vtl = 0;  // ts in the window and the line not late
++  {
++    const __m256i vws = _mm256_set1_epi64x(ws), vspan = _mm256_set1_epi64x((long long)span),
++                  vday = _mm256_set1_epi64x(DAY), vnone = _mm256_set1_epi64x(dn::ICODE_NONE),
++                  vbase = _mm256_set1_epi64x(dn::g_ing_base - 1000), vk = _mm256_set1_epi64x(1000),
++                  vingn = _mm256_set1_epi64x(ING_NONE);
++    for (u32 g = 0; g < n; g += 4) {
++      const __m256i t = _mm256_load_si256((const __m256i*)(b.ts + g));
++      const __m256i ic = _mm256_load_si256((const __m256i*)(b.icode + g));
++      const __mmask8 inwin = _mm256_cmplt_epu64_mask(_mm256_sub_epi64(t, vws), vspan);
++      __m256i iv = _mm256_add_epi64(_mm256_mullo_epi64(ic, vk), vbase);
++      iv = _mm256_mask_mov_epi64(iv, _mm256_cmpeq_epi64_mask(ic, vnone), vingn);
++      _mm256_store_si256((__m256i*)(ing + g), iv);
++      const __mmask8 ok = inwin & _mm256_cmple_epi64_mask(iv, _mm256_add_epi64(t, vday));
++      vtl |= (u64)(ok & 0xF) << g;
++    }
++  }
++  u64 vcm = 0, upm = 0, hex33 = 0;  // type view or cart; user and product present; user_id of 33 bytes
++  {
++    const __m256i four = _mm256_set1_epi32(4), view = _mm256_set1_epi32(0x77656976), cart = _mm256_set1_epi32(0x74726163),
++                  v33 = _mm256_set1_epi32(33);
++    for (u32 g = 0; g < n; g += 8) {
++      const __m256i l4 = _mm256_load_si256((const __m256i*)(b.ln[4] + g));
++      const __m256i s4 = _mm256_load_si256((const __m256i*)(b.st[4] + g));
++      const __m256i w4 = _mm256_i32gather_epi32((const int*)base, s4, 1);
++      const __mmask8 vc = _mm256_cmpeq_epi32_mask(l4, four) &
++                          (_mm256_cmpeq_epi32_mask(w4, view) | _mm256_cmpeq_epi32_mask(w4, cart));
++      const __m256i l1 = _mm256_load_si256((const __m256i*)(b.ln[1] + g));
++      const __m256i l5 = _mm256_load_si256((const __m256i*)(b.ln[5] + g));
++      const __mmask8 up = _mm256_test_epi32_mask(l1, l1) & _mm256_test_epi32_mask(l5, l5);
++      vcm |= (u64)vc << g;
++      upm |= (u64)up << g;
++      hex33 |= (u64)_mm256_cmpeq_epi32_mask(l1, v33) << g;
++    }
++  }
++  const u64 live = batch_mask(n);
++  hex33 &= live;
++  // the hex user IDs of the batch: their slots are fetched before the first of them is looked up
++  __m128i hv[dn::EvB::CAP];
++  u64 hexm = 0;
++  for (u64 m = hex33; m; m = _blsr_u64(m)) {
++    const u32 i = (u32)_tzcnt_u64(m);
++    if (hex_user(base + b.st[1][i], 33, hv[i])) {
++      hexm |= 1ULL << i;
++      hex_prefetch(hv[i]);
++    }
++  }
++  const u64 good = vtl & upm;  // valid unless the type says otherwise
++  u32 kept = 0;
++  for (u32 i = 0; i < n; ++i) {
++    const u32 elen = b.ln[0][i];
++    if (!elen) continue;
++    const u8* id = base + b.st[0][i];
++    u64 eid;
++    if (elen == 33 && event_offset_mask) {
++      const u64 hash = hash_id(id_hash(id, 33));
++      eid = (hash & ~event_offset_mask) | (reinterpret_cast<uintptr_t>(id) - event_base);
++      part[kept] = (1u << g_P1bits) + (u32)(hash >> (p1shift + 2));
++    } else {
++      eid = hash_id(make_key(id, elen));
++      part[kept] = (u32)(eid >> p1shift);
++    }
++    const u32 ulen = b.ln[1][i];
++    const u8* us = base + b.st[1][i];
++    const u64 uid = ulen ? hash_id(((hexm >> i) & 1) ? hex_key(hv[i], us) : make_key(us, ulen)) : 0;
++    const u32 rel = (u32)((u64)b.ts[i] - (u64)ws);
++    u64 tsp;
++    if (__builtin_expect((vcm >> i) & 1, 1)) {
++      tsp = ((good >> i) & 1) ? (u64)rel : (u64)TS_INVALID;
++    } else {  // purchase, or not a valid type
++      const u8* type = base + b.st[4][i];
++      u32 price;
++      tsp = TS_INVALID;
++      if (((good >> i) & 1) && b.ln[4][i] == 8 && memcmp(type, "purchase", 8) == 0 &&
++          price_fast(base + b.st[6][i], b.ln[6][i], price))
++        tsp = (u64)rel | ((u64)((cat_fast(base + b.st[5][i], b.ln[5][i]) << 24) | price) << 32);
++    }
++    _mm256_store_si256((__m256i*)&records[kept], _mm256_set_epi64x((long long)tsp, (long long)uid, ing[i], (long long)eid));
++    ++kept;
++  }
++  auto out = cur;
++#if SS_PFD > 0
++  for (u32 i = 0; i < kept && i < SS_PFD; ++i) WCScatter<R1>::prefetch(out, part[i]);
++  part[kept] = part[kept > 0 ? kept - 1 : 0];
++  for (u32 i = kept + 1; i < kept + SS_PFD + 1 && i < dn::EvB::CAP + SS_PFD + 1; ++i) part[i] = part[kept];
++#endif
++  for (u32 i = 0; i < kept; ++i) {
++#if SS_PFD > 0
++    WCScatter<R1>::prefetch(out, part[i + SS_PFD]);
++#endif
++    WCScatter<R1>::push32(out, part[i], _mm256_load_si256(reinterpret_cast<const __m256i*>(&records[i])));
++  }
++  cur = out;
++  return kept;
++}
++#else
+ static NOINLINE u32 emit_event_columns(dn::EvB& b, const u8* base, WCScatter<R1>::Cursor& cur,
+                                         u32 p1shift, i64 ws, i64 we) {
+   const u32 n = b.n;
+@@ -3188,6 +3353,7 @@ static NOINLINE u32 emit_event_columns(dn::EvB& b, const u8* base, WCScatter<R1>
+   cur = out;
+   return kept;
+ }
++#endif
+ 
+ static u64 column_events(const u8* begin, const u8* end, bool header, TL& tl, u32 shift, i64 ws, i64 we) {
+   dn::EvB b;
+@@ -3813,6 +3979,9 @@ int main(int argc, char** argv) {
+   const u32 P2bits_gen = std::min<u32>(12, std::max<u32>(4, ceil_log2(est_lines / 32768 + 1)));
+   g_P1bits = P1bits_gen;
+   g_P2bits = P2bits_gen;
++  // (bench knobs: partition bits moved up or down from the defaults)
++  if (const char* e = getenv("SS_P1ADJ")) g_P1bits = (u32)std::max(4, std::min(14, (int)g_P1bits + atoi(e)));
++  if (const char* e = getenv("SS_P2ADJ")) g_P2bits = (u32)std::max(4, std::min(14, (int)g_P2bits + atoi(e)));
+   size_t id_input_bytes = ev_bytes;
+   for (const auto& f : ck) id_input_bytes += f.size;
+   for (const auto& f : lk) id_input_bytes += f.size;
+@@ -3832,10 +4001,11 @@ int main(int argc, char** argv) {
+     }
+   });
+   g_phase = 1;
+-  build_links(lk);
++  LinkJob lkjob;
++  links_begin(lk, lkjob);
+   setup.join();
+   g_phase = 2;
+-  parse_events_clicks(ev, ck);
++  parse_links_events_clicks(lk, lkjob, ev, ck);
+   {
+     u64 a = 0, b = 0;
+     for (auto& t : g_tl) {

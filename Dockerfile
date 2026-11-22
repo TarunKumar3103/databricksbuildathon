@@ -20,7 +20,7 @@ FROM debian:bookworm-slim
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
 COPY --from=build /out/ /usr/local/bench/
 ENV DATA_DIR=/data OUTPUT_DIR=/output SCRATCH_DIR=/scratch
-# bench 19: five rounds at 20M and four at 60M (eight builds), and the phase timelines of
-# builds f and ov
-ENV BENCH_SIZES=20:5:5,60:15:4 BENCH_TIMELINE=f,ov
+# bench 20: seven rounds at 20M and five at 60M (four builds), and the phase timelines of
+# builds f and ve
+ENV BENCH_SIZES=20:5:7,60:15:5 BENCH_TIMELINE=f,ve
 CMD ["/usr/local/bench/bench"]

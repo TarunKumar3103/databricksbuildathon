@@ -1,10 +1,6 @@
-# Bench 19 (chat A), v5 data. tag, binary in /usr/local/bench, then ENV=VALUE settings.
+# Bench 20 (chat A), v5 data. tag, binary in /usr/local/bench, then ENV=VALUE settings.
 # The first build also writes the dev output that the report rows are added to.
-f     ss-f                      # ff33593 (0.5772; bench 18: same as 415ae10)
-ov    ss-ov                     # f + link lines parsed in the same pool run as the event lines
-ov2   ss-ov                     # the same binary once more: the noise
-ovP2  ss-ov SS_P2ADJ=1          # ov with twice the person partitions
-ovp2  ss-ov SS_P2ADJ=-1         # ov with half the person partitions
-ovp1  ss-ov SS_P1ADJ=-1         # ov with half the event-id partitions
-ovc4  ss-ov SS_CHUNK_KB=4096    # ov with parse chunks of 4 MB (8 MB by default at these sizes)
-ovc16 ss-ov SS_CHUNK_KB=16384   # ... and of 16 MB
+f     ss-f      # ff33593 (= 415ae10, 0.5600)
+ve    ss-ve     # f + links with the event parse (bench 19: neutral) + the event emit loop's checks in mask registers
+ve2   ss-ve     # the same binary once more: the noise
+ve3   ss-ve3    # ve built with -O3

@@ -179,3 +179,10 @@ dedup -121 ms wall at 60M. At 60M the timeline was links 102 ms, parse to 999, d
   Source: `bench/variants/ff33593-ov.diff` (also adds the knobs below, read from the environment).
 - `ovP2` / `ovp2`: person partitions doubled / halved (`SS_P2ADJ`); `ovp1`: event-id partitions halved.
 - `ovc4` / `ovc16`: parse chunks of 4 / 16 MB.
+
+## Bench 20 (A): the event emit loop with mask registers, and -O3
+
+Bench 19: every build within 1% of f at both sizes (links overlapped, partition counts, chunk sizes): none kept
+except the overlap, which is neutral. `ve` (`bench/variants/ff33593-ve.diff`): f + the overlap + the validity
+checks of emit_event_columns eight lines at a time (AVX-512VL masks, type bytes gathered), one 32-byte store
+per record. `ve2` the same binary, `ve3` ve at -O3.
