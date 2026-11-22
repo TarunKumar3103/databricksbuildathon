@@ -10,6 +10,15 @@
 //   4. dedup per event_id partition -> person lookup -> R2 records, partitioned by hash(person)
 //   5. per person partition: group, sort, sessionize, attribute, aggregate
 //   6. write Parquet
+// The record path's settings (benches 12 and 15): each record's staging line is prefetched for writing SS_PFD
+// records ahead in the scatter loops, and the threads' malloc heaps grow SS_TOPPAD bytes at a time (each growth
+// is an mprotect, which waits for the page faults in progress). -DSS_PFD=0 or -DSS_TOPPAD=0 turns either off.
+#ifndef SS_PFD
+#define SS_PFD 4
+#endif
+#ifndef SS_TOPPAD
+#define SS_TOPPAD 67108864
+#endif
 #include <dirent.h>
 #include <fcntl.h>
 #include <immintrin.h>
