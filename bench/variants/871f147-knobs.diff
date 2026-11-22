@@ -1,0 +1,23 @@
+diff --git a/src/main.cpp b/src/main.cpp
+index 361c86c..5ccaa79 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -4125,6 +4125,9 @@ int main(int argc, char** argv) {
+   const u32 P2bits_gen = std::min<u32>(12, std::max<u32>(4, ceil_log2(est_lines / 32768 + 1)));
+   g_P1bits = P1bits_gen;
+   g_P2bits = P2bits_gen;
++  // (bench knobs: partition bits moved up or down from the defaults)
++  if (const char* e = getenv("SS_P1ADJ")) g_P1bits = (u32)std::max(4, std::min(14, (int)g_P1bits + atoi(e)));
++  if (const char* e = getenv("SS_P2ADJ")) g_P2bits = (u32)std::max(4, std::min(14, (int)g_P2bits + atoi(e)));
+   size_t id_input_bytes = ev_bytes;
+   for (const auto& f : ck) id_input_bytes += f.size;
+   for (const auto& f : lk) id_input_bytes += f.size;
+@@ -4138,7 +4141,7 @@ int main(int argc, char** argv) {
+     dn::init_daycode();
+     {
+       const char* e = getenv("SS_PQ");
+-      g_pq = use_column_times() && NT <= 31 && !(e && *e == '0');
++      g_pq = use_column_times() && NT <= 31 && g_P2bits <= g_P1bits && !(e && *e == '0');
+     }
+     g_tl.resize(NT);
+     for (auto& t : g_tl) {

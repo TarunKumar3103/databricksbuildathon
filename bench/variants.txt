@@ -1,7 +1,8 @@
-# Bench 22 (chat A), v5 data. tag, binary in /usr/local/bench, then ENV=VALUE settings.
+# Bench 23 (chat A), v5 data. tag, binary in /usr/local/bench, then ENV=VALUE settings.
 # The first build also writes the dev output that the report rows are added to.
-f     ss-f            # ff33593 (= 415ae10, 0.5600)
-pq    ss-pq           # the PQ route: 16-byte P (person) and Q (event id) records, dedup on Q, losers skipped
-pqoff ss-pq SS_PQ=0   # the same binary on the R1 route (as f)
-pq2   ss-pq           # pq once more: the noise
-nd    ss-nd           # TIMING ONLY, wrong output: no dedup pass at all (bench 21's upper bound)
+f     ss-f                                    # ff33593 (= 415ae10, 0.5600)
+pq    ss-pqk                                  # 871f147 (PQ route) + partition knobs, at the defaults
+pq1   ss-pqk SS_P1ADJ=-1 SS_P2ADJ=-1          # PQ with half the event-id and half the person partitions
+pq2   ss-pqk SS_P1ADJ=-2 SS_P2ADJ=-2          # ... a quarter of each
+r1    ss-pqk SS_PQ=0 SS_P1ADJ=-1 SS_P2ADJ=-1  # the R1 route (as f) with half of each
+r2    ss-pqk SS_PQ=0 SS_P1ADJ=-2 SS_P2ADJ=-2  # ... a quarter of each

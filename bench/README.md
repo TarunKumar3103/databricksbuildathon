@@ -202,3 +202,10 @@ ingest_ts in whole seconds, and where its P record is: thread, person partition,
 sends the P records that lose to their person partition as kill entries, which the person phase skips. Bytes
 per event: 64 moved instead of 96 (R1 32 written and read, R2 16 written and read). `pqoff` is the same
 binary with SS_PQ=0 (the R1 route). `nd` as in bench 21.
+
+## Bench 23 (A): the PQ route with fewer partitions
+
+Bench 22: pq +5% at both sizes (parse CPU +35%: the person lookup and a third scatter stream at parse; dedup
+CPU -62%); nd -17%. A parse thread then fills staging lines for R2, Q, the 33-byte Q and R2C at once (about
+13k lines, 850 KB at 60M), more than L2. Here the event-id and person partitions are halved and quartered
+together (SS_P1ADJ, SS_P2ADJ), on PQ and on the R1 route.
