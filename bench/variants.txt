@@ -1,6 +1,6 @@
-# Bench 20 (chat A), v5 data. tag, binary in /usr/local/bench, then ENV=VALUE settings.
+# Bench 21 (chat A), v5 data. tag, binary in /usr/local/bench, then ENV=VALUE settings.
 # The first build also writes the dev output that the report rows are added to.
 f     ss-f      # ff33593 (= 415ae10, 0.5600)
-ve    ss-ve     # f + links with the event parse (bench 19: neutral) + the event emit loop's checks in mask registers
-ve2   ss-ve     # the same binary once more: the noise
-ve3   ss-ve3    # ve built with -O3
+ve    ss-ve     # bench 20's ve
+nd    ss-nd     # TIMING ONLY, wrong output: ve with no dedup pass (event lines routed to persons at parse)
+nd2   ss-nd     # the same binary once more

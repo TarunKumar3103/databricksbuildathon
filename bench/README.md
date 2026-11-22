@@ -186,3 +186,9 @@ Bench 19: every build within 1% of f at both sizes (links overlapped, partition 
 except the overlap, which is neutral. `ve` (`bench/variants/ff33593-ve.diff`): f + the overlap + the validity
 checks of emit_event_columns eight lines at a time (AVX-512VL masks, type bytes gathered), one 32-byte store
 per record. `ve2` the same binary, `ve3` ve at -O3.
+
+## Bench 21 (A): what removing the dedup pass could win
+
+`nd` is **timing only, wrong output** (duplicates are counted): ve with the links finished before the event
+parse, each event line routed to its person at parse (as the clicks are), and no dedup pass. It is the upper
+bound of a design that removes duplicates inside the person phase.
