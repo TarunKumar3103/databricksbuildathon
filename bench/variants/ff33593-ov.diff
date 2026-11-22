@@ -1,0 +1,140 @@
+diff --git a/src/main.cpp b/src/main.cpp
+index abedf98..c9c8586 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -1932,32 +1932,47 @@ static void finish_links(size_t nlinks) {
+       (unsigned long long)nslots, remap, (unsigned long long)(words * 8 / 1024));
+ }
+ 
+-// The general link phase: every ID of every link line goes into H.
+-static void build_links(std::vector<MFile>& files) {
++// The general link phase: every ID of every link line goes into H. In three steps, so that the link lines can be
++// parsed in the same pool run as the event lines (which do not need H): links_begin counts the lines and makes
++// H, links_chunk parses one chunk, links_end (once every chunk is in) points every ID at its person.
++struct LinkJob {
+   std::vector<Chunk> chunks;
+-  make_chunks(files, 1 << 18, chunks);
+-  if (chunks.empty()) return;
+-  const int nchunks = (int)chunks.size();
++  std::vector<size_t> part;
++};
++static void links_begin(std::vector<MFile>& files, LinkJob& J) {
++  make_chunks(files, 1 << 18, J.chunks);
++  if (J.chunks.empty()) return;
++  const int nchunks = (int)J.chunks.size();
+   // An upper bound on the number of link lines sizes the table: at most two new IDs per line.
+-  std::vector<size_t> part(nchunks, 0);
++  J.part.assign(nchunks, 0);
+   parallel_for(nchunks, [&](int t, int) {
+-    const Chunk& c = chunks[t];
+-    part[t] = count_newlines(files[c.file].data + c.nominal, c.nominal_end - c.nominal);
++    const Chunk& c = J.chunks[t];
++    J.part[t] = count_newlines(files[c.file].data + c.nominal, c.nominal_end - c.nominal);
+   });
+   size_t max_lines = files.size();  // a last line without a newline
+-  for (size_t c : part) max_lines += c;
++  for (size_t c : J.part) max_lines += c;
+   g_Hbits = std::max<u32>(10, ceil_log2(max_lines * 2 + 2));  // more slots than IDs even if every ID is new
+   g_H = (HSlot*)vm_alloc(sizeof(HSlot) << g_Hbits);
+-  parallel_for(nchunks, [&](int t, int) {
+-    const Chunk& c = chunks[t];
+-    const MFile& f = files[c.file];
+-    size_t b = line_start_at_or_after(f, c.nominal), e = line_start_at_or_after(f, c.nominal_end);
+-    part[t] = b < e ? parse_link_chunk(f.data + b, f.data + e, b == 0) : 0;
+-  });
++}
++static void links_chunk(std::vector<MFile>& files, LinkJob& J, int t) {
++  const Chunk& c = J.chunks[t];
++  const MFile& f = files[c.file];
++  size_t b = line_start_at_or_after(f, c.nominal), e = line_start_at_or_after(f, c.nominal_end);
++  J.part[t] = b < e ? parse_link_chunk(f.data + b, f.data + e, b == 0) : 0;
++}
++static void links_end(LinkJob& J) {
++  if (J.chunks.empty()) return;
+   size_t nlinks = 0;
+-  for (size_t c : part) nlinks += c;
++  for (size_t c : J.part) nlinks += c;
+   finish_links(nlinks);
+ }
++static void build_links(std::vector<MFile>& files) {
++  LinkJob J;
++  links_begin(files, J);
++  if (J.chunks.empty()) return;
++  parallel_for((int)J.chunks.size(), [&](int t, int) { links_chunk(files, J, t); });
++  links_end(J);
++}
+ 
+ namespace dn {
+ static std::atomic<u64>* g_acc = nullptr;  // per person index: what the links say about it (dense.h)
+@@ -2286,6 +2301,47 @@ static u64 column_events(const u8*, const u8*, bool, TL&, u32, i64, i64);
+ static u64 column_clicks(const u8*, const u8*, bool, TL&, i64, i64);
+ static bool use_column_times();
+ 
++// The link lines and the event lines in one pool run (links first: the event lines do not need H), then H is
++// finished, then the click lines, which look their persons up in H.
++static void parse_links_events_clicks(std::vector<MFile>& lk, LinkJob& J, std::vector<MFile>& ev, std::vector<MFile>& ck) {
++  size_t ev_bytes = 0, ck_bytes = 0;
++  for (auto& f : ev) ev_bytes += f.size;
++  for (auto& f : ck) ck_bytes += f.size;
++  size_t chunk = std::max<size_t>(1 << 18, std::min<size_t>(8 << 20, (ev_bytes + ck_bytes) / (NT * 24 + 1)));
++  if (const char* e = getenv("SS_CHUNK_KB")) chunk = (size_t)std::max(64, atoi(e)) << 10;  // (bench knob)
++  std::vector<Chunk> ce, cc;
++  make_chunks(ev, chunk, ce);
++  make_chunks(ck, std::max<size_t>(1 << 18, std::min(chunk, ck_bytes / (NT * 32 + 1))), cc);
++  const u32 p1shift = 64 - g_P1bits;
++  const i64 ws = g_ws, we = g_we, cws = g_ws - WEEK;
++  const auto event_parser = use_column_times() ? column_events : parse_event_chunk;
++  const auto click_parser = use_column_times() ? column_clicks : parse_click_chunk;
++  const int nl = (int)J.chunks.size();
++  parallel_for(nl + (int)ce.size(), [&](int t, int tid) {
++    if (t < nl) {
++      links_chunk(lk, J, t);
++      return;
++    }
++    TL& tl = g_tl[tid];
++    const Chunk& c = ce[t - nl];
++    const MFile& f = ev[c.file];
++    size_t b = line_start_at_or_after(f, c.nominal), e = line_start_at_or_after(f, c.nominal_end);
++    if (b >= e) return;
++    tl.n_event_lines += event_parser(f.data + b, f.data + e, b == 0, tl, p1shift, ws, we);
++  });
++  links_end(J);
++  LOG("links done");
++  parallel_for((int)cc.size(), [&](int t, int tid) {
++    TL& tl = g_tl[tid];
++    const Chunk& c = cc[t];
++    const MFile& f = ck[c.file];
++    size_t b = line_start_at_or_after(f, c.nominal), e = line_start_at_or_after(f, c.nominal_end);
++    if (b >= e) return;
++    tl.n_click_lines += click_parser(f.data + b, f.data + e, b == 0, tl, cws, we);
++  });
++  parallel_for(NT, [&](int t, int) { g_tl[t].r1.finish(g_tl[t].arena); });
++}
++
+ static void parse_events_clicks(std::vector<MFile>& ev, std::vector<MFile>& ck) {
+   size_t ev_bytes = 0, ck_bytes = 0;
+   for (auto& f : ev) ev_bytes += f.size;
+@@ -3813,6 +3869,9 @@ int main(int argc, char** argv) {
+   const u32 P2bits_gen = std::min<u32>(12, std::max<u32>(4, ceil_log2(est_lines / 32768 + 1)));
+   g_P1bits = P1bits_gen;
+   g_P2bits = P2bits_gen;
++  // (bench knobs: partition bits moved up or down from the defaults)
++  if (const char* e = getenv("SS_P1ADJ")) g_P1bits = (u32)std::max(4, std::min(14, (int)g_P1bits + atoi(e)));
++  if (const char* e = getenv("SS_P2ADJ")) g_P2bits = (u32)std::max(4, std::min(14, (int)g_P2bits + atoi(e)));
+   size_t id_input_bytes = ev_bytes;
+   for (const auto& f : ck) id_input_bytes += f.size;
+   for (const auto& f : lk) id_input_bytes += f.size;
+@@ -3832,10 +3891,11 @@ int main(int argc, char** argv) {
+     }
+   });
+   g_phase = 1;
+-  build_links(lk);
++  LinkJob lkjob;
++  links_begin(lk, lkjob);
+   setup.join();
+   g_phase = 2;
+-  parse_events_clicks(ev, ck);
++  parse_links_events_clicks(lk, lkjob, ev, ck);
+   {
+     u64 a = 0, b = 0;
+     for (auto& t : g_tl) {

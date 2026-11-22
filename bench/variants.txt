@@ -1,10 +1,10 @@
-# Bench 18 (chat A), v5 data. tag, binary in /usr/local/bench, then ENV=VALUE settings.
+# Bench 19 (chat A), v5 data. tag, binary in /usr/local/bench, then ENV=VALUE settings.
 # The first build also writes the dev output that the report rows are added to.
-h    ss-h      # 415ae10: hex user-ID table (scored 0.5600)
-f    ss-f      # ff33593: h + assists over a click's days, link hex prefetch
-f2   ss-f      # the same binary once more: the noise between two copies of one build
-p13  ss-p13    # f with up to 2^13 event partitions (2^12 before): smaller dedup partitions
-pop  ss-pop    # f + MADV_POPULATE_READ on each chunk before it is parsed
-r16  ss-r16    # TIMING ONLY, wrong output: f with 16-byte event records (no ts, payload, ingest)
-f4   ss-f SS_THREADS=4    # f on 4 threads
-f16  ss-f SS_THREADS=16   # f on 16 threads
+f     ss-f                      # ff33593 (0.5772; bench 18: same as 415ae10)
+ov    ss-ov                     # f + link lines parsed in the same pool run as the event lines
+ov2   ss-ov                     # the same binary once more: the noise
+ovP2  ss-ov SS_P2ADJ=1          # ov with twice the person partitions
+ovp2  ss-ov SS_P2ADJ=-1         # ov with half the person partitions
+ovp1  ss-ov SS_P1ADJ=-1         # ov with half the event-id partitions
+ovc4  ss-ov SS_CHUNK_KB=4096    # ov with parse chunks of 4 MB (8 MB by default at these sizes)
+ovc16 ss-ov SS_CHUNK_KB=16384   # ... and of 16 MB

@@ -166,3 +166,16 @@ Eight builds, five rounds at 20M and four at 60M, timelines of `h`, `f`, `r16`.
   payload or ingest_ts), to see what halving the event records' memory traffic is worth in parse and dedup
   before building it for real. Its person phase is not comparable (every event at ts 0).
 - `f4`, `f16`: f on 4 and 16 threads.
+
+## Bench 19 (A, branch a-bench18): links overlapped with the event parse, partition and chunk sizes
+
+Rows as in bench 18. Bench 18 found: 415ae10 = ff33593 = itself within 1% (two copies of ff33593: 616 / 618 ms
+at 20M, 2001 / 1986 at 60M); 2^13 event partitions +3% at 60M; MADV_POPULATE_READ nothing; 4 threads +25%,
+16 threads +11%; 16-byte event records (timing only) -18% at 20M and -19% at 60M, of which parse -87 ms and
+dedup -121 ms wall at 60M. At 60M the timeline was links 102 ms, parse to 999, dedup to 1529, output at 1990.
+
+- `f` ff33593; `ov` f with the link lines parsed in the same pool run as the event lines (they do not need H;
+  the click lines, which do, come after the links are finished), `ov2` the same binary (noise).
+  Source: `bench/variants/ff33593-ov.diff` (also adds the knobs below, read from the environment).
+- `ovP2` / `ovp2`: person partitions doubled / halved (`SS_P2ADJ`); `ovp1`: event-id partitions halved.
+- `ovc4` / `ovc16`: parse chunks of 4 / 16 MB.
