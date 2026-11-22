@@ -1864,15 +1864,45 @@ struct SegStat {
   u64 n_persons = 0, n_events = 0, n_general = 0;
 };
 
-// Partitions [pb, pe): a thread's share of the scan. The first dense person met in them is left to the thread
-// that scans the partitions before, which reads on past its own share for the first dense person out there,
-// just as this thread reads on past pe (see the two places below).
+// What a segment leaves for the pass over the segment ends (scan_all runs it once every segment is through).
+// A person whose events lie on both sides of a segment's end is put together there, from the state of the
+// person open at the end of the one segment and the events the next segments kept aside: no thread reads
+// another segment's partitions, and nothing depends on which segment was scanned first.
+struct SegEnd {
+  struct Ev {
+    u32 un, ts, cat, price;
+  };
+  // head: the events of the first dense person met in the segment's partitions, in order (the person is
+  // not the segment's own: it belongs to the end of the segment before, wherever it began)
+  std::vector<Ev> head;
+  u32 head_p = NONE;      // that person; NONE: the segment has no dense person's event at all
+  bool head_open = true;  // no other dense person came after it in the segment (so it may go on after it)
+  // tail: the person open when the segment's partitions were through, as far as it has come
+  bool has_tail = false;  // false: the segment has nothing to do at its end (no dense person in it)
+  bool skipping = false;
+  u32 q_skip = NONE;
+  i64 prev_p = -1;
+  u32 cur_p = NONE, cur_cnt = 0, cur_base = 0, ns = 0, nev = 0, x_next = NONE;
+  i64 prev = 0, order = 0;
+  size_t x_i = 0;
+  std::vector<u32> sess_ts, sess_ev;  // its sessions so far
+  std::vector<DS::Pur> pur;           // ... and its purchases
+};
+
+// Partitions [pb, pe): a thread's share of the scan, segment `seg` of `nseg`. The first dense person met in
+// them is not the segment's own: its events are kept aside (ends[seg].head). The person open after the last
+// partition is not closed here either: its state goes to ends[seg], and scan_segment<true> (after all
+// segments) goes on with it through the events the next segments kept aside, up to the first dense person
+// out there, just as a single scan of all partitions would have. (Two functions, so that the scan of the
+// partitions is compiled as it would be alone.)
 //
 // A person's events arrive in time order, one after the other. Each one costs a few instructions without a
 // branch that depends on the data: it is counted, and it starts a session if it comes more than 30 minutes
 // after the one before. Everything else is done per person once all its events are in: its sessions' days,
 // revenue, credited campaign and assists, and its rows.
-static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegStat& st) {
+template <bool at_ends>
+static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegStat& st, SegEnd* const ends, const u32 seg,
+                         const u32 nseg) {
   TL& tl = g_tl[tid];
   const u32 NC = g_ncamp, ORG = NC;
   const u32 NB = (u32)(((u64)(g_we - g_ws - 1) >> BSHIFT) + 1);
@@ -2230,9 +2260,14 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
       if (q_skip == NONE) {
         q_skip = p;
         prev_p = p;
+        ends[seg].head_p = p;
       }
-      if (p == q_skip) return false;
+      if (p == q_skip) {
+        ends[seg].head.push_back(SegEnd::Ev{un, ts, cat, price});
+        return false;
+      }
       skipping = false;
+      ends[seg].head_open = false;
     }
     close_person();
     open_person(p, cnt, ac);
@@ -2301,7 +2336,7 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
   __m256i k_price = _mm256_set1_epi64x(0x1FFFFLL << 24);
   __asm__("" : "+x"(k_ord), "+x"(k_sh1), "+x"(k_m31), "+x"(k_min30), "+x"(k_price));
   alignas(32) u32 pbuf[16];
-  for (u32 j = pb; j < pe && !g_fail.load(std::memory_order_relaxed); j++) {
+  for (u32 j = pb; !at_ends && j < pe && !g_fail.load(std::memory_order_relaxed); j++) {
     if (!place(j, T, S)) continue;
     DN_VEC();
     for (u32 i = 0; i < ESLOTS; i += 8) {
@@ -2372,39 +2407,69 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
   }
 #undef DN_SLOT
 #undef DN_VEC
-  // ---- past our partitions: the first dense person met there is ours too, whether it is the open person
-  // going on or a new one (the thread that has those partitions leaves it alone, see above). Two cases have
-  // nothing to do: no dense person at all in our partitions (then the first one out there was already the
-  // first one here, and the thread before us has it), and only the one we left to the thread before, if
-  // that one is still going on out there.
-  if (pb == 0 || !skipping || q_skip != NONE) {
+  // ---- the end of the segment. The first dense person met past our partitions is ours too, whether it is
+  // the open person going on or a new one (the segment that has those partitions keeps its events aside, see
+  // above). Two cases have nothing to do: no dense person at all in our partitions (then the first one out
+  // there was already the first one here, and the segment before us has it), and only the one we left to the
+  // segment before, if that one is still going on out there.
+  if (!at_ends) {
+    // the scan of the partitions: what the end needs is left in ends[seg]
+    DN_OUT();
+    SegEnd& E = ends[seg];
+    E.has_tail = pb == 0 || !skipping || q_skip != NONE;
+    E.skipping = skipping;
+    E.q_skip = q_skip;
+    E.prev_p = prev_p;
+    E.cur_p = ps.cur_p;
+    E.cur_cnt = ps.cur_cnt;
+    E.cur_base = ps.cur_base;
+    E.ns = ps.ns;
+    E.nev = ps.nev;
+    E.x_next = ps.x_next;
+    E.prev = ps.prev;
+    E.order = ps.order;
+    E.x_i = ps.x_i;
+    if (ps.cur_p != NONE) {
+      E.sess_ts.assign(sess_ts, sess_ts + ps.ns + 1);
+      E.sess_ev.assign(sess_ev, sess_ev + ps.ns + 1);
+      E.pur = S.pur;
+    }
+    ps.cur_p = NONE;  // (not closed here)
+  } else if (ends[seg].has_tail) {
+    const SegEnd& E = ends[seg];
+    skipping = E.skipping;
+    q_skip = E.q_skip;
+    prev_p = E.prev_p;
+    ps.cur_p = E.cur_p;
+    ps.cur_cnt = E.cur_cnt;
+    ps.cur_base = E.cur_base;
+    ps.ns = E.ns;
+    ps.nev = E.nev;
+    ps.x_next = E.x_next;
+    ps.prev = E.prev;
+    ps.order = E.order;
+    ps.x_i = E.x_i;
+    S.pur.clear();
+    if (ps.cur_p != NONE) {
+      std::copy(E.sess_ts.begin(), E.sess_ts.end(), sess_ts);
+      std::copy(E.sess_ev.begin(), E.sess_ev.end(), sess_ev);
+      S.pur = E.pur;
+      if (__builtin_expect((acc[ps.cur_p].load(std::memory_order_relaxed) & ACC_EXTRA) != 0, 0)) S.xq = g_extra.find(ps.cur_p)->second.ev;
+    }
+    DN_IN();
     bool taken = false;  // the first dense person out there has come
-    for (u32 j = pe; j < g_PE && !g_fail.load(std::memory_order_relaxed); j++) {
-      if (!place(j, T, S)) continue;
-      bool stop = false;
-      for (u32 i = 0; i < ESLOTS; i++) {
-        const u64 w0 = T[i].w0;
-        const u32 tsf = (u32)w0;
-        if ((tsf & 0x7FFFFFFF) == 0) continue;
-        const u32 ts = (tsf & 0x7FFFFFFF) - 1;
-        u32 un = (u32)(w0 >> 32), cat = 0, price = 0;
-        if (__builtin_expect((i32)tsf < 0, 0)) {
-          const XEv& x = g_tl[un >> 24].xev[un & 0xFFFFFF];
-          if (x.num == NONE) continue;
-          un = x.num;
-          cat = x.payload >> 24;
-          price = x.payload & 0xFFFFFF;
-        } else {
-          const u32 pay = (u32)(T[i].w1 >> 24) & 0x3FFFFF;
-          cat = pay >> 17;
-          price = pay & 0x1FFFF;
-        }
+    bool stop = false;
+    for (u32 t = seg + 1; t < nseg && !stop && !g_fail.load(std::memory_order_relaxed); t++) {
+      const SegEnd& H = ends[t];
+      if (H.head_p == NONE) continue;  // (no dense person's event in that segment)
+      for (const SegEnd::Ev& e : H.head) {
+        const u32 un = e.un, ts = e.ts, cat = e.cat, price = e.price;
         if (un - h_base >= h_cnt) {  // not an ID of the open person
           const u32 p = un >> 9;
           if (p == ps.cur_p) continue;  // (an ID of its index that is not one of the dense person)
           const u64 ac = acc[p].load(std::memory_order_relaxed);
           const u32 cnt = dense_cnt(ac);
-          if ((un & 511) >= cnt) continue;  // no dense person's event: the other thread's to hand on
+          if ((un & 511) >= cnt) continue;  // no dense person's event
           if (taken || (skipping && p == q_skip)) {  // the person after ours / the one we left is still going on
             stop = true;
             break;
@@ -2422,11 +2487,10 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
         }
         DN_FEED(h_ns, h_nev, h_prev, h_order, ts, cat, price);
       }
-      memset(T, 0, sizeof(D16) * ESLOTS);
-      if (stop) break;
+      if (!H.head_open) break;  // another dense person follows in that segment: ours ends before it
     }
+    DN_OUT();
   }
-  DN_OUT();
 #undef DN_OUT
 #undef DN_IN
 #undef DN_FEED
@@ -2481,9 +2545,14 @@ static void scan_all() {
     g_tl[t].c_assist.assign((size_t)(NC + 1) * ND, 0);
   });
   std::vector<DS> scr(NT);
-  std::vector<SegStat> st(nseg);
+  std::vector<SegStat> st(nseg), st_ends(nseg);
+  std::vector<SegEnd> ends(nseg);
   parallel_for((int)nseg, [&](int s, int tid) {
-    if (sb[s] < sb[s + 1]) scan_segment(sb[s], sb[s + 1], tid, scr[tid], st[s]);
+    if (sb[s] < sb[s + 1]) scan_segment<false>(sb[s], sb[s + 1], tid, scr[tid], st[s], ends.data(), (u32)s, nseg);
+  });
+  // the ends of the segments: the persons that the segments left open
+  parallel_for((int)nseg, [&](int s, int tid) {
+    if (ends[s].has_tail) scan_segment<true>(sb[s], sb[s + 1], tid, scr[tid], st_ends[s], ends.data(), (u32)s, nseg);
   });
   // the campaigns' lines of days -> the tables by day and campaign that the general phase and the output use
   parallel_for(NT, [&](int t, int) {
@@ -2520,6 +2589,11 @@ static void scan_all() {
   });
   u64 np = 0, ne = 0, ng = 0;
   for (auto& s : st) {
+    np += s.n_persons;
+    ne += s.n_events;
+    ng += s.n_general;
+  }
+  for (auto& s : st_ends) {
     np += s.n_persons;
     ne += s.n_events;
     ng += s.n_general;
