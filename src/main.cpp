@@ -540,11 +540,22 @@ struct IdEntry {
 static IdEntry** id_slots;
 static size_t id_mask;
 
+static constexpr u64 HEX_ID = 1ULL << 53;
+struct alignas(16) HexSlot {
+  u64 a, b;
+};
+static HexSlot* hex_slots;
+static size_t hex_mask;
+static u32 hex_shift = 63;
+
 static void init_ids(size_t bytes) {
   const u64 wanted = std::min<u64>(1ULL << 27, std::max<u64>(8192, bytes / 256));
   const size_t count = size_t{1} << ceil_log2(wanted);
   id_slots = static_cast<IdEntry**>(vm_alloc(count * sizeof(*id_slots)));
   id_mask = count - 1;
+  hex_slots = static_cast<HexSlot*>(vm_alloc(count * sizeof(HexSlot)));
+  hex_mask = count - 1;
+  hex_shift = 64 - ceil_log2(count);
 }
 
 static u32 id_hash(const u8* s, u32 n) {
@@ -579,7 +590,63 @@ static inline bool matches_id(const IdEntry* entry, const u8* s, u32 n) {
   return memcmp(entry->bytes(), s, n) == 0;
 }
 
+// User IDs of the form 'u' + 32 lowercase hex digits (1 in 8 of the user IDs): the 16 bytes they spell sit in a
+// table of their own, so a lookup compares inside the slot (no entry to follow), and the batch loops prefetch the
+// slot a batch ahead. Key: HEX_ID | slot. A slot is written once, by a 16-byte compare-and-swap, and holds a
+// value that is never all zero (such an ID takes the general path). A string whose 48 slots from its home are
+// all taken by others can never get into the table later either, so it goes to the general path every time.
+
+// The 32 bytes at p as 16 bytes (two hex digits each, the first one high); false unless all are 0-9 or a-f.
+static FORCE_INLINE bool hex32(const u8* p, __m128i& out) {
+  const __m256i v = _mm256_loadu_si256((const __m256i*)p);
+  const __m256i d = _mm256_sub_epi8(v, _mm256_set1_epi8('0'));
+  const __m256i l = _mm256_sub_epi8(v, _mm256_set1_epi8('a'));
+  const __m256i isd = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
+  const __m256i isl = _mm256_cmpeq_epi8(_mm256_min_epu8(l, _mm256_set1_epi8(5)), l);
+  if ((u32)_mm256_movemask_epi8(_mm256_or_si256(isd, isl)) != 0xFFFFFFFFu) return false;
+  const __m256i nib = _mm256_blendv_epi8(_mm256_add_epi8(l, _mm256_set1_epi8(10)), d, isd);
+  const __m256i w = _mm256_maddubs_epi16(nib, _mm256_set1_epi16(0x0110));
+  out = _mm_packus_epi16(_mm256_castsi256_si128(w), _mm256_extracti128_si256(w, 1));
+  return !_mm_testz_si128(out, out);
+}
+static FORCE_INLINE size_t hex_home(__m128i v) {
+  const u64 a = (u64)_mm_cvtsi128_si64(v), b = (u64)_mm_extract_epi64(v, 1);
+  return (size_t)(((a ^ (b * 0x9E3779B97F4A7C15ULL)) * 0xD6E8FEB86659FD93ULL) >> hex_shift);
+}
+static FORCE_INLINE void hex_prefetch(__m128i v) { _mm_prefetch((const char*)&hex_slots[hex_home(v)], _MM_HINT_T0); }
+
+static NOINLINE u64 intern_general(const u8* s, u32 n);
+
+// The key of the 33-byte user ID s whose hex part is v (as hex32 gives it).
+static NOINLINE u64 hex_key(__m128i v, const u8* s) {
+  size_t slot = hex_home(v);
+  for (unsigned probe = 0; probe < 48; ++probe, slot = (slot + 1) & hex_mask) {
+    const __m128i cur = _mm_load_si128((const __m128i*)&hex_slots[slot]);  // (16-byte aligned: one load)
+    if (_mm_movemask_epi8(_mm_cmpeq_epi8(cur, v)) == 0xFFFF) return HEX_ID | slot;
+    if (_mm_testz_si128(cur, cur)) {
+      unsigned __int128 exp = 0, des;
+      memcpy(&des, &v, 16);
+      if (__atomic_compare_exchange_n((unsigned __int128*)&hex_slots[slot], &exp, des, false, __ATOMIC_ACQ_REL,
+                                      __ATOMIC_ACQUIRE))
+        return HEX_ID | slot;
+      if (exp == des) return HEX_ID | slot;  // another thread has just put the same ID here
+    }
+  }
+  return intern_general(s, 33);
+}
+
+// The key of a long user ID, a batch ahead: true (and v) if it takes the hex table.
+static FORCE_INLINE bool hex_user(const u8* s, u32 n, __m128i& v) {
+  return n == 33 && s[0] == 'u' && hex_slots && hex32(s + 1, v);
+}
+
 static NOINLINE u64 intern_id(const u8* s, u32 n) {
+  __m128i v;
+  if (hex_user(s, n, v)) return hex_key(v, s);
+  return intern_general(s, n);
+}
+
+static NOINLINE u64 intern_general(const u8* s, u32 n) {
   if (id_slots) {
     size_t slot = id_hash(s, n) & id_mask;
     IdEntry* copy = nullptr;
@@ -615,7 +682,7 @@ static inline u32 fast_key_bytes(u64 k, u8* out) {
   return w ? 9 - ((u32)__builtin_clzll(w) >> 3) : 1;
 }
 
-static std::string_view id_view(u64 k, u8* fast, std::string& overflow) {
+static std::string_view id_view(u64 k, u8* fast /* 40 bytes */, std::string& overflow) {
   if (!is_slow(k)) {
     const u32 n = fast_key_bytes(k, fast);
     return {reinterpret_cast<const char*>(fast), n};
@@ -628,13 +695,23 @@ static std::string_view id_view(u64 k, u8* fast, std::string& overflow) {
     overflow = g_overflow.strs[(k ^ OVERFLOW_ID) - 1];
     return overflow;
   }
+  if (k & HEX_ID) {  // (fast has room for 33 bytes)
+    static const char HX[] = "0123456789abcdef";
+    const u8* v = (const u8*)&hex_slots[k ^ HEX_ID];
+    fast[0] = 'u';
+    for (int i = 0; i < 16; i++) {
+      fast[1 + 2 * i] = (u8)HX[v[i] >> 4];
+      fast[2 + 2 * i] = (u8)HX[v[i] & 15];
+    }
+    return {reinterpret_cast<const char*>(fast), 33};
+  }
   const IdEntry* e = __atomic_load_n(&id_slots[k - 1], __ATOMIC_ACQUIRE);
   return {e->bytes(), e->size};
 }
 
 static inline int key_cmp(u64 a, u64 b) {
   if (!is_slow(a) && !is_slow(b)) return a < b ? -1 : (a > b ? 1 : 0);
-  u8 ba[9], bb[9];
+  u8 ba[40], bb[40];
   std::string oa, ob;
   return id_view(a, ba, oa).compare(id_view(b, bb, ob));
 }
@@ -2933,7 +3010,7 @@ static void person_phase(bool keep_stats = false) {
           memcpy(ip, kb, 16);
           out.ids.cur = ip + 4 + klen;
         } else {
-          u8 fast[9];
+          u8 fast[40];
           std::string overflow;
           const std::string_view name = id_view(pkey, fast, overflow);
           const u32 klen = (u32)name.size();
@@ -3033,6 +3110,15 @@ static NOINLINE u32 emit_event_columns(dn::EvB& b, const u8* base, WCScatter<R1>
   u32 kept = 0;
   alignas(32) R1 records[dn::EvB::CAP];
   u32 part[dn::EvB::CAP + SS_PFD + 1];
+  // the hex user IDs of the batch: their slots are fetched before the first of them is looked up
+  __m128i hv[dn::EvB::CAP];
+  u64 hexm = 0;
+  for (u32 i = 0; i < n; ++i) {
+    if (b.ln[1][i] == 33 && hex_user(base + b.st[1][i], 33, hv[i])) {
+      hexm |= 1ULL << i;
+      hex_prefetch(hv[i]);
+    }
+  }
   for (u32 i = 0; i < n; ++i) {
     const u32 elen = b.ln[0][i];
     if (!elen) continue;
@@ -3053,7 +3139,7 @@ static NOINLINE u32 emit_event_columns(dn::EvB& b, const u8* base, WCScatter<R1>
     const i64 ts = b.ts[i];
     const u64 rel = static_cast<u64>(ts) - static_cast<u64>(ws);
     const u32 ulen = b.ln[1][i];
-    r.uid = ulen ? hash_id(make_key(base + b.st[1][i], ulen)) : 0;
+    r.uid = ulen ? hash_id(((hexm >> i) & 1) ? hex_key(hv[i], base + b.st[1][i]) : make_key(base + b.st[1][i], ulen)) : 0;
     bool valid = rel < span && r.ingest <= ts + DAY && ulen && b.ln[5][i];
     r.payload = 0;
     const u8* type = base + b.st[4][i];
@@ -3104,6 +3190,14 @@ static NOINLINE u32 emit_click_columns(dn::CkB& b, const u8* base, RT& router, i
   const u32 n = b.n;
   dn::ck_ts_rows(b, base, n, batch_mask(n));
   u32 count = 0;
+  __m128i hv[dn::CkB::CAP];
+  u64 hexm = 0;
+  for (u32 i = 0; i < n; ++i) {
+    if (b.ln[1][i] == 33 && hex_user(base + b.st[1][i], 33, hv[i])) {
+      hexm |= 1ULL << i;
+      hex_prefetch(hv[i]);
+    }
+  }
   auto feed = router.feed();
   for (u32 i = 0; i < n; ++i) {
     const u32 idlen = b.ln[0][i], ulen = b.ln[1][i];
@@ -3114,7 +3208,7 @@ static NOINLINE u32 emit_click_columns(dn::CkB& b, const u8* base, RT& router, i
     const i32 camp = camp_fast(base + b.st[2][i], b.ln[2][i]);
     if (camp < 0) continue;
     const u64 id = click_key(base + b.st[0][i], idlen);
-    const u64 uid = hash_id(make_key(base + b.st[1][i], ulen));
+    const u64 uid = hash_id(((hexm >> i) & 1) ? hex_key(hv[i], base + b.st[1][i]) : make_key(base + b.st[1][i], ulen));
     feed.add_if(uid, u64x2{id, rel | (u64{static_cast<u32>(camp)} << 32)}, 1);
   }
   router.close(feed);
