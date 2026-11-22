@@ -1,6 +1,11 @@
-# Bench 9 (B, branch b-probe): where the cycles go, and the floors. tag, binary in /usr/local/bench, ENV=VALUE.
+# Bench 10 (B, branch b-bench10): the scatter. tag, binary in /usr/local/bench, ENV=VALUE.
 # The first build also writes the dev output that the report rows are added to.
-v    ss-cf4f788-clang18-pgo     # v4 cf4f788 as its Dockerfile (clang 18.1.3 + its profile): scored 0.38 at 17:48
-b    ss-d720cb5-clang18-pgo     # b-v4n d720cb5 as its Dockerfile: cf4f788 + B's place() commit
-s    ss-d720cb5-stg             # d720cb5 with -DSTAGES (rdtsc stage counters, perf counters) and a profile of its own
-f    ss-d720cb5-stg SS_SOL=1    # the same build in speed-of-light mode: floors only, then exit without output
+v    ss-8384d32-clang18-pgo     # v4 8384d32 as its Dockerfile (sha256 eb129ec6...): scored 0.38
+p4   ss-pf4-clang18-pgo         # b-pf 0e5c528 with -DSS_PFD=4: staging lines prefetched 4 records ahead; own profile
+p8   ss-pf8-clang18-pgo         # the same, 8 records ahead
+p16  ss-pf16-clang18-pgo        # the same, 16 records ahead
+z    ss-pz-clang18-pgo          # b-pf 0e5c528 with -DSS_PREFAULT=1: each thread's arena faulted in when mapped
+zp   ss-pzp8-clang18-pgo        # z with -DSS_PFD=8 as well
+s    ss-pfs-stg                 # b-pfs 8847acc (b-pf 43899be + stage counters) with -DSTAGES; own profile
+ps   ss-pfs-stg-pf8             # s with -DSS_PFD=8
+f    ss-pfs-stg SS_SOL=1        # s in floor mode: bench 9's floors, writing the arena, the scatter alone

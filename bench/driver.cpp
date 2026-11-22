@@ -473,8 +473,34 @@ int main() {
   const double tmax = atof(env_or("BENCH_TMAX", "150").c_str());
   const std::string seed = env_or("BENCH_SEED", "20261122");
   tl_tag = env_or("BENCH_TIMELINE", "");  // the build whose phase timeline the report gives
-  const std::string stg_tag = env_or("BENCH_STAGES", ""), sol_tag = env_or("BENCH_SOL", "");  // probe builds (bench 9)
-  std::vector<Row> srows;  // their rows, one per size
+  // probe builds (bench 9, several since bench 10): BENCH_STAGES lists the builds with stage counters, whose lines
+  // are printed in short form (the values of BENCH_STAGES_KEYS, in that order, joined by '/'), except that the
+  // one BENCH_STAGES_FULL names ("tag@60": build tag at the 60M size) also gets its whole line; BENCH_SOL is the
+  // floor build
+  std::vector<std::string> stg_tags;
+  {
+    const std::string l = env_or("BENCH_STAGES", "");
+    size_t a = 0;
+    while (a < l.size()) {
+      size_t z = l.find(',', a);
+      if (z == std::string::npos) z = l.size();
+      if (z > a) stg_tags.push_back(l.substr(a, z - a));
+      a = z + 1;
+    }
+  }
+  std::vector<std::string> stg_keys;
+  {
+    const std::string l = env_or("BENCH_STAGES_KEYS", "e1,e2,pe,sc,pu,c1,pc,csc,te,tc,seg,clo,busy,wall");
+    size_t a = 0;
+    while (a < l.size()) {
+      size_t z = l.find(',', a);
+      if (z == std::string::npos) z = l.size();
+      if (z > a) stg_keys.push_back(l.substr(a, z - a));
+      a = z + 1;
+    }
+  }
+  const std::string stg_full = env_or("BENCH_STAGES_FULL", ""), sol_tag = env_or("BENCH_SOL", "");
+  std::vector<Row> srows, srows2, srows3;  // their rows: floors, short stage lines, whole stage lines
   g_day = day_of(slurp(data + "/manifest.json"));
   std::vector<Variant> vs = load_variants(dir);
   std::string notes;
@@ -666,16 +692,40 @@ int main() {
         }
         return nullptr;
       };
-      const Run* rs = stg_tag.empty() ? nullptr : median_run(stg_tag);
       const Run* rf = sol_tag.empty() ? nullptr : median_run(sol_tag);
-      if (rs || rf)
-        srows.push_back(Row{fmt("!s%d %.0fM %s", sizeno, z.ev_m, rs && !rs->stg.empty() ? rs->stg.c_str() : "no-STAGES"),
-                            fmt("PERF %s | SOL %s", rs && !rs->pf.empty() ? rs->pf.c_str() : "-",
-                                rf && !rf->sol.empty() ? rf->sol.c_str() : "-"),
-                            0, 0, 0});
+      if (rf) {
+        std::string l = rf->sol.empty() ? "no-SOL" : rf->sol;
+        const size_t q = l.find(" bytes=");
+        if (q != std::string::npos) l.resize(q);
+        srows.push_back(Row{fmt("!f%d %.0fM %s", sizeno, z.ev_m, l.c_str()), "-", 0, 0, 0});
+      }
+      // the value of key k in a STAGES line ("... k=v ...")
+      auto val = [](const std::string& l, const std::string& k) -> std::string {
+        const std::string kk = " " + k + "=";
+        size_t q = (" " + l).find(kk);
+        if (q == std::string::npos) return "?";
+        q += kk.size() - 1;
+        size_t z = l.find(' ', q);
+        return l.substr(q, (z == std::string::npos ? l.size() : z) - q);
+      };
+      std::string sh;
+      for (auto& tg : stg_tags) {
+        const Run* rs = median_run(tg);
+        sh += " " + tg + ":";
+        if (!rs || rs->stg.empty()) {
+          sh += "none";
+          continue;
+        }
+        for (size_t k = 0; k < stg_keys.size(); k++) sh += (k ? "/" : "") + val(rs->stg, stg_keys[k]);
+        if (stg_full == fmt("%s@%.0f", tg.c_str(), z.ev_m))
+          srows3.push_back(Row{fmt("!S%d %.0fM %s %s", sizeno, z.ev_m, tg.c_str(), rs->stg.c_str()), "-", 0, 0, 0});
+      }
+      if (!stg_tags.empty()) srows2.push_back(Row{fmt("!s%d %.0fM%s", sizeno, z.ev_m, sh.c_str()), "-", 0, 0, 0});
     }
   }
   for (auto& r : srows) rows.push_back(r);
+  for (auto& r : srows2) rows.push_back(r);
+  for (auto& r : srows3) rows.push_back(r);
   rows.push_back(Row{fmt("!%d %s%s tot=%.0fs", sizeno + 1, env_s.c_str(), notes.c_str(), el()), gen_s.empty() ? "-" : gen_s.substr(1),
                      (long long)dev_ms, ncpu, (long long)el()});
   if (!write_report(out, rows)) fprintf(stderr, "bench: report not written\n");
