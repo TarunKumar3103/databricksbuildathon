@@ -1,4 +1,4 @@
-# Bench 13 (B, branch b-bench13): the record-path fixes on v4 6d5b17b, the floors, the memory nodes.
+# Bench 15 (B, branch b-bench15): the record-path fixes on v4 6d5b17b, the floors, the memory nodes.
 # tag, binary in /usr/local/bench, ENV=VALUE. The first build also writes the dev output that the report rows are added to.
 n    ss-6d5b17b-clang18-pgo     # v4 6d5b17b as its Dockerfile: scored 0.364
 nt   ss-6d5b17b-clang18-pgo GLIBC_TUNABLES=glibc.malloc.top_pad=67108864   # n with malloc's heaps grown 64 MB at a time

@@ -796,7 +796,7 @@ int main() {
       if (!stg_tags.empty()) srows2.push_back(Row{fmt("!s%d %.0fM%s", sizeno, z.ev_m, sh.c_str()), "-", 0, 0, 0});
     }
   }
-  // (bench 13) The rejection message lists the rows sorted by user_id and stops after about 2,300 characters,
+  // (bench 15) The rejection message lists the rows sorted by user_id and stops after about 2,300 characters,
   // so the rows are numbered !0, !1, ... in the order they matter: the timings, largest size first, then the
   // memory nodes, the floors, the stage values, the whole stage line, the machine.
   {

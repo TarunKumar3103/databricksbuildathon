@@ -137,7 +137,7 @@ Rows, after `!1 20M` and `!2 60M` as before:
 
 The PERF lines are left out (bench 9: perf events are refused, EPERM).
 
-## Bench 13 (B, branch b-bench13): the record-path fixes on v4 6d5b17b, the floors, the memory nodes
+## Bench 15 (B, branch b-bench15): the record-path fixes on v4 6d5b17b, the floors, the memory nodes
 
 Bench 12's prefetch rows and its malloc row were each worth about 1.4% at 60M on v4 8384d32; this one puts
 them on the new head. Six builds: `n` (v4 6d5b17b as its Dockerfile, scored 0.364), `nt` (n's binary with
