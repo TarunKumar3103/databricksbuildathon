@@ -1537,9 +1537,35 @@ struct XClk {  // valid click whose click_id or user_id is not regular
   u32 num;  // user number, or 0xFFFFFFFF
 };
 
+// ---- the PQ route (event records split in two, 16 bytes each; see dedup_q)
+// P: an R2 record, written at parse time for every valid event line, to the person's partition. Its locator
+// is (thread, person partition, index of the record in that thread's stream of that partition).
+// Q: per event line with an event_id, partitioned by event_id: what dedup needs (the event_id, the ingest_ts
+// as whole seconds since dn::g_ing_base + 1, and the locator of its P record, or none for a line that is not
+// a valid event). Q16 for the regular partitions: w0 = event-id hash << P1bits | person partition (the top
+// P1bits of the hash are the partition); w1 = ingest code << 32 | thread << 27 | index (0xFFFFFFFF: no P).
+// Q32 for the 33-byte event ids, compared in the mapped files (event_base): eid as in R1, w1 as in Q16, p2.
+// K: a P record that loses its dedup: thread << 27 | index, in the person partition's stream.
+struct Q16 {
+  u64 w0, w1;
+};
+struct Q32 {
+  u64 eid, w1, p2, pad;
+};
+struct K16 {
+  u64 loc, pad;
+};
+static constexpr u32 PQ_NOLOC = 0xFFFFFFFFu, PQ_KBITS = 27;
+static bool g_pq = false;               // the PQ route is on
+static std::atomic<bool> g_pq_fail{false};  // something did not fit its field: the run starts over without PQ
+
 struct TL {
   Arena arena;
   WCScatter<R1> r1;
+  WCScatter<Q16> q;
+  WCScatter<Q32> qv;
+  WCScatter<K16> kill;
+  std::vector<u32> pk;  // P records so far per person partition
   WCScatter<R2> r2;
   WCScatter<R2C> r2c;
   WCScatter<D16> ev;
@@ -2285,6 +2311,8 @@ static void drop_inputs(const std::vector<MFile>& files) {
 static u64 column_events(const u8*, const u8*, bool, TL&, u32, i64, i64);
 static u64 column_clicks(const u8*, const u8*, bool, TL&, i64, i64);
 static bool use_column_times();
+static u64 column_events_pq(const u8*, const u8*, bool, TL&, u32, i64, i64);
+static void dedup_q();
 
 static void parse_events_clicks(std::vector<MFile>& ev, std::vector<MFile>& ck) {
   size_t ev_bytes = 0, ck_bytes = 0;
@@ -2296,7 +2324,7 @@ static void parse_events_clicks(std::vector<MFile>& ev, std::vector<MFile>& ck) 
   make_chunks(ck, std::max<size_t>(1 << 18, std::min(chunk, ck_bytes / (NT * 32 + 1))), cc);
   const u32 p1shift = 64 - g_P1bits;
   const i64 ws = g_ws, we = g_we, cws = g_ws - WEEK;
-  const auto event_parser = use_column_times() ? column_events : parse_event_chunk;
+  const auto event_parser = g_pq ? column_events_pq : use_column_times() ? column_events : parse_event_chunk;
   const auto click_parser = use_column_times() ? column_clicks : parse_click_chunk;
   parallel_for((int)(ce.size() + cc.size()), [&](int t, int tid) {
     TL& tl = g_tl[tid];
@@ -2316,7 +2344,15 @@ static void parse_events_clicks(std::vector<MFile>& ev, std::vector<MFile>& ck) 
 
     }
   });
-  parallel_for(NT, [&](int t, int) { g_tl[t].r1.finish(g_tl[t].arena); });
+  parallel_for(NT, [&](int t, int) {
+    TL& tl = g_tl[t];
+    if (g_pq) {
+      tl.q.finish(tl.arena);
+      tl.qv.finish(tl.arena);
+    } else {
+      tl.r1.finish(tl.arena);
+    }
+  });
 }
 
 // ------------------------------------------------------------------------------------------
@@ -2664,6 +2700,8 @@ static void person_phase(bool keep_stats = false) {
     std::vector<XRec> X;
     std::vector<u64> E;
     std::vector<std::pair<const R2*, u32>> blk;  // the partition's blocks of events
+    std::vector<u32> blkt;                     // ... the thread of each
+    std::vector<u32> kills;
     std::vector<u32> Cts, Ccamp;  // clicks grouped by person, in any order
     std::vector<u64> Cclick;
     std::vector<u32> tin, sts, scamp;  // one person's clicks in time order
@@ -2723,9 +2761,22 @@ static void person_phase(bool keep_stats = false) {
       S.E.resize(n_e);
     }
     S.blk.clear();
+    S.blkt.clear();
     for (int t = 0; t < NT; t++)
       for (auto& b : g_tl[t].r2.blocks[p])
-        if (b.second) S.blk.push_back({b.first, b.second});
+        if (b.second) {
+          S.blk.push_back({b.first, b.second});
+          S.blkt.push_back((u32)t);
+        }
+    // PQ: the P records of this partition that lost their dedup, as thread << 27 | index, in order
+    S.kills.clear();
+    if (g_pq) {
+      for (int t = 0; t < NT; t++)
+        for (auto& b : g_tl[t].kill.blocks[p])
+          for (u32 j = 0; j < b.second; j++) S.kills.push_back((u32)b.first[j].loc);
+      std::sort(S.kills.begin(), S.kills.end());
+    }
+    S.kills.push_back(0xFFFFFFFFu);  // (a sentinel no record has)
     const size_t nblk = S.blk.size();
     S.blk.push_back(S.blk[0]);  // (something harmless to prefetch after the last block)
     XRec* X = S.X.data();
@@ -2738,7 +2789,14 @@ static void person_phase(bool keep_stats = false) {
       u32* cntL = S.cntL.data();
       u32 np = 0;
       size_t k = 0;
+      const u32* kp = S.kills.data();
+      const bool pq = g_pq;
+      u32 kt = 0xFFFFFFFFu, kidx = 0;  // the thread of the blocks being read, and the index of the next record
       for (size_t bi = 0; bi < nblk; bi++) {
+        if (S.blkt[bi] != kt) {
+          kt = S.blkt[bi];
+          kidx = kt << PQ_KBITS;
+        }
         const char* const nx = (const char*)S.blk[bi + 1].first;  // (see the same step in dedup_and_route)
         _mm_prefetch(nx, _MM_HINT_T0);
         _mm_prefetch(nx + 64, _MM_HINT_T0);
@@ -2747,6 +2805,10 @@ static void person_phase(bool keep_stats = false) {
         const R2* r = S.blk[bi].first;
         const u32 cnt = S.blk[bi].second;
         for (u32 j = 0; j < cnt; j++) {
+          if (__builtin_expect(pq && kidx++ == *kp, 0)) {  // (PQ) a copy that lost its dedup
+            kp++;
+            continue;
+          }
           const u64 h = r[j].h;
           u64 i = (h << P2bits) >> sh;
           u32 lid;
@@ -2777,6 +2839,7 @@ static void person_phase(bool keep_stats = false) {
           cntL[lid]++;
         }
       }
+      n_e = k;  // (PQ: without the killed copies)
     }
     const u32 np = (u32)S.hs.size();
     const u64 mask = tsz - 1;
@@ -3198,6 +3261,255 @@ static u64 column_events(const u8* begin, const u8* end, bool header, TL& tl, u3
   tl.r1.close(cur);
   tl.r1.flush(tl.arena);
   return rows;
+}
+
+
+// ---- PQ parse: each kept event line gives a Q record; a valid one also a P record, through the person lookup.
+struct PQItem {
+  u64 tsp;   // ts | payload << 32
+  u64 eid;   // as in R1
+  u32 ing;   // ingest code
+  u32 part;  // Q partition (>= 2^P1bits: a Q32 partition)
+};
+static FORCE_INLINE u32 pq_ing_code(i64 ic) {
+  if (ic == dn::ICODE_NONE) return 0xFFFFFFFFu;
+  if (__builtin_expect(ic < 0 || ic >= 0xFFFFFFFFLL, 0)) {
+    g_pq_fail.store(true, std::memory_order_relaxed);
+    return 0xFFFFFFFFu;
+  }
+  return (u32)ic;
+}
+struct PQOut {
+  WCScatter<Q16>::Cursor q;
+  WCScatter<Q32>::Cursor qv;
+  u32 P1, P1bits;
+  FORCE_INLINE void push(const PQItem& it, u32 p2, u32 lo) {
+    const u64 w1 = ((u64)it.ing << 32) | lo;
+    if (__builtin_expect(it.part < P1, 1))
+      WCScatter<Q16>::push16(q, it.part, _mm_set_epi64x((long long)w1, (long long)((it.eid << P1bits) | p2)));
+    else
+      WCScatter<Q32>::push32(qv, it.part - P1, _mm256_set_epi64x(0, (long long)p2, (long long)w1, (long long)it.eid));
+  }
+};
+
+template <class RT>
+static NOINLINE u32 emit_event_columns_pq(dn::EvB& b, const u8* base, RT& router, PQOut& qo, u32 p1shift, i64 ws,
+                                          i64 we) {
+  const u32 n = b.n;
+  dn::ev_ts_rows(b, base, n, batch_mask(n));
+  const u64 span = static_cast<u64>(we - ws);
+  u32 kept = 0;
+  __m128i hv[dn::EvB::CAP];
+  u64 hexm = 0;
+  for (u32 i = 0; i < n; ++i) {
+    if (b.ln[1][i] == 33 && hex_user(base + b.st[1][i], 33, hv[i])) {
+      hexm |= 1ULL << i;
+      hex_prefetch(hv[i]);
+    }
+  }
+  auto feed = router.feed();
+  for (u32 i = 0; i < n; ++i) {
+    const u32 elen = b.ln[0][i];
+    if (!elen) continue;
+    ++kept;
+    const u8* id = base + b.st[0][i];
+    PQItem it;
+    if (elen == 33 && event_offset_mask) {
+      const u64 hash = hash_id(id_hash(id, 33));
+      it.eid = (hash & ~event_offset_mask) | (reinterpret_cast<uintptr_t>(id) - event_base);
+      it.part = qo.P1 + (u32)(hash >> (p1shift + 2));
+    } else {
+      it.eid = hash_id(make_key(id, elen));
+      it.part = (u32)(it.eid >> p1shift);
+    }
+    const i64 ic = b.icode[i];
+    it.ing = pq_ing_code(ic);
+    const i64 ingest = ic == dn::ICODE_NONE ? ING_NONE : dn::g_ing_base + (ic - 1) * 1000;
+    const i64 ts = b.ts[i];
+    const u64 rel = static_cast<u64>(ts) - static_cast<u64>(ws);
+    const u32 ulen = b.ln[1][i];
+    bool valid = rel < span && ingest <= ts + DAY && ulen && b.ln[5][i];
+    u32 payload = 0;
+    const u8* type = base + b.st[4][i];
+    const u32 len = b.ln[4][i];
+    u32 first;
+    memcpy(&first, type, 4);
+    if (!(len == 4 && (first == 0x77656976u || first == 0x74726163u))) {
+      u32 price;
+      if (valid && len == 8 && memcmp(type, "purchase", 8) == 0 && price_fast(base + b.st[6][i], b.ln[6][i], price))
+        payload = (cat_fast(base + b.st[5][i], b.ln[5][i]) << 24) | price;
+      else
+        valid = false;
+    }
+    if (valid) {
+      it.tsp = (u64)(u32)rel | ((u64)payload << 32);
+      const u8* us = base + b.st[1][i];
+      const u64 uid = hash_id(((hexm >> i) & 1) ? hex_key(hv[i], us) : make_key(us, ulen));
+      feed.add_if(uid, it, 1);
+    } else {
+      qo.push(it, 0, PQ_NOLOC);
+    }
+  }
+  router.close(feed);
+  return kept;
+}
+
+static u64 column_events_pq(const u8* begin, const u8* end, bool header, TL& tl, u32 shift, i64 ws, i64 we) {
+  dn::EvB b;
+  const u32 p2shift = 64 - g_P2bits;
+  const u32 tid = (u32)(&tl - g_tl.data());
+  auto cur = tl.r2.cursor(tl.arena);
+  PQOut qo{tl.q.cursor(tl.arena), tl.qv.cursor(tl.arena), 1u << g_P1bits, g_P1bits};
+  u32* const pk = tl.pk.data();
+  auto emit = [&qo, pk, p2shift, tid](WCScatter<R2>::Cursor& c, u64 ph, const PQItem& it) __attribute__((always_inline)) {
+    const u32 p2 = (u32)(ph >> p2shift);
+    const u32 k = pk[p2]++;
+    if (__builtin_expect(k >= (1u << PQ_KBITS), 0)) g_pq_fail.store(true, std::memory_order_relaxed);
+    WCScatter<R2>::push16(c, p2, _mm_set_epi64x((long long)it.tsp, (long long)ph));
+    qo.push(it, p2, (tid << PQ_KBITS) | (k & ((1u << PQ_KBITS) - 1)));
+  };
+  Router<PQItem, R2, decltype(emit)> router(cur, emit);
+  const auto rows = scan_batches<7>(begin, end, header, b, [&](const u8* base) {
+    return emit_event_columns_pq(b, base, router, qo, shift, ws, we);
+  });
+  router.run();
+  tl.r2.close(cur);
+  tl.r2.flush(tl.arena);
+  tl.q.close(qo.q);
+  tl.q.flush(tl.arena);
+  tl.qv.close(qo.qv);
+  tl.qv.flush(tl.arena);
+  return rows;
+}
+
+
+// ---- PQ dedup: per Q partition, find the event ids with more than one copy; every copy with a P record that
+// is not its event's kept copy (the first with the smallest ingest_ts) gets a K record in its person partition.
+// The way to the candidates is as in dedup_and_route: a bit map with 8+ bits per record, then an exact table
+// of the IDs whose bit was already set.
+static void dedup_q() {
+  const u32 P1 = 1u << g_P1bits, PV = P1 / 4, NP = P1 + PV;
+  std::vector<size_t> sizes(NP, 0);
+  for (u32 p = 0; p < NP; p++)
+    for (int t = 0; t < NT; t++) sizes[p] += p < P1 ? g_tl[t].q.size(p) : g_tl[t].qv.size(p - P1);
+  std::vector<int> order(NP);
+  for (u32 p = 0; p < NP; p++) order[p] = (int)p;
+  std::sort(order.begin(), order.end(), [&](int a, int b) { return sizes[a] > sizes[b]; });
+  struct Scratch {
+    std::vector<u64> seen, cand;
+    std::vector<std::pair<u64, const void*>> tab;  // (key, best record)
+    std::vector<std::pair<const void*, u32>> blk;
+  };
+  std::vector<Scratch> scr(NT);
+  const u32 P1bits = g_P1bits;
+  auto process = [&](int oi, int tid, auto view_t) {
+    constexpr bool VIEW = decltype(view_t)::value;
+    using QR = typename std::conditional<VIEW, Q32, Q16>::type;
+    const int p = order[oi];
+    const size_t n = sizes[p];
+    if (n < 2) return;
+    TL& tl = g_tl[tid];
+    Scratch& S = scr[tid];
+    // the bits of a record's id below its partition's, and its key in the exact table (never 0)
+    const u32 sh = VIEW ? P1bits - 2 : 0;
+    auto top = [sh](const QR& r) -> u64 {
+      if constexpr (VIEW) return (r.eid & ~event_offset_mask) << sh;
+      else return r.w0;
+    };
+    auto key = [P1bits](const QR& r) -> u64 {
+      if constexpr (VIEW) return r.eid;
+      else return (r.w0 >> P1bits) | (1ULL << 63);
+    };
+    auto same = [](u64 a, u64 b) -> bool {
+      if constexpr (VIEW) return same_event_view(a, b);
+      else return a == b;
+    };
+    const u32 mbits = std::max<u32>(12, ceil_log2(n * 8));
+    const size_t words = (size_t)1 << (mbits - 6);
+    if (S.seen.size() < words) {
+      S.seen.resize(words);
+      S.cand.resize(words);
+    }
+    u64* seen = S.seen.data();
+    u64* cand = S.cand.data();
+    memset(seen, 0, words * 8);
+    memset(cand, 0, words * 8);
+    size_t nids = 0;
+    const u32 ishift = 64 - mbits;
+    S.blk.clear();
+    for (int t = 0; t < NT; t++) {
+      if constexpr (VIEW) {
+        for (auto& b : g_tl[t].qv.blocks[p - P1])
+          if (b.second) S.blk.push_back({b.first, b.second});
+      } else {
+        for (auto& b : g_tl[t].q.blocks[p])
+          if (b.second) S.blk.push_back({b.first, b.second});
+      }
+    }
+    const size_t nblk = S.blk.size();
+    // pass 1: a bit per record; a bit found set marks its index as a candidate
+    for (size_t k = 0; k < nblk; k++) {
+      const QR* rec = (const QR*)S.blk[k].first;
+      const u32 cnt = S.blk[k].second;
+      for (u32 j = 0; j < cnt; j++) {
+        const u64 i = top(rec[j]) >> ishift;
+        const u64 bit = 1ULL << (i & 63);
+        const u64 w = seen[i >> 6];
+        const u64 dup = (w & bit) ? bit : 0;
+        cand[i >> 6] |= dup;
+        nids += dup != 0;
+        seen[i >> 6] = w | bit;
+      }
+    }
+    if (nids == 0) return;
+    // pass 2: the candidates through an exact table that keeps, per event id, its best copy so far; a copy
+    // that loses (or the best one, when a later copy beats it) is killed if it has a P record
+    const u32 tbits = ceil_log2(nids * 4 + 8);
+    const size_t tsz = (size_t)1 << tbits;
+    if (S.tab.size() < tsz) S.tab.resize(tsz);
+    auto* tab = S.tab.data();
+    for (size_t q = 0; q < tsz; q++) tab[q] = {0, nullptr};
+    const u64 tmask = tsz - 1;
+    auto cur = tl.kill.cursor(tl.arena);
+    auto kill = [&](const QR& r) __attribute__((always_inline)) {
+      const u32 lo = (u32)r.w1;
+      if (lo == PQ_NOLOC) return;
+      u32 p2;
+      if constexpr (VIEW) p2 = (u32)r.p2;
+      else p2 = (u32)(r.w0 & ((1ULL << P1bits) - 1));
+      WCScatter<K16>::push16(cur, p2, _mm_set_epi64x(0, (long long)lo));
+    };
+    for (size_t k = 0; k < nblk; k++) {
+      const QR* rec = (const QR*)S.blk[k].first;
+      const u32 cnt = S.blk[k].second;
+      for (u32 j = 0; j < cnt; j++) {
+        const QR& r = rec[j];
+        const u64 tp = top(r);
+        const u64 i = tp >> ishift;
+        if (!((cand[i >> 6] >> (i & 63)) & 1)) continue;
+        const u64 kk = key(r);
+        u64 q = tp >> (64 - tbits);
+        while (tab[q].first != 0 && !same(tab[q].first, kk)) q = (q + 1) & tmask;
+        if (tab[q].first == 0) {
+          tab[q] = {kk, &r};
+          continue;
+        }
+        const QR& best = *(const QR*)tab[q].second;
+        if ((u32)(r.w1 >> 32) < (u32)(best.w1 >> 32)) {
+          kill(best);
+          tab[q].second = &r;
+        } else {
+          kill(r);
+        }
+      }
+    }
+    tl.kill.close(cur);
+    tl.kill.flush(tl.arena);
+  };
+  parallel_for((int)NP, [&](int oi, int tid) {
+    if ((u32)order[oi] >= P1) process(oi, tid, std::true_type{});
+    else process(oi, tid, std::false_type{});
+  });
 }
 
 template<class RT>
@@ -3824,9 +4136,20 @@ int main(int argc, char** argv) {
     load_lookups(data);
     dn::g_ing_base = g_ws - 30 * DAY;
     dn::init_daycode();
+    {
+      const char* e = getenv("SS_PQ");
+      g_pq = use_column_times() && NT <= 31 && !(e && *e == '0');
+    }
     g_tl.resize(NT);
     for (auto& t : g_tl) {
-      t.r1.init(event_partitions());
+      if (g_pq) {
+        t.q.init(1u << g_P1bits);
+        t.qv.init(std::max(1u, (1u << g_P1bits) / 4));
+        t.kill.init(1u << g_P2bits);
+        t.pk.assign(1u << g_P2bits, 0);
+      } else {
+        t.r1.init(event_partitions());
+      }
       t.r2.init(1u << g_P2bits);
       t.r2c.init(1u << g_P2bits);
     }
@@ -3836,6 +4159,22 @@ int main(int argc, char** argv) {
   setup.join();
   g_phase = 2;
   parse_events_clicks(ev, ck);
+  if (getenv("SS_PQ_FAILTEST")) g_pq_fail.store(true);  // (tests of the way back)
+  if (g_pq && g_pq_fail.load()) {
+    // A value did not fit the PQ records' fields: start the parse over on the R1 route.
+    LOG("PQ given up: R1 route");
+    for (auto& t : g_tl)
+      for (auto& sl : t.arena.slabs) madvise(sl.first, sl.second, MADV_DONTNEED);
+    g_pq = false;
+    g_tl.clear();
+    g_tl.resize(NT);
+    for (auto& t : g_tl) {
+      t.r1.init(event_partitions());
+      t.r2.init(1u << g_P2bits);
+      t.r2c.init(1u << g_P2bits);
+    }
+    parse_events_clicks(ev, ck);
+  }
   {
     u64 a = 0, b = 0;
     for (auto& t : g_tl) {
@@ -3846,7 +4185,17 @@ int main(int argc, char** argv) {
   }
   if (getenv("SS_STOP") && !strcmp(getenv("SS_STOP"), "parse")) return 0;
   g_phase = 3;
-  dedup_and_route();
+  if (g_pq) {
+    dedup_q();
+    parallel_for(NT, [&](int t, int) {
+      TL& tl = g_tl[t];
+      tl.r2.finish(tl.arena);
+      tl.r2c.finish(tl.arena);
+      tl.kill.finish(tl.arena);
+    });
+  } else {
+    dedup_and_route();
+  }
   LOG("dedup done");
   drop_inputs(ev);
   LOG("dedup + routing done");
