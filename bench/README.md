@@ -109,11 +109,11 @@ shared), `g5` / `g20` (segments of 5 / 20 partitions), `s4` (the scan on 4 pinne
 partitions of 2^15 indexes: half the staging lines, 512 KB slot tables) and `e154` (e15 with the scan on 4
 pinned threads, so one slot table per core). Four rounds at both sizes.
 
-## Bench 13 (C, branch c-bench13): the parse's timestamps eight lines at a time
+## Bench 14 (C, branch c-bench14): the parse's timestamps eight lines at a time
 
 The first two commits of C's work on the parse's compute side, each with its own profile, against the head they
-sit on. v: v4 2589f28 (head) as its Dockerfile; m: v4 cf4452a (0.38), so that 2589f28 also gets a row against
-the build it replaces; t: c-vts 6d5b17b, v with the event lines' two timestamps decoded eight lines at a time
+sit on. v: v4 2589f28 as its Dockerfile; m: v4 cf4452a (0.38), so that 2589f28 also gets a row against
+the build it replaces; t: v4 6d5b17b (head since 20:44, fast-forwarded from c-vts), v with the event lines' two timestamps decoded eight lines at a time
 (ev_ts_rows); c: c-vts 226ca9f, t with the click lines' timestamp the same way (ck_ts_rows); v2: v's binary once
 more, for the noise between two copies of one build in one session. Eight rounds at 20M, six at 60M; timelines of
 v, t and c. What to read: t and c against v and v2, in wall time and in parse CPU (the second number); the scan
