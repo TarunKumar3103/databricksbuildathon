@@ -544,10 +544,12 @@ static NOINLINE i64 icode_of_ms(i64 ing) {
   }
   return d / 1000 + 1;
 }
+static void init_vts();
 static void init_daycode() {
   for (int k = 0; k < 2; k++)
     for (int i = 0; i < 416; i++) g_daycode[k][i] = g_dayms[k][i] == DAYMS_NONE ? 0 : (g_dayms[k][i] - g_ing_base) / 1000 + 1;
   memcpy(g_day_m[1], g_daycode[g_ymain_row], sizeof g_day_m[1]);
+  init_vts();
 }
 
 // Eight 32-bit lanes at a time (mask compares with AVX-512, plain AVX2 otherwise).
@@ -649,6 +651,217 @@ static NOINLINE void ev_ts_exact(EvB& B, u32 i, const u8* base) {
   i64 ing;
   if (!parse_f1(base + B.st[3][i], B.ln[3][i], ing)) ing = ING_NONE;
   B.icode[i] = icode_of_ms(ing);
+}
+
+// The timestamps of one line by the kernel for the form of its ts (ingest_ts has to be 20 bytes for the fast
+// forms), as the batch did them before the eight-line pass; for the lines that pass leaves over.
+static NOINLINE void ev_ts_form(EvB& B, u32 i, const u8* base) {
+  const u8* const a = base + B.st[2][i];
+  const u8* const b = base + B.st[3][i];
+  const u32 l2 = B.ln[2][i];
+  i64 ta, tb, cb, add;
+  if (B.ln[3][i] == 20) {
+    if (l2 == 20) {
+      if (__builtin_expect(f1_pair_mc<0xFFFFFFFFu>(a, b, ta, tb, cb), 1)) {
+        B.ts[i] = ta;
+        B.icode[i] = cb;
+        return;
+      }
+    } else if (l2 == 13) {
+      if (__builtin_expect(digits13(a, ta) && f1_one_mc<0xFFFFu>(b, tb, cb), 1)) {
+        B.ts[i] = ta;
+        B.icode[i] = cb;
+        return;
+      }
+    } else if (l2 == 25) {
+      if (__builtin_expect(f3_offset(a, add) && f1_pair_mc<0xFFFF7FFFu>(a, b, ta, tb, cb), 1)) {
+        B.ts[i] = ta + add;
+        B.icode[i] = cb;
+        return;
+      }
+    }
+  }
+  ev_ts_exact(B, i, base);
+}
+
+// ---- Both timestamps of eight lines at a time, for the main year (g_ymain)
+//
+// Per line, one vector holds bytes 4..19 of ts and of ingest_ts ("-MM-DDTHH:MM:SSZ"), checked in one compare
+// as in f1_pair_mc. Its digit pairs become the words D, H, Mi, Se, M and then the three numbers D * 24 + H,
+// Mi * 60 + Se and M. The eight lines' numbers are turned into columns (four lines' ts beside the same four
+// lines' ingest_ts in one vector), and the rest is done for eight values at once: the month's entry in a
+// table of 16 (hours before its first day, and its days * 24), the check of the day against the month's length
+// (D * 24 + H - 24 below days * 24, given H <= 23), the seconds since the main year began, and from them the ms
+// of ts and the ingest code. The years (bytes 0..3) and the masks are compared in a second pass over the batch.
+// A line whose ingest_ts passes and whose ts is 13 digits gets its ts from digits13; one whose ts has a UTC
+// offset and passes as civil time gets the offset added; every other line goes through ev_ts_form, so the
+// result is the same as before for every line.
+struct VTs {
+  bool on = false;
+  i64 y0ms = 0;    // Jan 1 of the main year at 00:00 UTC, in ms
+  i32 y0code = 0;  // the same instant as an ingest code (see icode_of_ms)
+  alignas(32) u32 mon[16];  // month: hours before its first day (bits 0..15), its days * 24 (bits 16..31)
+};
+static VTs g_vts;
+
+// The table and the constants for the main year, checked against g_day_m for every month and day (and the
+// day's first and last hour); the pass stays off if anything differs.
+static void init_vts() {
+  g_vts.on = false;
+  if (g_ymain_row >= 2 || g_ymain == 0) return;
+  char t[4];
+  memcpy(t, &g_ymain, 4);
+  int y = 0;
+  for (int k = 0; k < 4; k++) {
+    if (t[k] < '0' || t[k] > '9') return;
+    y = y * 10 + (t[k] - '0');
+  }
+  const bool lp = is_leap((u32)y);
+  const i64 y0ms = days_from_civil(y, 1, 1) * DAY, dc = y0ms - g_ing_base;
+  if (dc % 1000 != 0) return;
+  const i64 y0code = dc / 1000 + 1;
+  if (y0code < -(1LL << 30) || y0code > (1LL << 30)) return;  // (with the seconds of a year, still 32 bits)
+  for (u32 m = 0; m < 16; m++) {
+    u32 cumh = 0, d24 = 0;
+    if (m >= 1 && m <= 12) {
+      cumh = (CUM[m] + ((m > 2 && lp) ? 1u : 0u)) * 24;
+      d24 = (DIM[m] + ((m == 2 && lp) ? 1u : 0u)) * 24;
+    }
+    g_vts.mon[m] = cumh | (d24 << 16);
+  }
+  for (u32 m = 0; m < 13; m++)
+    for (u32 d = 0; d < 32; d++)
+      for (u32 h : {0u, 23u}) {
+        const u32 e = g_vts.mon[m], x = d * 24 + h - 24;
+        const bool ok = x < (e >> 16);
+        const i64 ref = g_day_m[0][m * 32 + d];
+        if (ok != (ref != DAYMS_NONE)) return;
+        if (!ok) continue;
+        const i64 sod = (i64)h * 3600 + 59 * 60 + 59, secs = (i64)((e & 0xFFFF) + x) * 3600 + 59 * 60 + 59;
+        if (y0ms + secs * 1000 != ref + sod * 1000 || y0code + secs != g_day_m[1][m * 32 + d] + sod) return;
+      }
+  g_vts.y0ms = y0ms;
+  g_vts.y0code = (i32)y0code;
+  g_vts.on = true;
+}
+
+// g_vts.mon[m & 15] for eight lanes
+static FORCE_INLINE __m256i vts_month(__m256i m) {
+  const __m256i lo = _mm256_load_si256((const __m256i*)g_vts.mon), hi = _mm256_load_si256((const __m256i*)(g_vts.mon + 8));
+#if defined(__AVX512VL__) && defined(__AVX512F__)
+  return _mm256_permutex2var_epi32(lo, m, hi);
+#else
+  return _mm256_castps_si256(_mm256_blendv_ps(_mm256_castsi256_ps(_mm256_permutevar8x32_epi32(lo, m)),
+                                              _mm256_castsi256_ps(_mm256_permutevar8x32_epi32(hi, m)),
+                                              _mm256_castsi256_ps(_mm256_slli_epi32(m, 28))));
+#endif
+}
+// a < b, unsigned, eight lanes -> eight bits
+static FORCE_INLINE u32 ltu32x8(__m256i a, __m256i b) {
+#if defined(__AVX512VL__) && defined(__AVX512F__)
+  return _mm256_cmplt_epu32_mask(a, b);
+#else
+  return 0xFFu ^ (u32)_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(_mm256_max_epu32(a, b), a)));
+#endif
+}
+
+// The eight-line pass over a batch of n lines (lanes from n on read as empty fields at offset 0, see Cols::pad).
+// Writes B.ts and B.icode for every line.
+static NOINLINE void ev_ts_rows(EvB& B, const u8* const base, const u32 n, const u64 nmask) {
+  alignas(32) u32 vm[EvB::CAP + 8], vyt[EvB::CAP + 8], vyi[EvB::CAP + 8];  // per line: the check bits, the two years
+  u64 dts = 0, dig = 0;  // per line: the day of ts / of ingest_ts exists
+  {
+    const F1Lim<0xFFFFFFFFu, 2>& K = k_f1lim<0xFFFFFFFFu, 2>;
+    const __m256i kb = _mm256_load_si256((const __m256i*)K.base), kl = _mm256_load_si256((const __m256i*)K.lim);
+    // digit pairs of "-MM-DDTHH:MM:SSZ" in the order D, H, Mi, Se, M
+    const __m256i sh = _mm256_setr_epi8(4, 5, 7, 8, 10, 11, 13, 14, 1, 2, -1, -1, -1, -1, -1, -1, 4, 5, 7, 8, 10, 11, 13, 14, 1, 2,
+                                        -1, -1, -1, -1, -1, -1);
+    const __m256i w10 = _mm256_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0,
+                                         0, 0, 0, 0, 0);
+    const __m256i bnd = _mm256_setr_epi16(31, 23, 59, 59, 12, 0, 0, 0, 31, 23, 59, 59, 12, 0, 0, 0);
+    const __m256i w2 = _mm256_setr_epi16(24, 1, 60, 1, 1, 0, 0, 0, 24, 1, 60, 1, 1, 0, 0, 0);
+    const __m256i c24 = _mm256_set1_epi32(24), w3600 = _mm256_set1_epi32(3600);
+    const __m256i addc = _mm256_setr_epi32(0, 0, 0, 0, g_vts.y0code, g_vts.y0code, g_vts.y0code, g_vts.y0code);
+    const __m256i k1000 = _mm256_set1_epi64x(1000), y0 = _mm256_set1_epi64x(g_vts.y0ms);
+    for (u32 i0 = 0; i0 < n; i0 += 8) {
+      __m256i Q[8];
+#define VTS_ROW(j)                                                                                                          \
+  {                                                                                                                         \
+    const u32 i = i0 + (j);                                                                                                 \
+    const u8* const a = base + B.st[2][i];                                                                                  \
+    const u8* const b = base + B.st[3][i];                                                                                  \
+    const __m256i v = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128((const __m128i*)(a + 4))),            \
+                                              _mm_loadu_si128((const __m128i*)(b + 4)), 1);                                 \
+    const __m256i d = _mm256_sub_epi8(v, kb);                                                                               \
+    const __m256i ok = _mm256_cmpeq_epi8(_mm256_min_epu8(d, kl), d);                                                        \
+    const __m256i p = _mm256_maddubs_epi16(_mm256_shuffle_epi8(d, sh), w10);                                                \
+    vm[i] = (u32)_mm256_movemask_epi8(_mm256_andnot_si256(_mm256_cmpgt_epi16(p, bnd), ok));                                 \
+    Q[j] = _mm256_madd_epi16(p, w2);                                                                                        \
+    memcpy(&vyt[i], a, 4);                                                                                                  \
+    memcpy(&vyi[i], b, 4);                                                                                                  \
+  }
+      VTS_ROW(0) VTS_ROW(1) VTS_ROW(2) VTS_ROW(3) VTS_ROW(4) VTS_ROW(5) VTS_ROW(6) VTS_ROW(7)
+#undef VTS_ROW
+      // Q[j] = [D*24+H, Mi*60+Se, M, 0] of ts, then of ingest_ts. Columns: lines 0..3 and 4..7, ts then ingest_ts.
+      const __m256i u01 = _mm256_unpacklo_epi32(Q[0], Q[1]), w01 = _mm256_unpackhi_epi32(Q[0], Q[1]);
+      const __m256i u23 = _mm256_unpacklo_epi32(Q[2], Q[3]), w23 = _mm256_unpackhi_epi32(Q[2], Q[3]);
+      const __m256i u45 = _mm256_unpacklo_epi32(Q[4], Q[5]), w45 = _mm256_unpackhi_epi32(Q[4], Q[5]);
+      const __m256i u67 = _mm256_unpacklo_epi32(Q[6], Q[7]), w67 = _mm256_unpackhi_epi32(Q[6], Q[7]);
+      u32 ok03, ok47;
+      // seconds since the main year began (ts lanes), the ingest code (ingest_ts lanes); ok: the day exists
+      auto tail = [&](__m256i X, __m256i Y, __m256i Z, u32& okm) {
+        const __m256i e = vts_month(Z), xm = _mm256_sub_epi32(X, c24);
+        okm = ltu32x8(xm, _mm256_srli_epi32(e, 16));
+        const __m256i hours = _mm256_add_epi16(e, xm);  // bits 0..15: hours since the year began (where okm)
+        return _mm256_add_epi32(_mm256_add_epi32(_mm256_madd_epi16(hours, w3600), Y), addc);
+      };
+      const __m256i c03 = tail(_mm256_unpacklo_epi64(u01, u23), _mm256_unpackhi_epi64(u01, u23), _mm256_unpacklo_epi64(w01, w23), ok03);
+      const __m256i c47 = tail(_mm256_unpacklo_epi64(u45, u67), _mm256_unpackhi_epi64(u45, u67), _mm256_unpacklo_epi64(w45, w67), ok47);
+      _mm256_store_si256((__m256i*)(B.ts + i0), _mm256_add_epi64(_mm256_mul_epu32(_mm256_cvtepu32_epi64(_mm256_castsi256_si128(c03)), k1000), y0));
+      _mm256_store_si256((__m256i*)(B.ts + i0 + 4), _mm256_add_epi64(_mm256_mul_epu32(_mm256_cvtepu32_epi64(_mm256_castsi256_si128(c47)), k1000), y0));
+      _mm256_store_si256((__m256i*)(B.icode + i0), _mm256_cvtepi32_epi64(_mm256_extracti128_si256(c03, 1)));
+      _mm256_store_si256((__m256i*)(B.icode + i0 + 4), _mm256_cvtepi32_epi64(_mm256_extracti128_si256(c47, 1)));
+      dts |= (u64)((ok03 & 0xF) | ((ok47 & 0xF) << 4)) << i0;
+      dig |= (u64)((ok03 >> 4) | (ok47 & 0xF0)) << i0;
+    }
+  }
+  // ---- second pass: which lines are done, and what is left for the others
+  u64 l13 = 0, l25 = 0, lx = 0;
+  {
+    const __m256i lo16 = _mm256_set1_epi32(0xFFFF), lo15 = _mm256_set1_epi32(0x7FFF), ym = _mm256_set1_epi32((int)g_ymain);
+    const __m256i c20 = _mm256_set1_epi32(20), c13 = _mm256_set1_epi32(13), c25 = _mm256_set1_epi32(25);
+    for (u32 i0 = 0; i0 < n; i0 += 8) {
+      const __m256i m = _mm256_load_si256((const __m256i*)(vm + i0));
+      const __m256i l2 = _mm256_load_si256((const __m256i*)(B.ln[2] + i0)), l3 = _mm256_load_si256((const __m256i*)(B.ln[3] + i0));
+      const u32 live = (u32)(nmask >> i0) & 0xFF;
+      const u32 ing = eq32x8(_mm256_srli_epi32(m, 16), lo16) & eq32x8(_mm256_load_si256((const __m256i*)(vyi + i0)), ym) &
+                      eq32x8(l3, c20) & (u32)(dig >> i0) & live;
+      const u32 yt = eq32x8(_mm256_load_si256((const __m256i*)(vyt + i0)), ym) & (u32)(dts >> i0) & ing;
+      const u32 done = yt & eq32x8(_mm256_and_si256(m, lo16), lo16) & eq32x8(l2, c20);
+      const u32 off = yt & eq32x8(_mm256_and_si256(m, lo15), lo15) & eq32x8(l2, c25);
+      const u32 dg = ing & eq32x8(l2, c13);
+      l13 |= (u64)dg << i0;
+      l25 |= (u64)off << i0;
+      lx |= (u64)(live & ~(done | off | dg)) << i0;
+    }
+  }
+  for (u64 m = l13; m; m = _blsr_u64(m)) {
+    const u32 i = (u32)_tzcnt_u64(m);
+    i64 t;
+    if (__builtin_expect(digits13(base + B.st[2][i], t), 1))
+      B.ts[i] = t;
+    else
+      ev_ts_exact(B, i, base);
+  }
+  for (u64 m = l25; m; m = _blsr_u64(m)) {
+    const u32 i = (u32)_tzcnt_u64(m);
+    i64 add;
+    if (__builtin_expect(f3_offset(base + B.st[2][i], add), 1))
+      B.ts[i] += add;
+    else
+      ev_ts_exact(B, i, base);
+  }
+  for (u64 m = lx; m; m = _blsr_u64(m)) ev_ts_form(B, (u32)_tzcnt_u64(m), base);
 }
 
 // A line that is not a valid view or cart event of regular IDs: everything about it once more, one step at
@@ -778,8 +991,12 @@ static NOINLINE u32 process_events(EvB& B, const u8* const base, WCScatter<D16>:
       irr |= (u64)(be | bu) << i;
     }
   }
-  // ---- timestamps: the lines by the form of ts (ingest_ts has to be 20 bytes for the fast forms), then one
-  // kernel per form, as in the general pipeline; the ingest_ts also as its code
+  // ---- timestamps: eight lines at a time for the main year (ev_ts_rows). Otherwise the lines by the form of
+  // ts (ingest_ts has to be 20 bytes for the fast forms), then one kernel per form, as in the general pipeline;
+  // the ingest_ts also as its code
+  if (g_vts.on) {
+    ev_ts_rows(B, base, n, nmask);
+  } else {
   u32 cnt[4] = {0, 0, 0, 0};
   {
     const __m256i c20 = _mm256_set1_epi32(20), c13 = _mm256_set1_epi32(13), c25 = _mm256_set1_epi32(25);
@@ -824,6 +1041,7 @@ static NOINLINE u32 process_events(EvB& B, const u8* const base, WCScatter<D16>:
     }
   }
   for (u32 j = 0; j < cnt[3]; j++) ev_ts_exact(B, B.lst[3][j], base);
+  }
   // ---- the records of plain lines (valid view or cart events of regular IDs), four lines at a time: the
   // checks on the two timestamps come down to a handful of sign bits
   const u64 wlen = (u64)(we - ws);
@@ -2859,7 +3077,105 @@ static long selftest(Next&& next) {
     }
   }
   fprintf(stderr, "selftest click sorts: %ld cases, %ld mismatches\n", n2, bad2);
-  return bad + bad2;
+  // ---- the eight-line timestamp pass against ev_ts_exact, line by line, for windows around the turn of a
+  // year, in leap and other years, and before 1970
+  long n3 = 0, bad3 = 0, fast3 = 0;
+  {
+    static EvB B;
+    std::vector<u8> buf(64 * 96 + 128);
+    const int wins[][6] = {{2027, 12, 9, 2027, 12, 23},  {2027, 12, 20, 2028, 1, 15}, {2024, 2, 10, 2024, 3, 5},
+                           {2100, 2, 20, 2100, 3, 10},  {2000, 2, 20, 2000, 3, 10},  {1969, 12, 20, 1970, 1, 15},
+                           {2027, 6, 1, 2027, 6, 15}};
+    const i64 save_base = g_ing_base;
+    for (const auto& w : wins) {
+      const i64 lo = days_from_civil(w[0], w[1], w[2]) * DAY, hi = days_from_civil(w[3], w[4], w[5]) * DAY;
+      init_fast_years(lo, hi);
+      g_ing_base = lo - 30 * DAY;
+      init_daycode();
+      if (!g_vts.on) {
+        fprintf(stderr, "VTS OFF for the window from %d-%02d-%02d\n", w[0], w[1], w[2]);
+        bad3++;
+        continue;
+      }
+      char ytxt[2][5];
+      for (int k = 0; k < 2; k++) {
+        memcpy(ytxt[k], &g_ytxt[k], 4);
+        ytxt[k][4] = 0;
+      }
+      // one timestamp text in one of the forms, mostly near the window, sometimes broken
+      auto gen = [&](char* t, bool ingest) -> int {
+        const u64 r = next();
+        const i64 at = lo - 3 * DAY + (i64)(next() % (u64)(hi - lo + 9 * DAY)) / 1000 * 1000;
+        i64 dd = at >= 0 ? at / DAY : -((-at + DAY - 1) / DAY);
+        i64 y, mo, d;
+        civil_from_days(dd, y, mo, d);
+        i64 sod = at - dd * DAY;
+        int hh = (int)(sod / 3600000), mi = (int)(sod / 60000 % 60), se = (int)(sod / 1000 % 60);
+        int yr = (int)y, mm = (int)mo, dy = (int)d;
+        if (r % 23 == 0) yr += (int)(next() % 5) - 2;
+        if (r % 29 == 0) mm = (int)(next() % 16);
+        if (r % 31 == 0) dy = (int)(next() % 34);
+        if (r % 37 == 0) hh = (int)(next() % 26);
+        if (r % 41 == 0) mi = (int)(next() % 62);
+        if (r % 43 == 0) se = (int)(next() % 62);
+        const u32 form = ingest ? (next() % 20 == 0 ? (u32)(next() % 10) : 0u) : (u32)(next() % 10);
+        int len;
+        if (form < 6 || form == 9) {
+          len = snprintf(t, 40, "%04d-%02d-%02dT%02d:%02d:%02dZ", yr, mm, dy, hh, mi, se);
+        } else if (form == 6) {
+          const int oh = (int)(next() % 26), om = (int)(next() % 62);
+          len = snprintf(t, 40, "%04d-%02d-%02dT%02d:%02d:%02d%c%02d:%02d", yr, mm, dy, hh, mi, se, next() & 1 ? '+' : '-',
+                         oh % 100, om % 100);
+        } else if (form == 7) {
+          len = snprintf(t, 40, "%lld", (long long)(at + (i64)(next() % 1000)));
+        } else {
+          len = (int)(next() % 26);
+          for (int k = 0; k < len; k++) t[k] = "0123456789-:TZ+"[next() % 15];
+        }
+        if (len > 0 && next() % 9 == 0) t[next() % (u64)len] = "0123456789-:TZ+ ax"[next() % 18];
+        if (next() % 50 == 0 && len > 0) len--;  // a byte short, or one more
+        else if (next() % 50 == 0) t[len++] = "0Z5"[next() % 3];
+        return len;
+      };
+      for (int it = 0; it < 6000; it++) {
+        const u32 nl = 1 + (u32)(next() % 64);
+        for (auto& c : buf) c = (u8)"0123456789,\"Z:+-T\n"[next() % 18];
+        u32 pos = 0;
+        B.n = nl;
+        for (u32 i = 0; i < nl; i++) {
+          char a[48], b[48];
+          const int la = gen(a, false), lb = gen(b, true);
+          B.st[2][i] = pos;
+          B.ln[2][i] = (u32)la;
+          memcpy(buf.data() + pos, a, (size_t)la);
+          pos += (u32)la + 1 + (u32)(next() % 3);
+          B.st[3][i] = pos;
+          B.ln[3][i] = (u32)lb;
+          memcpy(buf.data() + pos, b, (size_t)lb);
+          pos += (u32)lb + 1 + (u32)(next() % 9);
+        }
+        B.pad();
+        const u64 nmask = nl >= 64 ? ~0ULL : ((1ULL << nl) - 1);
+        ev_ts_rows(B, buf.data(), nl, nmask);
+        for (u32 i = 0; i < nl; i++) {
+          const i64 ts = B.ts[i], ic = B.icode[i];
+          ev_ts_exact(B, i, buf.data());
+          n3++;
+          fast3 += ts == B.ts[i] && ic == B.icode[i] && B.ts[i] != TS_NONE && B.icode[i] != ICODE_NONE;
+          if (ts != B.ts[i] || ic != B.icode[i]) {
+            if (bad3 < 10)
+              fprintf(stderr, "VTS MISMATCH ts='%.*s' ing='%.*s' got %lld/%lld want %lld/%lld (main year %s)\n", (int)B.ln[2][i],
+                      (const char*)buf.data() + B.st[2][i], (int)B.ln[3][i], (const char*)buf.data() + B.st[3][i],
+                      (long long)ts, (long long)ic, (long long)B.ts[i], (long long)B.icode[i], ytxt[g_ymain_row & 1]);
+            bad3++;
+          }
+        }
+      }
+    }
+    g_ing_base = save_base;
+  }
+  fprintf(stderr, "selftest eight-line timestamps: %ld lines, %ld mismatches (%ld with both values)\n", n3, bad3, fast3);
+  return bad + bad2 + bad3;
 }
 
 }  // namespace dn
