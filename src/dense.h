@@ -498,6 +498,14 @@ static FORCE_INLINE u32 nz64x4(__m256i a) { return _mm256_test_epi64_mask(a, a);
 static FORCE_INLINE u32 gtu64x4(__m256i a, __m256i b) { return _mm256_cmpgt_epu64_mask(a, b); }  // a > b, unsigned
 static FORCE_INLINE __m256i mullo64x4(__m256i a, __m256i b) { return _mm256_mullo_epi64(a, b); }
 static FORCE_INLINE __m128i low32x4(__m256i a) { return _mm256_cvtepi64_epi32(a); }
+// The same checks as lane masks that stay in mask registers until they are combined (m4: four lanes, the bits
+// above 3 are 0). lz4: lanes where a is 0 and b differs from c, in one masked compare.
+typedef __mmask8 m4;
+static FORCE_INLINE m4 nz4(__m256i a) { return _mm256_test_epi64_mask(a, a); }
+static FORCE_INLINE m4 gtu4(__m256i a, __m256i b) { return _mm256_cmpgt_epu64_mask(a, b); }
+static FORCE_INLINE m4 lz4(__m256i a, __m256i b, __m256i c) { return _mm256_mask_cmpneq_epi64_mask(_mm256_testn_epi64_mask(a, a), b, c); }
+static FORCE_INLINE m4 or4(m4 a, m4 b) { return _kor_mask8(a, b); }
+static FORCE_INLINE u32 bits4(m4 a) { return _cvtmask8_u32(a); }
 #else
 static FORCE_INLINE u32 nz64x4(__m256i a) {
   return 0xF ^ (u32)_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(a, _mm256_setzero_si256())));
@@ -513,12 +521,18 @@ static FORCE_INLINE __m256i mullo64x4(__m256i a, __m256i b) {
 static FORCE_INLINE __m128i low32x4(__m256i a) {
   return _mm256_castsi256_si128(_mm256_permutevar8x32_epi32(a, _mm256_setr_epi32(0, 2, 4, 6, 0, 0, 0, 0)));
 }
+typedef u32 m4;
+static FORCE_INLINE m4 nz4(__m256i a) { return nz64x4(a); }
+static FORCE_INLINE m4 gtu4(__m256i a, __m256i b) { return gtu64x4(a, b); }
+static FORCE_INLINE m4 lz4(__m256i a, __m256i b, __m256i c) { return (0xF ^ nz64x4(a)) & nz64x4(_mm256_xor_si256(b, c)); }
+static FORCE_INLINE m4 or4(m4 a, m4 b) { return a | b; }
+static FORCE_INLINE u32 bits4(m4 a) { return a; }
 #endif
 
 // Four IDs at once. raw: the 8 bytes after each prefix; sh: 72 - 8 * (field length), which is how far the
 // digits have to move to sit right-aligned in their 8 bytes (0..56 for 1..8 digits). val gets the numbers.
 // The result has a bit for every ID that is not 1..8 base-36 digits without a leading zero.
-static FORCE_INLINE u32 b36x4(const __m256i raw, const __m256i sh, __m256i& val) {
+static FORCE_INLINE m4 b36x4(const __m256i raw, const __m256i sh, __m256i& val) {
   const __m256i x = _mm256_or_si256(_mm256_sllv_epi64(raw, sh),
                                     _mm256_andnot_si256(_mm256_sllv_epi64(_mm256_set1_epi64x(-1), sh), _mm256_set1_epi8('0')));
   const __m256i letters = _mm256_cmpgt_epi8(x, _mm256_set1_epi8(0x60));
@@ -527,7 +541,7 @@ static FORCE_INLINE u32 b36x4(const __m256i raw, const __m256i sh, __m256i& val)
   const __m256i over = _mm256_subs_epu8(d, lim);                                               // a byte that is no digit
   const __m256i lead = _mm256_and_si256(_mm256_srlv_epi64(d, sh), _mm256_set1_epi64x(0xFF));  // the first digit
   const __m256i one = _mm256_set1_epi64x(56);  // the shift of a single digit
-  const u32 bad = nz64x4(over) | ((0xF ^ nz64x4(lead)) & nz64x4(_mm256_xor_si256(sh, one))) | gtu64x4(sh, one);
+  const m4 bad = or4(or4(nz4(over), lz4(lead, sh, one)), gtu4(sh, one));
   const __m256i m1 = _mm256_maddubs_epi16(d, _mm256_set1_epi16(0x0124));     // digit pairs: 36 * hi + lo
   const __m256i m2 = _mm256_madd_epi16(m1, _mm256_set1_epi32(0x00010510));  // four digits: 1296 * hi + lo
   val = _mm256_add_epi64(_mm256_mul_epu32(m2, _mm256_set1_epi64x(1679616)), _mm256_srli_epi64(m2, 32));
@@ -953,7 +967,7 @@ static NOINLINE void ev_slow(TL& tl, int tid, EvB& B, u32 i, bool regular, const
 // is checked separately).
 // (The bytes are fetched with plain loads, one line at a time, not with gather instructions: on the scorer's
 // processors those are slow.)
-static FORCE_INLINE u32 ids4(const u64* raw, const u32* ln, __m256i& val) {
+static FORCE_INLINE m4 ids4(const u64* raw, const u32* ln, __m256i& val) {
   const __m256i sh = _mm256_sub_epi64(_mm256_set1_epi64x(72), _mm256_slli_epi64(_mm256_cvtepu32_epi64(_mm_load_si128((const __m128i*)ln)), 3));
   return b36x4(_mm256_load_si256((const __m256i*)raw), sh, val);
 }
@@ -1085,11 +1099,11 @@ static NOINLINE u32 process_events(EvB& B, const u8* const base, WCScatter<D16>:
     const __m256i emax = _mm256_set1_epi64x((long long)(g_ne_cap - 1)), umax = _mm256_set1_epi64x((long long)(((u64)g_nu_cap << 9) - 1));
     for (u32 i = 0; i < n; i += 4) {
       __m256i ve, vu;
-      u32 be = ids4(B.eq + i, B.ln[0] + i, ve);
-      u32 bu = ids4(B.uq + i, B.ln[1] + i, vu);
+      const m4 be0 = ids4(B.eq + i, B.ln[0] + i, ve);
+      const m4 bu0 = ids4(B.uq + i, B.ln[1] + i, vu);
       const __m256i idx = unscramble4(ve, ekey), num = unscramble4(vu, ukey);
-      be |= gtu64x4(ve, M) | gtu64x4(idx, emax);
-      bu |= gtu64x4(vu, M) | gtu64x4(num, umax);
+      const u32 be = bits4(or4(or4(be0, gtu4(ve, M)), gtu4(idx, emax)));
+      const u32 bu = bits4(or4(or4(bu0, gtu4(vu, M)), gtu4(num, umax)));
       _mm256_store_si256((__m256i*)(B.idx + i), idx);
       _mm_store_si128((__m128i*)(B.num + i), low32x4(num));
       irr |= (u64)(be | bu) << i;
@@ -1291,7 +1305,7 @@ struct CkB : Cols<4, 64> {
 // Four campaign numbers: "c_" and then 1 to 8 decimal digits, no leading zero unless the number is 0 itself.
 // raw: the 8 bytes after "c_"; ln: the lengths of the whole IDs. Returns the lanes that are not of that form
 // (their value is unspecified); the form itself is what camp_of accepts on its fast path.
-static FORCE_INLINE u32 dec10x4(const u64* raw, const u32* ln, __m256i& val) {
+static FORCE_INLINE m4 dec10x4(const u64* raw, const u32* ln, __m256i& val) {
   // the digits go to the top bytes: the first one to byte 8 - nd, the bytes before it become '0'
   const __m256i sh = _mm256_sub_epi64(_mm256_set1_epi64x(80), _mm256_slli_epi64(_mm256_cvtepu32_epi64(_mm_load_si128((const __m128i*)ln)), 3));
   const __m256i x = _mm256_or_si256(_mm256_sllv_epi64(_mm256_load_si256((const __m256i*)raw), sh),
@@ -1300,7 +1314,7 @@ static FORCE_INLINE u32 dec10x4(const u64* raw, const u32* ln, __m256i& val) {
   const __m256i over = _mm256_subs_epu8(d, _mm256_set1_epi8(9));                              // a byte that is no digit
   const __m256i lead = _mm256_and_si256(_mm256_srlv_epi64(d, sh), _mm256_set1_epi64x(0xFF));  // the first digit
   const __m256i one = _mm256_set1_epi64x(56);  // the shift of a single digit
-  const u32 bad = nz64x4(over) | ((0xF ^ nz64x4(lead)) & nz64x4(_mm256_xor_si256(sh, one))) | gtu64x4(sh, one);
+  const m4 bad = or4(or4(nz4(over), lz4(lead, sh, one)), gtu4(sh, one));
   const __m256i m1 = _mm256_maddubs_epi16(d, _mm256_set1_epi16(0x010A));     // digit pairs: 10 * hi + lo
   const __m256i m2 = _mm256_madd_epi16(m1, _mm256_set1_epi32(0x00010064));  // four digits: 100 * hi + lo
   val = _mm256_add_epi64(_mm256_mul_epu32(m2, _mm256_set1_epi64x(10000)), _mm256_srli_epi64(m2, 32));
@@ -1446,16 +1460,16 @@ static NOINLINE u32 process_clicks(CkB& B, const u8* const base, WCScatter<C16>:
     const __m256i umax = _mm256_set1_epi64x((long long)(((u64)g_nu_cap << 9) - 1));
     for (u32 i = 0; i < n; i += 4) {
       __m256i vk, vu, vc;
-      u32 bk = ids4(B.kq + i, B.ln[0] + i, vk);
-      u32 bu = ids4(B.uq + i, B.ln[1] + i, vu);
-      const u32 bc = dec10x4(B.cq + i, B.ln[2] + i, vc);
+      const m4 bk0 = ids4(B.kq + i, B.ln[0] + i, vk);
+      const m4 bu0 = ids4(B.uq + i, B.ln[1] + i, vu);
+      const u32 bc = bits4(dec10x4(B.cq + i, B.ln[2] + i, vc));
       const __m256i num = unscramble4(vu, ukey);
-      bk |= gtu64x4(vk, M);
-      bu |= gtu64x4(vu, M) | gtu64x4(num, umax);
+      const m4 bk = or4(bk0, gtu4(vk, M));
+      const m4 bu = or4(or4(bu0, gtu4(vu, M)), gtu4(num, umax));
       _mm256_store_si256((__m256i*)(B.kv + i), vk);
       _mm256_store_si256((__m256i*)(B.cv + i), vc);
       _mm_store_si128((__m128i*)(B.num + i), low32x4(num));
-      irr |= (u64)(bk | bu) << i;
+      irr |= (u64)bits4(or4(bk, bu)) << i;
       cslow |= (u64)bc << i;
     }
   }
@@ -3201,7 +3215,7 @@ static long selftest(Next&& next) {
       sh[k] = (u64)72 - 8 * (u64)(l + 1);  // (the field has a prefix byte)
     }
     __m256i val;
-    const u32 bm = b36x4(_mm256_load_si256((const __m256i*)raw), _mm256_load_si256((const __m256i*)sh), val);
+    const u32 bm = bits4(b36x4(_mm256_load_si256((const __m256i*)raw), _mm256_load_si256((const __m256i*)sh), val));
     alignas(32) u64 vv[4];
     _mm256_store_si256((__m256i*)vv, val);
     for (int k = 0; k < 4; k++) {

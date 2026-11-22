@@ -3293,7 +3293,7 @@ static int selftest() {
         memcpy(q4s[j], t, sizeof t);
         if (j == 3) {
           __m256i val;
-          const u32 bad = dn::dec10x4(q4raw, q4ln, val);
+          const u32 bad = dn::bits4(dn::dec10x4(q4raw, q4ln, val));
           alignas(32) u64 vv[4];
           _mm256_store_si256((__m256i*)vv, val);
           for (u32 k = 0; k < 4; k++) {
