@@ -1,14 +1,8 @@
-# Bench 12 (B, branch b-bench12): the scatter. tag, binary in /usr/local/bench, ENV=VALUE.
-# The first build also writes the dev output that the report rows are added to.
-v    ss-8384d32-clang18-pgo     # v4 8384d32 as its Dockerfile (sha256 eb129ec6...): scored 0.38
-h    ss-cf4452a-clang18-pgo     # v4 cf4452a as its Dockerfile (sha256 1f8a1564...): A's two scan commits on top of v
-vt   ss-8384d32-clang18-pgo GLIBC_TUNABLES=glibc.malloc.top_pad=67108864   # v with malloc's heaps grown 64 MB at a time
-vn   ss-8384d32-clang18-pgo SS_NODROP=1   # v without dropping the parsed input pages
-p4   ss-pf4-clang18-pgo         # b-pf 0e5c528 with -DSS_PFD=4: staging lines prefetched 4 records ahead; own profile
-p8   ss-pf8-clang18-pgo         # the same, 8 records ahead
-p16  ss-pf16-clang18-pgo        # the same, 16 records ahead
-z    ss-pz-clang18-pgo          # b-pf 0e5c528 with -DSS_PREFAULT=1: each thread's arena faulted in when mapped
-zp   ss-pzp8-clang18-pgo        # z with -DSS_PFD=8 as well
-s    ss-pfs-stg                 # b-pfs 8847acc (b-pf 43899be + stage counters) with -DSTAGES; own profile
-ps   ss-pfs-stg-pf8             # s with -DSS_PFD=8
-f    ss-pfs-stg SS_SOL=1        # s in floor mode: bench 9's floors, writing the arena, the scatter alone
+# Bench 13 (B, branch b-bench13): the record-path fixes on v4 6d5b17b, the floors, the memory nodes.
+# tag, binary in /usr/local/bench, ENV=VALUE. The first build also writes the dev output that the report rows are added to.
+n    ss-6d5b17b-clang18-pgo     # v4 6d5b17b as its Dockerfile: scored 0.364
+nt   ss-6d5b17b-clang18-pgo GLIBC_TUNABLES=glibc.malloc.top_pad=67108864   # n with malloc's heaps grown 64 MB at a time
+c4   ss3-c4-clang18-pgo         # b-pf3 bafbb05 (6d5b17b + B's knobs) with -DSS_PFD=4 -DSS_TOPPAD=67108864; own profile
+c8   ss3-c8-clang18-pgo         # the same with -DSS_PFD=8
+s8   ss-pfs-stg                 # bench 12's stage build (b-pfs 8847acc, on 8384d32), for the 60M stage line bench 12 lost
+f    ss-pfs-stg SS_SOL=1        # its floor mode: bench 9's floors, writing the arena, the scatter alone

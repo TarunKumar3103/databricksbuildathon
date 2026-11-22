@@ -136,3 +136,17 @@ Rows, after `!1 20M` and `!2 60M` as before:
 - `!S2 60M s ...`: build s's whole `STAGES` line at 60M (bench 9's was cut off).
 
 The PERF lines are left out (bench 9: perf events are refused, EPERM).
+
+## Bench 13 (B, branch b-bench13): the record-path fixes on v4 6d5b17b, the floors, the memory nodes
+
+Bench 12's prefetch rows and its malloc row were each worth about 1.4% at 60M on v4 8384d32; this one puts
+them on the new head. Six builds: `n` (v4 6d5b17b as its Dockerfile, scored 0.364), `nt` (n's binary with
+`GLIBC_TUNABLES=glibc.malloc.top_pad=67108864`), `c4` and `c8` (b-pf3 bafbb05, which is 6d5b17b with B's
+record-path knobs, built with `-DSS_PFD=4` or `8` and `-DSS_TOPPAD=67108864`, each with a profile of its own),
+`s8` (bench 12's stage build, b-pfs 8847acc on 8384d32, for the 60M stage line bench 12 lost) and `f` (s8 with
+`SS_SOL=1`).
+
+The rejection message lists rows sorted by `user_id` and stops after about 2,300 characters, which cut bench
+12 after its timing rows. So the rows are numbered in the order they matter: `!0` the 60M timings, `!1` the
+20M timings, `!2` the memory nodes (bench 12's `!n`), `!3` and `!4` the floors at 60M and 20M (`!f`), `!5` and
+`!6` the stage values of s8 at 60M and 20M (`!s`), `!7` s8's whole stage line at 60M (`!S`), `!8` the machine.

@@ -796,12 +796,24 @@ int main() {
       if (!stg_tags.empty()) srows2.push_back(Row{fmt("!s%d %.0fM%s", sizeno, z.ev_m, sh.c_str()), "-", 0, 0, 0});
     }
   }
-  rows.insert(rows.begin(), Row{numa_s, "-", 0, 0, 0});
-  for (auto& r : srows) rows.push_back(r);
-  for (auto& r : srows2) rows.push_back(r);
-  for (auto& r : srows3) rows.push_back(r);
-  rows.push_back(Row{fmt("!%d %s%s tot=%.0fs", sizeno + 1, env_s.c_str(), notes.c_str(), el()), gen_s.empty() ? "-" : gen_s.substr(1),
-                     (long long)dev_ms, ncpu, (long long)el()});
+  // (bench 13) The rejection message lists the rows sorted by user_id and stops after about 2,300 characters,
+  // so the rows are numbered !0, !1, ... in the order they matter: the timings, largest size first, then the
+  // memory nodes, the floors, the stage values, the whole stage line, the machine.
+  {
+    std::vector<Row> all;
+    for (size_t i = rows.size(); i-- > 0;) all.push_back(rows[i]);
+    all.push_back(Row{numa_s, "-", 0, 0, 0});
+    for (size_t i = srows.size(); i-- > 0;) all.push_back(srows[i]);
+    for (size_t i = srows2.size(); i-- > 0;) all.push_back(srows2[i]);
+    for (auto& r : srows3) all.push_back(r);
+    all.push_back(Row{fmt("!x %s%s tot=%.0fs", env_s.c_str(), notes.c_str(), el()), gen_s.empty() ? "-" : gen_s.substr(1),
+                      (long long)dev_ms, ncpu, (long long)el()});
+    for (size_t k = 0; k < all.size(); k++) {
+      const size_t sp = all[k].uid.find(' ');
+      all[k].uid = fmt("!%zu", k) + (sp == std::string::npos ? std::string() : all[k].uid.substr(sp));
+    }
+    rows.swap(all);
+  }
   if (!write_report(out, rows)) fprintf(stderr, "bench: report not written\n");
   for (auto& r : rows) fprintf(stderr, "BENCH %s || %s\n", r.uid.c_str(), r.cat.c_str());
   return 0;
