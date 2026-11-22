@@ -98,7 +98,7 @@ threads: `touch` one byte per page (the page faults alone), `read` every byte on
 `masks` the scanner's three masks per 64 bytes, `cols` the event files through the column scanner with no
 field work, `retouch` the faults again after the pages are dropped.
 
-## Bench 11 (B, branch b-bench11): the scatter
+## Bench 12 (B, branch b-bench12): the scatter
 
 Bench 9 put the scatter at 272 thread-ms of the parse's 1,387 at 20M, most of it waiting on memory. Twelve
 builds: `v` (v4 8384d32 as its Dockerfile, sha256 eb129ec6..., scored 0.38), `h` (v4 cf4452a as its

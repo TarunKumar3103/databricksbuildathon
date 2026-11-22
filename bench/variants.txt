@@ -1,4 +1,4 @@
-# Bench 11 (B, branch b-bench11): the scatter. tag, binary in /usr/local/bench, ENV=VALUE.
+# Bench 12 (B, branch b-bench12): the scatter. tag, binary in /usr/local/bench, ENV=VALUE.
 # The first build also writes the dev output that the report rows are added to.
 v    ss-8384d32-clang18-pgo     # v4 8384d32 as its Dockerfile (sha256 eb129ec6...): scored 0.38
 h    ss-cf4452a-clang18-pgo     # v4 cf4452a as its Dockerfile (sha256 1f8a1564...): A's two scan commits on top of v
