@@ -20,10 +20,12 @@ RUN clang++-18 -std=c++17 -O2 -fno-vectorize -fno-slp-vectorize -march=cascadela
         -o /shopping-sessions src/main.cpp \
  && strip /shopping-sessions
 
-# Run stage: just the binary. The scorer runs it as uid 1000 with a read-only root filesystem;
-# it only reads $DATA_DIR and writes $OUTPUT_DIR.
-FROM debian:bookworm-slim
-RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
+# The executable is static. Include the mount points in the read-only root image.
+RUN install -d /runtime-root/data /runtime-root/output /runtime-root/scratch /runtime-root/tmp \
+ && chmod 1777 /runtime-root/tmp
+FROM scratch
+COPY --from=build /runtime-root/ /
 COPY --from=build /shopping-sessions /usr/local/bin/shopping-sessions
 ENV DATA_DIR=/data OUTPUT_DIR=/output SCRATCH_DIR=/scratch
+USER 1000:1000
 CMD ["/usr/local/bin/shopping-sessions"]
