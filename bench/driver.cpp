@@ -701,10 +701,11 @@ int main() {
       // bench 10: tag=wall/parse CPU/scan CPU in ms (medians); then the route if not dense, !n failed runs,
       // or the number of good runs if some round did not run
       (void)us;
-      (void)ss;
       (void)th;
-      a += fmt(" %s=%.0f/%.0f/%.0f%s%s", vs[vi].tag.c_str(), mw, ph[1].empty() ? -1.0 : median(ph[1]) * 1000,
-               ph[2].empty() ? -1.0 : median(ph[2]) * 1000, route == 'd' ? "" : fmt("%c", route).c_str(),
+      // bench 13: a fourth number, the system CPU time of the whole process in ms (median)
+      a += fmt(" %s=%.0f/%.0f/%.0f/%.0f%s%s", vs[vi].tag.c_str(), mw, ph[1].empty() ? -1.0 : median(ph[1]) * 1000,
+               ph[2].empty() ? -1.0 : median(ph[2]) * 1000, ss.empty() ? -1.0 : median(ss) * 1000,
+               route == 'd' ? "" : fmt("%c", route).c_str(),
                bad ? fmt("!%d", bad).c_str() : (w.size() == (size_t)z.rounds ? "" : fmt(",%zu", w.size()).c_str()));
       if (!w.empty() && std::find(tl_tags.begin(), tl_tags.end(), vs[vi].tag) != tl_tags.end()) {
         // the timeline of the run with the median wall time

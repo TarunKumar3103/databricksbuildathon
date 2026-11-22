@@ -108,3 +108,25 @@ with the partitions' record counts taken in parallel), `n` (cf4452a with the kno
 shared), `g5` / `g20` (segments of 5 / 20 partitions), `s4` (the scan on 4 pinned threads); `e15` (event
 partitions of 2^15 indexes: half the staging lines, 512 KB slot tables) and `e154` (e15 with the scan on 4
 pinned threads, so one slot table per core). Four rounds at both sizes.
+
+## Bench 13 (A, branch a-bench13): partition sizes on the new head, and clicks placed by click index
+
+Same harness as bench 11; an entry in rows `!1` and `!2` is now `tag=wall/parse CPU/scan CPU/system CPU`, all
+in ms (medians; the first two CPU numbers are user time of those phases, the last the system time of the whole
+process). Twelve builds, four rounds at both sizes, timelines of `x`, `k10`, `c12`, `c13`.
+
+- `x` v4 2589f28 (head) and `m` v4 cf4452a (0.38), as their Dockerfiles build them.
+- `x14`, `x16`: the head with event partitions of 2^14 and 2^16 indexes (256 KB and 1 MB slot tables; bench 11
+  had 2^15 against 2^14 on cf4452a, which still prefetched blocks).
+- `k9`, `k10`: the head with click partitions of 512 and 1,024 persons. At 60M there are 7,240 click
+  partitions of 256 persons, so a thread's click staging lines take 463 KB, more than the events' 124 KB.
+- `c11`, `c12`, `c13`: the branch `a-ckidx` (sources in `bench/variants/ckidx`), which gives up the person
+  partitions for clicks: click_ids are unscrambled to click indexes, which the generator hands out person by
+  person, and a click partition is 2^11, 2^12 or 2^13 consecutive indexes, placed in a slot table like the
+  events. In the cost model its click path has more instructions than load_clicks, and here its scan is no
+  faster; what it can win is the scatter (1,900 partitions at 60M with 2^13).
+- `g3`, `g10`: the head with segments of 3 and 10 event partitions; `c12g`: c12 with segments of 10.
+
+The knob builds are `bench/variants/2589f28-knobs/knobs.diff` on 2589f28 with `-DSS_KE=` / `-DSS_KC=`, each
+with a profile of its own (`pgobuild.sh`). Every build matches the references here (66 runs over segment sizes
+and thread counts, the 20M set at 8 threads).

@@ -1,13 +1,14 @@
-# Bench 11 (chat A). tag, binary in /usr/local/bench, then ENV=VALUE settings.
+# Bench 13 (chat A). tag, binary in /usr/local/bench, then ENV=VALUE settings.
 # The first build also writes the dev output that the report rows are added to.
-j    ss-8384d32-clang18-pgo                # v4 8384d32 as its Dockerfile: scored 0.38 at 18:53
-k    ss-286f27c-clang18-pgo                # v4 286f27c: j + the segment ends as a pass after the scan
-m    ss-cf4452a-clang18-pgo                # v4 cf4452a (head): k + ends taken as soon as their segments are through + the largest click partitions loaded once
-w    ss-cf4452a-parcount                   # m + the partitions' record counts taken in parallel at the start of the scan
-n    ss-cf4452a-knobs                      # cf4452a with the bench knobs (bench/variants/cf4452a-knobs/knobs.py) at their defaults: should equal m
-nb   ss-cf4452a-knobs SS_CKBIG=2000000000  # no click partition is shared: what loading the largest one once is worth
-g5   ss-cf4452a-knobs SS_SEGPART=5         # segments of 5 partitions instead of 10 (their ends cost little now)
-g20  ss-cf4452a-knobs SS_SEGPART=20        # ... of 20
-s4   ss-cf4452a-knobs SS_ST=4              # the scan on 4 threads, one pinned to each core
-e15  ss-cf4452a-ke15 SS_SEGPART=5          # event partitions of 2^15 indexes: half the staging lines, 512 KB slot tables
-e154 ss-cf4452a-ke15 SS_SEGPART=5 SS_ST=4  # ... with the scan on 4 pinned threads (one slot table per core)
+x    ss-2589f28-clang18-pgo                # v4 2589f28 (head) as its Dockerfile: cf4452a + KE = 15 + no block prefetch + parallel counts
+m    ss-cf4452a-clang18-pgo                # v4 cf4452a: scored 0.38 at 19:54 (bench 11's m)
+x14  ss-2589f28-ke14                       # x with event partitions of 2^14 indexes (256 KB slot tables), profile of its own
+x16  ss-2589f28-ke16                       # ... of 2^16 (1 MB slot tables, a quarter of bench 11's staging lines)
+k9   ss-2589f28-kc9                        # x with click partitions of 512 persons instead of 256: half the click staging lines
+k10  ss-2589f28-kc10                       # ... of 1,024 persons: a quarter
+c11  ss-ckidx-kci11                        # clicks placed by click index (bench/variants/ckidx): partitions of 2,048 indexes
+c12  ss-ckidx-kci12                        # ... of 4,096 (the branch's default)
+c13  ss-ckidx-kci13                        # ... of 8,192
+g3   ss-2589f28-clang18-pgo SS_SEGPART=3   # x with segments of 3 event partitions instead of 5
+g10  ss-2589f28-clang18-pgo SS_SEGPART=10  # ... of 10
+c12g ss-ckidx-kci12 SS_SEGPART=10          # c12 with segments of 10 (half as many click partitions placed twice)
