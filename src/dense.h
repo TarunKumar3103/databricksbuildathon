@@ -1098,10 +1098,28 @@ static NOINLINE u32 process_events(EvB& B, const u8* const base, WCScatter<D16>:
   // (c: a copy of the cursor whose address never escapes, so that the compiler keeps it in registers;
   // cur itself is handed to ev_slow below)
   auto c = cur;
+#if SS_PFD > 0
+  if (plain) {
+    // the staging line of the record SS_PFD records ahead is fetched while this one is pushed (when there is
+    // none left, the current one's again: harmless, and no branch)
+    u64 ma = plain;
+    for (int k = 0; k < SS_PFD; k++) {
+      WCScatter<D16>::prefetch(c, B.part[(u32)_tzcnt_u64(ma ? ma : plain)]);
+      ma = _blsr_u64(ma);
+    }
+    for (u64 m = plain; m; m = _blsr_u64(m)) {
+      const u32 i = (u32)_tzcnt_u64(m);
+      WCScatter<D16>::prefetch(c, B.part[(u32)_tzcnt_u64(ma ? ma : m)]);
+      ma = _blsr_u64(ma);
+      WCScatter<D16>::push16(c, B.part[i], _mm_load_si128((const __m128i*)&B.rec[i]));
+    }
+  }
+#else
   for (u64 m = plain; m; m = _blsr_u64(m)) {
     const u32 i = (u32)_tzcnt_u64(m);
     WCScatter<D16>::push16(c, B.part[i], _mm_load_si128((const __m128i*)&B.rec[i]));
   }
+#endif
   // purchases with a valid price whose category and price fit the record: the plain record and the payload.
   // Anything else about them (a bad price, a payload that does not fit) is left to ev_slow, as before.
   for (u64 m = purch; m; m = _blsr_u64(m)) {
@@ -1329,10 +1347,26 @@ static NOINLINE u32 process_clicks(CkB& B, const u8* const base, WCScatter<C16>:
   }
   good &= kept;
   auto cur = cur_out;
+#if SS_PFD > 0
+  if (const u64 gm = good & ~irr) {
+    u64 ma = gm;
+    for (int k = 0; k < SS_PFD; k++) {
+      WCScatter<C16>::prefetch(cur, B.part[(u32)_tzcnt_u64(ma ? ma : gm)]);
+      ma = _blsr_u64(ma);
+    }
+    for (u64 m = gm; m; m = _blsr_u64(m)) {
+      const u32 i = (u32)_tzcnt_u64(m);
+      WCScatter<C16>::prefetch(cur, B.part[(u32)_tzcnt_u64(ma ? ma : m)]);
+      ma = _blsr_u64(ma);
+      WCScatter<C16>::push16(cur, B.part[i], _mm_load_si128((const __m128i*)&B.rec[i]));
+    }
+  }
+#else
   for (u64 m = good & ~irr; m; m = _blsr_u64(m)) {
     const u32 i = (u32)_tzcnt_u64(m);
     WCScatter<C16>::push16(cur, B.part[i], _mm_load_si128((const __m128i*)&B.rec[i]));
   }
+#endif
   for (u64 m = good & irr; m; m = _blsr_u64(m)) {
     const u32 i = (u32)_tzcnt_u64(m);
     ck_slow(tl, B, i, base, (u32)((u64)B.ts[i] - (u64)cws), (u32)B.camp[i]);
