@@ -14,6 +14,7 @@
 #include <fcntl.h>
 #include <immintrin.h>
 #include <linux/futex.h>
+#include <malloc.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -3330,6 +3331,12 @@ static inline void exit_now() {
 
 int main(int argc, char** argv) {
   g_t0 = now_s();
+#if SS_TOPPAD
+  // The threads' malloc heaps grow this many bytes at a time instead of a page: each growth is an mprotect,
+  // which takes the address space's lock for writing, waiting for the page faults and drops in progress and
+  // holding up the ones after it (about 750 of them in a 20M run otherwise). Bench 12 row vt.
+  mallopt(M_TOP_PAD, SS_TOPPAD);
+#endif
   if (argc >= 2 && strcmp(argv[1], "--selftest") == 0) return selftest();
   if (argc >= 4 && strcmp(argv[1], "--bench-parse") == 0) return bench_parse(argv[2], argv[3], argc >= 5 ? atoi(argv[4]) : 5);
   const char* lg = getenv("SS_LOG");
