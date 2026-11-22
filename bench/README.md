@@ -209,3 +209,10 @@ Bench 22: pq +5% at both sizes (parse CPU +35%: the person lookup and a third sc
 CPU -62%); nd -17%. A parse thread then fills staging lines for R2, Q, the 33-byte Q and R2C at once (about
 13k lines, 850 KB at 60M), more than L2. Here the event-id and person partitions are halved and quartered
 together (SS_P1ADJ, SS_P2ADJ), on PQ and on the R1 route.
+
+## Bench 24 (A): threads per phase
+
+Bench 23: the PQ route stays 3 to 5% slower with fewer partitions; the R1 route with fewer partitions = f.
+`ss-nt` is ff33593 with `bench/variants/ff33593-phase-threads.diff`: workers whose number is at or above
+SS_DEDUP_NT / SS_PERSON_NT / SS_PARSE_NT take no tasks in that phase. Bench 18 had 4 threads for the whole run
++25%; the dedup's second pass and the person phase work in L2-sized partitions, which two hyperthreads share.

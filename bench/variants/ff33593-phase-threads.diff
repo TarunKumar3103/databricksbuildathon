@@ -1,0 +1,22 @@
+--- /dev/fd/63	2026-11-22 01:32:18.133624518 -0500
++++ src/main.cpp	2026-11-22 01:31:35.186202255 -0500
+@@ -124,7 +124,9 @@
+ static inline void futex_wake_all(std::atomic<u32>* a) { syscall(SYS_futex, (u32*)a, FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0); }
+ 
+ // Tasks of job j until none is left.
++static int g_phase_nt[6] = {256, 256, 256, 256, 256, 256};  // (bench knob: threads that take tasks, per phase)
+ static void pool_take(PoolJob* j, int tid) {
++  if (tid >= g_phase_nt[j->phase]) return;
+   u64 u0 = 0, s0 = 0, u1, s1;
+   bool any = false;
+   for (;;) {
+@@ -3813,6 +3815,9 @@
+   const u32 P2bits_gen = std::min<u32>(12, std::max<u32>(4, ceil_log2(est_lines / 32768 + 1)));
+   g_P1bits = P1bits_gen;
+   g_P2bits = P2bits_gen;
++  if (const char* e = getenv("SS_DEDUP_NT")) g_phase_nt[3] = std::max(1, atoi(e));
++  if (const char* e = getenv("SS_PERSON_NT")) g_phase_nt[4] = std::max(1, atoi(e));
++  if (const char* e = getenv("SS_PARSE_NT")) g_phase_nt[2] = std::max(1, atoi(e));
+   size_t id_input_bytes = ev_bytes;
+   for (const auto& f : ck) id_input_bytes += f.size;
+   for (const auto& f : lk) id_input_bytes += f.size;
