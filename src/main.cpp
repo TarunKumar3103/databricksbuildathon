@@ -3406,8 +3406,17 @@ int main(int argc, char** argv) {
       dn::g_nu_cap = (u32)nu;
       dn::g_PE = (u32)(dn::g_ne_cap >> dn::KE);
       dn::g_PC = dn::g_nu_cap >> dn::KC;
-      dn::sample<7>(ev, 'e', 'u', 4096, samp);
-      if (dn::recover_user_key(samp)) {
+      // (A few hundred lines are enough for the user key, as one line in ten or twenty is of the five busiest
+      // users. The event key wants more of them, but it is not needed before the parse: the setup thread
+      // below takes its own sample while the links are read.)
+      dn::sample<7>(ev, 'e', 'u', 512, samp);
+      bool got = dn::recover_user_key(samp);
+      if (!got) {
+        samp.clear();
+        dn::sample<7>(ev, 'e', 'u', 4096, samp);
+        got = dn::recover_user_key(samp);
+      }
+      if (got) {
         dn::g_on = true;
         dn::g_acc = (std::atomic<u64>*)vm_alloc(sizeof(std::atomic<u64>) * dn::g_nu_cap);
         g_P2bits = std::min<u32>(8, std::max<u32>(4, ceil_log2(est_lines / (32768 * 16) + 1)));
@@ -3420,7 +3429,11 @@ int main(int argc, char** argv) {
   // The lookups and the per-thread state are not needed for the links: set them up on the side meanwhile.
   std::thread setup([&] {
     load_lookups(data);
-    if (dn::g_on && !dn::recover_event_key(samp)) dn::fail("no key for the event ids");
+    if (dn::g_on) {
+      std::vector<dn::Samp> esamp;
+      dn::sample<7>(ev, 'e', 'u', 4096, esamp);
+      if (!dn::recover_event_key(esamp)) dn::fail("no key for the event ids");
+    }
     if (dn::g_on && (u64)(g_we - g_ws) > 0x7FFFFFF0ULL) dn::fail("window too long");
     if (dn::g_on && g_cats.size() > 255) dn::fail("too many categories");
     if (dn::g_on && g_ncamp > dn::CK_CAMP) dn::fail("too many campaigns");
