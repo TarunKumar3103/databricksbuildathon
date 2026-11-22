@@ -118,3 +118,14 @@ the build it replaces; t: v4 6d5b17b (head since 20:44, fast-forwarded from c-vt
 more, for the noise between two copies of one build in one session. Eight rounds at 20M, six at 60M; timelines of
 v, t and c. What to read: t and c against v and v2, in wall time and in parse CPU (the second number); the scan
 CPU (the third) should not move.
+
+## Bench 17 (C, branch c-bench17): the bundle's pieces and their sum at 60M
+
+Tarun's standing note: build for 60M events and 15M clicks, judge by the 60M rows, bundle the small commits into
+one entry. This bench measures the pieces waiting for that entry and their sum, each as its Dockerfile builds it
+with a profile of its own: h = v4 226ca9f (head); c = c-vts b5c9de0 (h + C's three commits: the ID checks in
+mask registers, the prefix bytes and campaign lookup, the 13-digit timestamps two at a time); a = a-bundle
+792b9c4 (h + B's record path, A's start, the heaps on huge pages; A's gated binary); al = a + B's links (b-lk
+2da81da); s = c-sum 4c303d0, a + b-lk + c-vts' three commits (the whole sum); h2 = h once more for the noise. Five rounds at 20M,
+eight at 60M; timelines of h, a and s. What to read: s against h at 60M is what the entry would gain; a, al and
+c against h say whether each piece pays; s against al and a whether they add.

@@ -1,7 +1,8 @@
-# Bench 14 (chat C). tag, binary in /usr/local/bench, then ENV=VALUE settings.
+# Bench 17 (chat C). tag, binary in /usr/local/bench, then ENV=VALUE settings.
 # The first build also writes the dev output that the report rows are added to.
-v    ss-2589f28-clang18-pgo    # v4 2589f28 as its Dockerfile: cf4452a + KE = 15, no block prefetch, parallel counts
-m    ss-cf4452a-clang18-pgo    # v4 cf4452a as its Dockerfile: scored 0.38 at 19:54
-t    ss-6d5b17b-clang18-pgo    # v4 6d5b17b (head since 20:44, = c-vts 6d5b17b): v + the event timestamps eight lines at a time
-c    ss-226ca9f-clang18-pgo    # c-vts 226ca9f: t + the click timestamps eight lines at a time
-v2   ss-2589f28-clang18-pgo    # v once more: how far two copies of one build differ in this session
+h    ss-226ca9f-clang18-pgo     # v4 226ca9f (head) as its Dockerfile
+c    ss-b5c9de0-clang18-pgo     # c-vts b5c9de0: h + C's three commits (ID checks in mask registers, prefix bytes and campaign lookup, 13-digit pairs)
+a    ss-792b9c4-clang18-pgo     # a-bundle 792b9c4 as its Dockerfile: h + B's record path (SS_PFD 4, top pad 64 MB) + A's start + heaps on huge pages
+al   ss-bundle-lk-clang18-pgo   # a + B's links (b-lk 2da81da), own profile
+s    ss-sum-clang18-pgo         # c-sum 4c303d0: a + b-lk + c-vts' three commits, own profile: the whole sum
+h2   ss-226ca9f-clang18-pgo     # h once more: the noise between two copies of one build
