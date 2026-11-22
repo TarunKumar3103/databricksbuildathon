@@ -16,7 +16,9 @@
 #include <signal.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <sys/statvfs.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
@@ -466,6 +468,64 @@ static int32_t day_of(const std::string& manifest) {  // days since 1970 of wind
   return era * 146097 + (int)doe - 719468;
 }
 
+// Bench 12: the memory node of every 4th page of the files in dir (mapped and read here), of fresh anonymous
+// memory, as "n0/n1/other" counts. (move_pages with no target nodes only reports where pages are.)
+static std::string node_counts(void* const* pages, size_t n) {
+  long long c[3] = {0, 0, 0};
+  std::vector<int> st(1024);
+  for (size_t a = 0; a < n; a += 1024) {
+    const size_t k = std::min<size_t>(1024, n - a);
+    if (syscall(SYS_move_pages, 0, (unsigned long)k, (void**)(pages + a), nullptr, st.data(), 0) != 0) return "err";
+    for (size_t i = 0; i < k; i++) c[st[i] == 0 ? 0 : st[i] == 1 ? 1 : 2]++;
+  }
+  return fmt("%lld/%lld/%lld", c[0], c[1], c[2]);
+}
+static std::string file_nodes(const std::string& dir, size_t max_mb) {
+  std::vector<void*> pages;
+  std::vector<std::pair<void*, size_t>> maps;
+  size_t mapped = 0;
+  DIR* d = opendir(dir.c_str());
+  if (!d) return "nodir";
+  while (dirent* e = readdir(d)) {
+    if (e->d_name[0] == '.') continue;
+    const std::string p = dir + "/" + e->d_name;
+    const int fd = open(p.c_str(), O_RDONLY);
+    if (fd < 0) continue;
+    struct stat stt {};
+    if (fstat(fd, &stt) == 0 && stt.st_size > 0 && mapped < (max_mb << 20)) {
+      const size_t sz = (size_t)stt.st_size;
+      uint8_t* m = (uint8_t*)mmap(nullptr, sz, PROT_READ, MAP_SHARED, fd, 0);
+      if (m != MAP_FAILED) {
+        volatile uint8_t sink = 0;
+        for (size_t o = 0; o < sz; o += 16384) {
+          sink = sink + m[o];
+          pages.push_back(m + o);
+        }
+        maps.push_back({m, sz});
+        mapped += sz;
+      }
+    }
+    close(fd);
+  }
+  closedir(d);
+  const std::string r = node_counts(pages.data(), pages.size()) + fmt("@%zuM", mapped >> 20);
+  for (auto& x : maps) munmap(x.first, x.second);
+  return r;
+}
+static std::string anon_nodes() {
+  const size_t sz = (size_t)64 << 20;
+  uint8_t* m = (uint8_t*)mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (m == MAP_FAILED) return "err";
+  std::vector<void*> pages;
+  for (size_t o = 0; o < sz; o += 16384) {
+    m[o] = 1;
+    pages.push_back(m + o);
+  }
+  std::string r = node_counts(pages.data(), pages.size());
+  munmap(m, sz);
+  return r;
+}
+
 int main() {
   g_t0 = now_s();
   const std::string data = env_or("DATA_DIR", "/data"), out = env_or("OUTPUT_DIR", "/output");
@@ -527,6 +587,18 @@ int main() {
   const std::string cgmax = first_line("/sys/fs/cgroup/memory.max"), cpumax = first_line("/sys/fs/cgroup/cpu.max");
   std::string env_s = fmt("cpus=%d k=%s scr=%.0fG cg=%s/%s dev=%.0fms nvar=%zu", ncpu, un.release, scratch_gb,
                           cpumax.c_str(), cgmax.c_str(), dev_ms, vs.size());
+  // 3b. memory nodes (bench 12): each node's CPUs, the CPU and node this runs on, and where the pages are of the
+  // dev set's events (put on DATA_DIR by the scorer, as the scored set is), of the clicks, and of fresh memory
+  std::string numa_s;
+  {
+    unsigned cpu = 0, node = 0;
+    syscall(SYS_getcpu, &cpu, &node, nullptr);
+    numa_s = fmt("!n nodes0=%s,1=%s,mems=%s run=c%u/n%u data_ev=%s data_ck=%s anon=%s",
+                 first_line("/sys/devices/system/node/node0/cpulist").c_str(),
+                 first_line("/sys/devices/system/node/node1/cpulist").c_str(),
+                 first_line("/sys/fs/cgroup/cpuset.mems.effective").c_str(), cpu, node,
+                 file_nodes(data + "/events", 512).c_str(), file_nodes(data + "/clicks", 128).c_str(), anon_nodes().c_str());
+  }
 
   // 4. sizes
   struct Size {
@@ -584,6 +656,7 @@ int main() {
                  bytes / 1e9, dirty0 >= 0 ? dirty0 >> 20 : -1, sync_s, synced ? "" : "+",
                  g.status ? fmt(",exit=%d", g.status).c_str() : "");
     if (g.status != 0 || bytes <= 0) continue;
+    if (sizeno == 1) numa_s += " scr=" + file_nodes(gdir + "/events", 256);  // (pages the generator wrote here)
 
     // interleaved rounds, the order rotated each round
     std::vector<std::vector<Run>> res(vs.size());
@@ -723,6 +796,7 @@ int main() {
       if (!stg_tags.empty()) srows2.push_back(Row{fmt("!s%d %.0fM%s", sizeno, z.ev_m, sh.c_str()), "-", 0, 0, 0});
     }
   }
+  rows.insert(rows.begin(), Row{numa_s, "-", 0, 0, 0});
   for (auto& r : srows) rows.push_back(r);
   for (auto& r : srows2) rows.push_back(r);
   for (auto& r : srows3) rows.push_back(r);

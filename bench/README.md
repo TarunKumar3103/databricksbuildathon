@@ -117,6 +117,12 @@ stage counters, with `-DSTAGES`), `ps` (`s` with `-DSS_PFD=8`) and `f` (`s` with
 
 Rows, after `!1 20M` and `!2 60M` as before:
 
+- `!n ...` (first): the memory nodes. `nodes0=`/`1=` each node's CPUs, `mems=` the container's memory nodes,
+  `run=` the CPU and node the driver started on, then where pages are, as counts on node 0 / node 1 / neither
+  (every 4th page, `@` the MB looked at): `data_ev` and `data_ck` the dev set's event and click files on
+  `DATA_DIR`, which the scorer put there as it puts the scored set, `anon` fresh memory written here, `scr` the
+  20M set the generator wrote to /scratch. The machine has two nodes (bench 10's machine row), so the scored
+  input may sit on the far one.
 - `!f1 20M ...` / `!f2 60M ...`: build f's floors in wall ms with all threads. Bench 9's five (`touch read
   masks cols retouch`), then the arena's: `zf` one byte written per 4 KB of fresh memory (page faults and the
   kernel's zeroing alone), `ntw` non-temporal 64-byte lines over that memory once it is faulted in, `stw`
