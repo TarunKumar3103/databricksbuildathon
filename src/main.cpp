@@ -3475,7 +3475,7 @@ static int run_sol(std::vector<MFile>& ev, std::vector<MFile>& ck) {
     if (z > a) madvise((void*)(all[c.file].data + a), z - a, MADV_DONTNEED);
   });
   timed(4, touch);
-  // 6 to 11 (bench 10): writing the arena. W bytes in all, about what the records of this input take (16 bytes
+  // 6 to 11 (bench 11): writing the arena. W bytes in all, about what the records of this input take (16 bytes
   // per line of about 72), split over the threads; each thread has its own memory, as in the parse.
   double wm[6] = {0, 0, 0, 0, 0, 0};
   // (at most 384 MB in all, so that a 60M set's page cache is not pushed out)
