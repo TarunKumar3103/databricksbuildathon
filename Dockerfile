@@ -15,8 +15,10 @@ COPY pgo/ ./pgo/
 # pgo/make-profile.sh by the same clang version. Nothing runs on the build machine.
 # -fno-pie: Ubuntu's clang makes position-independent code even for a static binary; without it the tables
 # have absolute addresses. On the scorer bench 0.7% faster at 20M events and 0.9% at 60M.
+# Restore the v5 training profile (gzip + Base64); the runtime image contains only the executable.
+RUN base64 -d pgo/v5.profdata.gz.b64 | gzip -dc > /tmp/v5.profdata
 RUN clang++-18 -std=c++17 -O2 -fno-vectorize -fno-slp-vectorize -march=cascadelake -mtune=cascadelake -static -pthread -fno-pie \
-        -fprofile-instr-use=pgo/clang18.profdata -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled \
+        -fprofile-instr-use=/tmp/v5.profdata -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled \
         -o /shopping-sessions src/main.cpp \
  && strip /shopping-sessions
 
