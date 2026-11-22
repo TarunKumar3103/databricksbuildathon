@@ -3032,7 +3032,7 @@ static NOINLINE u32 emit_event_columns(dn::EvB& b, const u8* base, WCScatter<R1>
   const u64 span = static_cast<u64>(we - ws);
   u32 kept = 0;
   alignas(32) R1 records[dn::EvB::CAP];
-  u32 part[dn::EvB::CAP];
+  u32 part[dn::EvB::CAP + SS_PFD + 1];
   for (u32 i = 0; i < n; ++i) {
     const u32 elen = b.ln[0][i];
     if (!elen) continue;
@@ -3072,8 +3072,18 @@ static NOINLINE u32 emit_event_columns(dn::EvB& b, const u8* base, WCScatter<R1>
     ++kept;
   }
   auto out = cur;
-  for (u32 i = 0; i < kept; ++i)
+#if SS_PFD > 0
+  // (the staging line of the record SS_PFD records ahead is fetched for writing while this one is pushed)
+  for (u32 i = 0; i < kept && i < SS_PFD; ++i) WCScatter<R1>::prefetch(out, part[i]);
+  part[kept] = part[kept > 0 ? kept - 1 : 0];
+  for (u32 i = kept + 1; i < kept + SS_PFD + 1 && i < dn::EvB::CAP + SS_PFD + 1; ++i) part[i] = part[kept];
+#endif
+  for (u32 i = 0; i < kept; ++i) {
+#if SS_PFD > 0
+    WCScatter<R1>::prefetch(out, part[i + SS_PFD]);
+#endif
     WCScatter<R1>::push32(out, part[i], _mm256_load_si256(reinterpret_cast<const __m256i*>(&records[i])));
+  }
   cur = out;
   return kept;
 }
