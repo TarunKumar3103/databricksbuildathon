@@ -305,6 +305,10 @@ static NOINLINE u64 parse_link_chunk_dense(const u8* begin, const u8* end, bool 
   return nl + n;
 }
 
+// The link lines through the column scanner, the two IDs of four lines at a time (defined below, after the
+// vector helpers). SS_LINKS_OLD=1 builds the line-at-a-time path above instead.
+static NOINLINE u64 parse_link_chunk_vec(const u8* begin, const u8* end, bool skip_header, LinkList& keep);
+
 static void build_links_dense(std::vector<MFile>& files) {
   std::vector<Chunk> chunks;
   make_chunks(files, 1 << 18, chunks);
@@ -315,7 +319,11 @@ static void build_links_dense(std::vector<MFile>& files) {
     const Chunk& c = chunks[t];
     const MFile& f = files[c.file];
     size_t b = line_start_at_or_after(f, c.nominal), e = line_start_at_or_after(f, c.nominal_end);
+#if SS_LINKS_OLD
     part[t] = b < e ? parse_link_chunk_dense(f.data + b, f.data + e, b == 0, keep[tid]) : 0;
+#else
+    part[t] = b < e ? parse_link_chunk_vec(f.data + b, f.data + e, b == 0, keep[tid]) : 0;
+#endif
   });
   size_t nlinks = 0, nkept = 0;
   for (size_t c : part) nlinks += c;
@@ -955,6 +963,102 @@ static FORCE_INLINE u64 nonzero64(const u8* f) {
   const u32 a = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_load_si256((const __m256i*)f), z));
   const u32 b = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_load_si256((const __m256i*)(f + 32)), z));
   return ~((u64)a | ((u64)b << 32));
+}
+
+// Link lines, a batch of up to 64: the same decisions as process_links_dense, with the IDs decoded four lines
+// at a time as in the event parse (the 8 bytes after each 'u', ids4, unscramble4, the same range checks).
+struct LkB : Cols<2, 64> {
+  alignas(32) u64 aq[CAP + 8], bq[CAP + 8];  // the 8 bytes after the first byte of each ID
+  alignas(32) u8 pa[CAP + 8], pb[CAP + 8];   // nonzero: that first byte is not 'u'
+  alignas(32) u32 x[CAP + 8], y[CAP + 8];    // the user numbers of the two IDs, NONE if not regular
+};
+static NOINLINE u32 process_links_vec(LkB& B, const u8* const base, LinkList& keep) {
+  const u32 n = B.n;
+  B.pad();
+  for (u32 i = 0; i < n; i++) {
+    const u8* const a = base + B.st[0][i];
+    const u8* const b = base + B.st[1][i];
+    memcpy(&B.aq[i], a + 1, 8);
+    memcpy(&B.bq[i], b + 1, 8);
+    B.pa[i] = (u8)(a[0] ^ 'u');
+    B.pb[i] = (u8)(b[0] ^ 'u');
+  }
+  u64 bad_a = nonzero64(B.pa), bad_b = nonzero64(B.pb), empty = 0, inword = 0;
+  {
+    const __m256i ukey = _mm256_set1_epi64x((long long)g_ukey), M = _mm256_set1_epi64x((long long)M40);
+    const __m256i umax = _mm256_set1_epi64x((long long)(((u64)g_nu_cap << 9) - 1));
+    const __m256i none = _mm256_set1_epi32((int)NONE), zero = _mm256_setzero_si256();
+    const __m256i amask = _mm256_set1_epi32(511), kam = _mm256_set1_epi32((int)KA - 1);
+    for (u32 i = 0; i < n; i += 8) {
+      empty |= (u64)(eq32x8(_mm256_load_si256((const __m256i*)(B.ln[0] + i)), zero) |
+                     eq32x8(_mm256_load_si256((const __m256i*)(B.ln[1] + i)), zero))
+               << i;
+      for (u32 h = 0; h < 8; h += 4) {
+        __m256i va, vb;
+        u32 ba = ids4(B.aq + i + h, B.ln[0] + i + h, va);
+        u32 bb = ids4(B.bq + i + h, B.ln[1] + i + h, vb);
+        const __m256i na = unscramble4(va, ukey), nb = unscramble4(vb, ukey);
+        ba |= gtu64x4(va, M) | gtu64x4(na, umax);
+        bb |= gtu64x4(vb, M) | gtu64x4(nb, umax);
+        bad_a |= (u64)ba << (i + h);
+        bad_b |= (u64)bb << (i + h);
+        _mm_store_si128((__m128i*)(B.x + i + h), low32x4(na));
+        _mm_store_si128((__m128i*)(B.y + i + h), low32x4(nb));
+      }
+      // (NONE where an ID is not regular)
+      const u32 ma = (u32)(bad_a >> i) & 0xFF, mb = (u32)(bad_b >> i) & 0xFF;
+      const __m256i x8 = _mm256_load_si256((const __m256i*)(B.x + i)), y8 = _mm256_load_si256((const __m256i*)(B.y + i));
+      _mm256_store_si256((__m256i*)(B.x + i), _mm256_blendv_epi8(x8, none, movm32x8(ma)));
+      _mm256_store_si256((__m256i*)(B.y + i), _mm256_blendv_epi8(y8, none, movm32x8(mb)));
+      // lines for the word of one index: both IDs regular, of the same index, with aliases below KA
+      const u32 same = eq32x8(_mm256_srli_epi32(x8, 9), _mm256_srli_epi32(y8, 9));
+      const u32 small = eq32x8(_mm256_min_epu32(_mm256_and_si256(x8, amask), kam), _mm256_and_si256(x8, amask)) &
+                        eq32x8(_mm256_min_epu32(_mm256_and_si256(y8, amask), kam), _mm256_and_si256(y8, amask));
+      inword |= (u64)(same & small & ~(ma | mb) & 0xFF) << i;
+    }
+  }
+  const u64 live = (n >= 64 ? ~0ULL : ((1ULL << n) - 1)) & ~empty;  // a line with an empty ID links nothing
+  const u64 fast = live & inword;
+  // the words, asked for a few lines ahead of their update
+  u64 ma = fast;
+  for (int k = 0; k < 6 && ma; k++, ma = _blsr_u64(ma)) __builtin_prefetch(&g_acc[B.x[_tzcnt_u64(ma)] >> 9], 1, 3);
+  for (u64 m = fast; m; m = _blsr_u64(m)) {
+    if (ma) {
+      __builtin_prefetch(&g_acc[B.x[_tzcnt_u64(ma)] >> 9], 1, 3);
+      ma = _blsr_u64(ma);
+    }
+    const u32 i = (u32)_tzcnt_u64(m);
+    const u32 x = B.x[i], y = B.y[i];
+    link_aliases(x >> 9, x & 511, y & 511);
+  }
+  for (u64 m = live & ~inword; m; m = _blsr_u64(m)) {
+    const u32 i = (u32)_tzcnt_u64(m);
+    const u32 x = B.x[i], y = B.y[i];
+    keep.push_back({hash_id(make_key(base + B.st[0][i], B.ln[0][i])), hash_id(make_key(base + B.st[1][i], B.ln[1][i]))});
+    if (x != NONE) g_acc[x >> 9].fetch_or(ACC_POISON, std::memory_order_relaxed);
+    if (y != NONE) g_acc[y >> 9].fetch_or(ACC_POISON, std::memory_order_relaxed);
+  }
+  B.n = 0;
+  return (u32)_mm_popcnt_u64(live);
+}
+static NOINLINE u64 parse_link_chunk_vec(const u8* begin, const u8* end, bool skip_header, LinkList& keep) {
+  LkB B;
+  u64 nl = 0;
+  const u8* base = begin;
+  scan::scan_cols<2>(
+      begin, end, skip_header,
+      [&](const u8* sb, const __m256i* C, const u32* q) __attribute__((always_inline)) {
+        base = sb;
+        B.add_group(C, q);
+        if (__builtin_expect(B.n > LkB::CAP - 8, 0)) nl += process_links_vec(B, sb, keep);
+      },
+      [&](const u8* sb, __m256i st, __m256i ln) __attribute__((always_inline)) {
+        base = sb;
+        B.add_row(st, ln, 1);
+        if (__builtin_expect(B.n > LkB::CAP - 8, 0)) nl += process_links_vec(B, sb, keep);
+      });
+  if (B.n) nl += process_links_vec(B, base, keep);
+  return nl;
 }
 
 // One batch. Returns the number of its lines that have an event_id.
