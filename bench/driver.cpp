@@ -577,6 +577,7 @@ int main() {
     }
   }
   std::vector<Row> rows;
+  rows.push_back(Row{"!0" + facts, env_s, (long long)dev_ms, ncpu, 0});  // (bench 8's last row was cut off)
   std::string gen_s;
   int sizeno = 0;
   for (const Size& z : sizes) {
@@ -697,13 +698,14 @@ int main() {
       if (vi < 3) med3[vi] = (long long)mw;
       (void)mn;  // (bench 1 printed the best wall time too: a=512/498,...)
       (void)rss;  // (benches 1 to 5 printed the peak memory too, as 626M)
-      a += fmt(" %s=%.0f,u%.2f,s%.2f,%c%s", vs[vi].tag.c_str(), mw, median(us), median(ss), route,
-               bad ? fmt("!%d", bad).c_str() : (w.size() == (size_t)z.rounds ? "" : fmt("%zu", w.size()).c_str()));
-      if (!th.empty() && *std::max_element(th.begin(), th.end()) > 0)  // throttled ms per run: median and most
-        a += fmt(",T%.1f/%.1f", median(th), *std::max_element(th.begin(), th.end()));
-      if (!ph[0].empty())  // CPU ms of links, parse, dedup or scan (the person phase and the output are a few ms)
-        b += fmt("%s%s:%.0f+%.0f+%.0f", b.empty() ? "" : " ", vs[vi].tag.c_str(), median(ph[0]) * 1000,
-                 median(ph[1]) * 1000, median(ph[2]) * 1000);
+      // bench 10: tag=wall/parse CPU/scan CPU in ms (medians); then the route if not dense, !n failed runs,
+      // or the number of good runs if some round did not run
+      (void)us;
+      (void)ss;
+      (void)th;
+      a += fmt(" %s=%.0f/%.0f/%.0f%s%s", vs[vi].tag.c_str(), mw, ph[1].empty() ? -1.0 : median(ph[1]) * 1000,
+               ph[2].empty() ? -1.0 : median(ph[2]) * 1000, route == 'd' ? "" : fmt("%c", route).c_str(),
+               bad ? fmt("!%d", bad).c_str() : (w.size() == (size_t)z.rounds ? "" : fmt(",%zu", w.size()).c_str()));
       if (!w.empty() && std::find(tl_tags.begin(), tl_tags.end(), vs[vi].tag) != tl_tags.end()) {
         // the timeline of the run with the median wall time
         const Run* best = nullptr;
@@ -715,17 +717,17 @@ int main() {
       }
     }
     a += fmt(" rows=%lld/%lld%s", ud0, cd0, agree ? "" : ",DIFFER");
-    b += tlines;
+    b += tlines.empty() ? "" : tlines.substr(1);
     rows.push_back(Row{a, b.empty() ? "-" : b, med3[0], med3[1], med3[2]});
   }
-  {  // the container's CPU throttling over the whole bench
+  std::string last;  // the container's CPU throttling over the whole bench
+  {
     const std::string cst = slurp("/sys/fs/cgroup/cpu.stat");
-    facts += fmt(" thr=%lld/%lldp,%.0fms", stat_field(cst, "nr_throttled"), stat_field(cst, "nr_periods"),
-                 stat_field(cst, "throttled_usec") / 1000.0);
+    last = fmt("thr=%lld/%lldp,%.0fms", stat_field(cst, "nr_throttled"), stat_field(cst, "nr_periods"),
+               stat_field(cst, "throttled_usec") / 1000.0);
   }
-  rows.push_back(Row{fmt("!%d %s%s tot=%.0fs", sizeno + 1, env_s.c_str(), notes.c_str(), el()),
-                     (gen_s.empty() ? std::string("-") : gen_s.substr(1)) + facts,
-                     (long long)dev_ms, ncpu, (long long)el()});
+  rows.push_back(Row{fmt("!%d tot=%.0fs%s %s", sizeno + 1, el(), notes.c_str(), last.c_str()),
+                     gen_s.empty() ? std::string("-") : gen_s.substr(1), (long long)dev_ms, ncpu, (long long)el()});
   if (!write_report(out, rows)) fprintf(stderr, "bench: report not written\n");
   for (auto& r : rows) fprintf(stderr, "BENCH %s || %s\n", r.uid.c_str(), r.cat.c_str());
   return 0;

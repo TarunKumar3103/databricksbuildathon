@@ -1,12 +1,16 @@
-# Written by bench/mkbench.py. tag, binary in /usr/local/bench, then ENV=VALUE settings.
+# Bench 10 (chat A). tag, binary in /usr/local/bench, then ENV=VALUE settings.
 # The first build also writes the dev output that the report rows are added to.
-v    ss-719ab70-clang18-pgo          # v4 719ab70 as its Dockerfile: scored 0.39 at 16:34, the anchor
-s    ss-3fb5c91-clang18-pgo          # b-ts 3fb5c91 (719ab70 + 64d49ec's add_group + scanner separator bits), A's baseline for the scan
-a    ss-57d15ec-clang18-pgo          # v4 57d15ec = 3fb5c91 + A's scan commit 28eda9a: scored 0.41
-h    ss-cf4f788-clang18-pgo          # v4 cf4f788 = 57d15ec + B's c5195d4 timestamp commit: head of v4, A's entry: scored 0.38 at 17:48
-hn   ss-cf4f788-clang18-pgo-nopie    # h with -fno-pie (bench 7: about 1% at 60M)
-t    ss-c5195d4-clang18-pgo          # b-ts c5195d4 = 3fb5c91 + the F1 timestamp kernels (no A's scan): -3.0% modelled against 719ab70
-t2   ss-9672e5a-clang18-pgo          # b-ts 9672e5a = c5195d4 + ingest code stored as 2^24 - code
-z    ss-358a234-clang18-pgo          # b-zmm 358a234 = c5195d4 + 512-bit block compares in the scanner
-h7   ss-cf4f788-clang18-pgo SS_THREADS=7   # h with 7 threads: whether the cgroup's CPU quota of 8 holds 8 threads back
-h4   ss-cf4f788-clang18-pgo SS_THREADS=4   # h with 4 threads, one per core: what the second hyperthread of each core gives
+j    ss-8384d32-clang18-pgo             # v4 8384d32 as its Dockerfile: scored 0.38 at 18:53
+k    ss-286f27c-clang18-pgo             # v4 286f27c as its Dockerfile: j + the segment ends as a pass of their own (head of v4)
+n    ss-286f27c-knobs                   # 286f27c with the bench knobs (bench/variants/286f27c-knobs/knobs.py), all at their defaults: should equal k
+pw   ss-286f27c-knobs SS_PW=1           # a record's staging line is asked for (for writing) when its partition is known
+lw   ss-286f27c-knobs SS_LW=1           # load_clicks asks for the lines its keys go to, eight clicks ahead
+p0   ss-286f27c-knobs SS_PF=0           # place() and load_clicks ask for no block ahead
+p2   ss-286f27c-knobs SS_PF=2           # ... for the block after the next
+h2   ss-286f27c-knobs SS_PFH=2          # ... for the next block with prefetcht2 (not into the first-level cache)
+h3   ss-286f27c-knobs SS_PFH=3          # ... with prefetchnta
+s4   ss-286f27c-knobs SS_ST=4           # the scan's segments on 4 threads, one pinned to each core
+s6   ss-286f27c-knobs SS_ST=6           # ... on 6 threads, not pinned
+e13  ss-286f27c-ke13 SS_SEGPART=20      # event partitions of 2^13 indexes: 128 KB slot tables, twice the staging lines
+e12  ss-286f27c-ke12 SS_SEGPART=40      # ... of 2^12: 64 KB slot tables
+c32  ss-286f27c-cap32                   # parse batches of 32 lines instead of 64

@@ -72,3 +72,29 @@ DATA_DIR=data/dev1 OUTPUT_DIR=/tmp/out SCRATCH_DIR=/tmp/scr BENCH_DIR=<folder wi
 ```
 
 `BENCH_SIZES` is `events M : clicks M : rounds` per size.
+
+## Bench 10 (A, branch a-bench10): why the scan gains nothing from the second hyperthread, and the scatter
+
+Benches 8 and 9 left two leads. Four threads (one per core) scan as fast as eight, so two threads on a core
+get in each other's way there; and the scatter of the records runs at about three times the cycles per
+instruction of the stages around it. Fourteen builds, each a small change to v4 286f27c:
+
+- `j` v4 8384d32 (scored 0.38), `k` v4 286f27c (j plus the segment ends as a pass of their own).
+- `n` 286f27c with the knobs of `bench/variants/286f27c-knobs/knobs.py`, all at their defaults (should equal k),
+  and the same binary with one knob set: `pw` (`SS_PW=1`: a record's staging line is asked for, for writing,
+  when its partition is known), `lw` (`SS_LW=1`: load_clicks asks for the lines its keys go to), `p0` / `p2`
+  (`SS_PF`: place() and load_clicks ask for no block ahead / for the block after the next), `h2` / `h3`
+  (`SS_PFH`: the next block with prefetcht2 / prefetchnta), `s4` / `s6` (`SS_ST`: the scan's segments on 4
+  threads pinned one to a core / on 6 threads).
+- `e13`, `e12`: event partitions of 2^13 and 2^12 indexes (slot tables of 128 and 64 KB), segments of the same
+  number of events as in k. `c32`: parse batches of 32 lines.
+
+Every build has a profile of its own (`pgobuild.sh`). The rows are short so that all of them fit the message:
+
+- `!0`: the machine facts first (bench 8's were cut off): `up=` ms from the container's hostname file, hosts
+  file and cgroup to the start of the process, `mnt=` file systems, `thp=`, the CPUs and memory nodes; its
+  `top_category` has the CPU count, kernel, cgroup limits and the dev run.
+- `!1 20M`, `!2 60M`: per build `tag=wall/parse/scan`: median wall ms, then the medians of the parse's and the
+  scan's user CPU in ms. A letter after it is the route if it was not the dense one, `!n` counts failed runs,
+  `,n` the good runs if a round did not run. `top_category` has the timelines of `BENCH_TIMELINE`'s builds.
+- `!3`: the whole bench in seconds, CPU throttling, and the generation of the sets.
