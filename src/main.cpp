@@ -2144,6 +2144,10 @@ static void drop_inputs(const std::vector<MFile>& files) {
   });
 }
 
+static u64 column_events(const u8*, const u8*, bool, TL&, u32, i64, i64);
+static u64 column_clicks(const u8*, const u8*, bool, TL&, i64, i64);
+static bool use_column_times();
+
 static void parse_events_clicks(std::vector<MFile>& ev, std::vector<MFile>& ck) {
   size_t ev_bytes = 0, ck_bytes = 0;
   for (auto& f : ev) ev_bytes += f.size;
@@ -2151,9 +2155,11 @@ static void parse_events_clicks(std::vector<MFile>& ev, std::vector<MFile>& ck) 
   size_t chunk = std::max<size_t>(1 << 18, std::min<size_t>(8 << 20, (ev_bytes + ck_bytes) / (NT * 24 + 1)));
   std::vector<Chunk> ce, cc;
   make_chunks(ev, chunk, ce);
-  make_chunks(ck, chunk, cc);
+  make_chunks(ck, std::max<size_t>(1 << 18, std::min(chunk, ck_bytes / (NT * 32 + 1))), cc);
   const u32 p1shift = 64 - g_P1bits;
   const i64 ws = g_ws, we = g_we, cws = g_ws - WEEK;
+  const auto event_parser = use_column_times() ? column_events : parse_event_chunk;
+  const auto click_parser = use_column_times() ? column_clicks : parse_click_chunk;
   parallel_for((int)(ce.size() + cc.size()), [&](int t, int tid) {
     TL& tl = g_tl[tid];
     if (t < (int)ce.size()) {
@@ -2161,14 +2167,14 @@ static void parse_events_clicks(std::vector<MFile>& ev, std::vector<MFile>& ck) 
       const MFile& f = ev[c.file];
       size_t b = line_start_at_or_after(f, c.nominal), e = line_start_at_or_after(f, c.nominal_end);
       if (b >= e) return;
-      tl.n_event_lines += parse_event_chunk(f.data + b, f.data + e, b == 0, tl, p1shift, ws, we);
+      tl.n_event_lines += event_parser(f.data + b, f.data + e, b == 0, tl, p1shift, ws, we);
 
     } else {
       const Chunk& c = cc[t - ce.size()];
       const MFile& f = ck[c.file];
       size_t b = line_start_at_or_after(f, c.nominal), e = line_start_at_or_after(f, c.nominal_end);
       if (b >= e) return;
-      tl.n_click_lines += parse_click_chunk(f.data + b, f.data + e, b == 0, tl, cws, we);
+      tl.n_click_lines += click_parser(f.data + b, f.data + e, b == 0, tl, cws, we);
 
     }
   });
@@ -2938,6 +2944,140 @@ static void person_phase(bool keep_stats = false) {
 
 #include "dense.h"
 
+static bool use_column_times() { return dn::g_vts.on; }
+
+// Both input schemas use the same CSV batcher. Scalar rows at malformed boundaries
+// pass through the same consumer as the vector groups.
+template<int NF, class B, class Consume>
+static u64 scan_batches(const u8* begin, const u8* end, bool header, B& batch, Consume consume) {
+  u64 count = 0;
+  const u8* base = begin;
+  auto flush = [&](const u8* b) {
+    batch.pad();
+    count += consume(b);
+    batch.n = 0;
+  };
+  scan::scan_cols<NF>(begin, end, header,
+    [&](const u8* b, const __m256i* cols, const u32* quoted) __attribute__((always_inline)) {
+      base = b;
+      batch.add_group(cols, quoted);
+      if (batch.n > B::CAP - 8) flush(b);
+    },
+    [&](const u8* b, __m256i starts, __m256i lengths) __attribute__((always_inline)) {
+      base = b;
+      batch.add_row(starts, lengths, 1);
+      if (batch.n > B::CAP - 8) flush(b);
+    });
+  if (batch.n) flush(base);
+  return count;
+}
+
+static inline u64 batch_mask(u32 n) { return n == 64 ? UINT64_MAX : (1ULL << n) - 1; }
+
+static NOINLINE u32 emit_event_columns(dn::EvB& b, const u8* base, WCScatter<R1>::Cursor& cur,
+                                        u32 p1shift, i64 ws, i64 we) {
+  const u32 n = b.n;
+  dn::ev_ts_rows(b, base, n, batch_mask(n));
+  const u64 span = static_cast<u64>(we - ws);
+  u32 kept = 0;
+  alignas(32) R1 records[dn::EvB::CAP];
+  u32 part[dn::EvB::CAP];
+  for (u32 i = 0; i < n; ++i) {
+    const u32 elen = b.ln[0][i];
+    if (!elen) continue;
+    const u8* id = base + b.st[0][i];
+    R1& r = records[kept];
+    if (elen == 33 && event_offset_mask) {
+      const u64 hash = hash_id(id_hash(id, 33));
+      r.eid = (hash & ~event_offset_mask) | (reinterpret_cast<uintptr_t>(id) - event_base);
+      part[kept] = (1u << g_P1bits) + (u32)(hash >> (p1shift + 2));
+    } else {
+      r.eid = hash_id(make_key(id, elen));
+      part[kept] = (u32)(r.eid >> p1shift);
+    }
+    // All ingest times are whole seconds. Convert the vector parser's exact
+    // code back to full milliseconds before the earliest-copy comparison.
+    const i64 ic = b.icode[i];
+    r.ingest = ic == dn::ICODE_NONE ? ING_NONE : dn::g_ing_base + (ic - 1) * 1000;
+    const i64 ts = b.ts[i];
+    const u64 rel = static_cast<u64>(ts) - static_cast<u64>(ws);
+    const u32 ulen = b.ln[1][i];
+    r.uid = ulen ? hash_id(make_key(base + b.st[1][i], ulen)) : 0;
+    bool valid = rel < span && r.ingest <= ts + DAY && ulen && b.ln[5][i];
+    r.payload = 0;
+    const u8* type = base + b.st[4][i];
+    const u32 len = b.ln[4][i];
+    u32 first;
+    memcpy(&first, type, 4);
+    if (!(len == 4 && (first == 0x77656976u || first == 0x74726163u))) {
+      u32 price;
+      if (valid && len == 8 && memcmp(type, "purchase", 8) == 0 &&
+          price_fast(base + b.st[6][i], b.ln[6][i], price))
+        r.payload = (cat_fast(base + b.st[5][i], b.ln[5][i]) << 24) | price;
+      else
+        valid = false;
+    }
+    r.ts = valid ? static_cast<u32>(rel) : TS_INVALID;
+    ++kept;
+  }
+  auto out = cur;
+  for (u32 i = 0; i < kept; ++i)
+    WCScatter<R1>::push32(out, part[i], _mm256_load_si256(reinterpret_cast<const __m256i*>(&records[i])));
+  cur = out;
+  return kept;
+}
+
+static u64 column_events(const u8* begin, const u8* end, bool header, TL& tl, u32 shift, i64 ws, i64 we) {
+  dn::EvB b;
+  auto cur = tl.r1.cursor(tl.arena);
+  const auto rows = scan_batches<7>(begin, end, header, b, [&](const u8* base) {
+    return emit_event_columns(b, base, cur, shift, ws, we);
+  });
+  tl.r1.close(cur);
+  tl.r1.flush(tl.arena);
+  return rows;
+}
+
+template<class RT>
+static NOINLINE u32 emit_click_columns(dn::CkB& b, const u8* base, RT& router, i64 cws, i64 we) {
+  const u32 n = b.n;
+  dn::ck_ts_rows(b, base, n, batch_mask(n));
+  u32 count = 0;
+  auto feed = router.feed();
+  for (u32 i = 0; i < n; ++i) {
+    const u32 idlen = b.ln[0][i], ulen = b.ln[1][i];
+    if (!idlen || !ulen) continue;
+    ++count;
+    const u64 rel = static_cast<u64>(b.ts[i]) - static_cast<u64>(cws);
+    if (rel >= static_cast<u64>(we - cws)) continue;
+    const i32 camp = camp_fast(base + b.st[2][i], b.ln[2][i]);
+    if (camp < 0) continue;
+    const u64 id = click_key(base + b.st[0][i], idlen);
+    const u64 uid = hash_id(make_key(base + b.st[1][i], ulen));
+    feed.add_if(uid, u64x2{id, rel | (u64{static_cast<u32>(camp)} << 32)}, 1);
+  }
+  router.close(feed);
+  return count;
+}
+
+static u64 column_clicks(const u8* begin, const u8* end, bool header, TL& tl, i64 cws, i64 we) {
+  dn::CkB b;
+  const u32 shift = 64 - g_P2bits;
+  auto cur = tl.r2c.cursor(tl.arena);
+  auto emit = [shift](WCScatter<R2C>::Cursor& c, u64 ph, const u64x2& v) __attribute__((always_inline)) {
+    WCScatter<R2C>::push32(c, (u32)(ph >> shift), _mm256_set_epi64x(0, (long long)v.b, (long long)v.a, (long long)ph));
+  };
+  Router<u64x2, R2C, decltype(emit)> router(cur, emit);
+  const auto rows = scan_batches<4>(begin, end, header, b, [&](const u8* base) {
+    return emit_click_columns(b, base, router, cws, we);
+  });
+  router.run();
+  tl.r2c.close(cur);
+  tl.r2c.flush(tl.arena);
+  return rows;
+}
+
+
 // ------------------------------------------------------------------------------------------
 // output
 
@@ -3506,6 +3646,8 @@ int main(int argc, char** argv) {
       ev.size(), ev_bytes, ck.size(), lk.size(), 1u << g_P1bits, 1u << g_P2bits, NT);
   std::thread setup([&] {
     load_lookups(data);
+    dn::g_ing_base = g_ws - 30 * DAY;
+    dn::init_daycode();
     g_tl.resize(NT);
     for (auto& t : g_tl) {
       t.r1.init(event_partitions());
