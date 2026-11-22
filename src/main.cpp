@@ -286,7 +286,10 @@ struct WCScatter {
   static_assert(sizeof(T) == 16 || sizeof(T) == 32, "record size");
   static constexpr u32 PER = 64 / sizeof(T);
   static constexpr u32 BLK = (u32)(BLOCK_BYTES / sizeof(T));
-  static constexpr u32 QCAP = 32;
+#ifndef SS_QCAP
+#define SS_QCAP 32
+#endif
+  static constexpr u32 QCAP = SS_QCAP;
   struct Hot {
     T* cur;
     T* lim;
@@ -332,8 +335,13 @@ struct WCScatter {
       Hot& h = hot[e->p];
       if (__builtin_expect(h.cur == h.lim, 0)) grow(e->p, a);
       const __m256i* src = (const __m256i*)line;
+#if SS_DRAIN_ST
+      _mm256_store_si256((__m256i*)h.cur, _mm256_load_si256(src));
+      _mm256_store_si256((__m256i*)h.cur + 1, _mm256_load_si256(src + 1));
+#else
       _mm256_stream_si256((__m256i*)h.cur, _mm256_load_si256(src));
       _mm256_stream_si256((__m256i*)h.cur + 1, _mm256_load_si256(src + 1));
+#endif
       h.cur += PER;
       e->spare = line;  // the entry's old spare went to the partition; the entries from `end` on kept theirs
     }
@@ -379,6 +387,8 @@ struct WCScatter {
     _mm256_store_si256((__m256i*)cur, x);
     advance(c, p, cur);
   }
+  // A hint that partition p is about to get a record: its staging line, fetched for writing.
+  static FORCE_INLINE void prefetch(const Cursor& c, u32 p) { __builtin_prefetch(c.sp[p], 1, 3); }
   static FORCE_INLINE void push16(Cursor& c, u32 p, __m128i x) {
     static_assert(sizeof(T) == 16, "push16");
     T* const cur = c.sp[p];
