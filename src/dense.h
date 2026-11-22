@@ -1188,6 +1188,12 @@ static void parse(std::vector<MFile>& ev, std::vector<MFile>& ck) {
   size_t chunk = std::max<size_t>(1 << 18, std::min<size_t>(8 << 20, (ev_bytes + ck_bytes) / (NT * 24 + 1)));
   // The click files come last, so their chunks decide how far apart the threads finish: they are smaller.
   const size_t chunk_ck = std::max<size_t>(1 << 18, std::min<size_t>(chunk, ck_bytes / (NT * 32 + 1)));
+#if SS_PREFAULT
+  // what a thread's arena will hold: its share of the records (16 bytes per line of about 72) and an open block
+  // per partition, of which 90%
+  g_arena_prefault = (size_t)(0.9 * ((double)(ev_bytes + ck_bytes) / 72.0 * 16.0 / NT +
+                                     (double)(((ev_bytes / 72) >> KE) + g_PC) * BLOCK_BYTES));
+#endif
   std::vector<Chunk> ce, cc;
   make_chunks(ev, chunk, ce);
   make_chunks(ck, chunk_ck, cc);
@@ -1215,6 +1221,13 @@ static void parse(std::vector<MFile>& ev, std::vector<MFile>& ck) {
     g_tl[t].ev.finish(g_tl[t].arena);
     g_tl[t].ck.finish(g_tl[t].arena);
   });
+#if SS_PREFAULT
+  {
+    int k = 0;
+    for (auto& t : g_tl) k += t.arena.prefaulted;
+    LOG("arenas prefaulted: %d of %d, %zu MB each", k, NT, g_arena_prefault >> 20);
+  }
+#endif
 }
 
 // ------------------------------------------------------------------------------------------
