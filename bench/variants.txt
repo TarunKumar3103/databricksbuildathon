@@ -1,13 +1,7 @@
-# Bench 11 (chat A). tag, binary in /usr/local/bench, then ENV=VALUE settings.
+# Bench 13 (chat C). tag, binary in /usr/local/bench, then ENV=VALUE settings.
 # The first build also writes the dev output that the report rows are added to.
-j    ss-8384d32-clang18-pgo                # v4 8384d32 as its Dockerfile: scored 0.38 at 18:53
-k    ss-286f27c-clang18-pgo                # v4 286f27c: j + the segment ends as a pass after the scan
-m    ss-cf4452a-clang18-pgo                # v4 cf4452a (head): k + ends taken as soon as their segments are through + the largest click partitions loaded once
-w    ss-cf4452a-parcount                   # m + the partitions' record counts taken in parallel at the start of the scan
-n    ss-cf4452a-knobs                      # cf4452a with the bench knobs (bench/variants/cf4452a-knobs/knobs.py) at their defaults: should equal m
-nb   ss-cf4452a-knobs SS_CKBIG=2000000000  # no click partition is shared: what loading the largest one once is worth
-g5   ss-cf4452a-knobs SS_SEGPART=5         # segments of 5 partitions instead of 10 (their ends cost little now)
-g20  ss-cf4452a-knobs SS_SEGPART=20        # ... of 20
-s4   ss-cf4452a-knobs SS_ST=4              # the scan on 4 threads, one pinned to each core
-e15  ss-cf4452a-ke15 SS_SEGPART=5          # event partitions of 2^15 indexes: half the staging lines, 512 KB slot tables
-e154 ss-cf4452a-ke15 SS_SEGPART=5 SS_ST=4  # ... with the scan on 4 pinned threads (one slot table per core)
+v    ss-2589f28-clang18-pgo    # v4 2589f28 (head) as its Dockerfile: cf4452a + KE = 15, no block prefetch, parallel counts
+m    ss-cf4452a-clang18-pgo    # v4 cf4452a as its Dockerfile: scored 0.38 at 19:54
+t    ss-6d5b17b-clang18-pgo    # c-vts 6d5b17b: v + the event timestamps eight lines at a time
+c    ss-226ca9f-clang18-pgo    # c-vts 226ca9f: t + the click timestamps eight lines at a time
+v2   ss-2589f28-clang18-pgo    # v once more: how far two copies of one build differ in this session
