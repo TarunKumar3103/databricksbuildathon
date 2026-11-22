@@ -196,11 +196,15 @@ static void* vm_alloc(size_t bytes) {
 // CPU time (twice as many block boundaries to cross), for only 30 MB less memory.
 static constexpr size_t BLOCK_BYTES = 4096;
 
+// (SS_PREFAULT, bench 10: this many bytes of each thread's first slab are faulted in, a write per 4 KB, as soon as
+// the slab is mapped, so that the scatter's non-temporal stores do not meet the page faults one by one.)
+static size_t g_arena_prefault = 0;
 struct Arena {
   u8* cur = nullptr;
   u8* end = nullptr;
   std::vector<void*> free_blocks;  // recycled BLOCK_BYTES blocks
   std::vector<std::pair<void*, size_t>> slabs;
+  bool prefaulted = false;
   void* alloc(size_t n) {
     n = (n + 63) & ~(size_t)63;
     if ((size_t)(end - cur) < n) {
@@ -208,6 +212,14 @@ struct Arena {
       cur = (u8*)vm_alloc(sz);
       end = cur + sz;
       slabs.push_back({cur, sz});
+#if SS_PREFAULT
+      if (slabs.size() == 1 && g_arena_prefault) {
+        volatile u8* const v = cur;
+        const size_t m = std::min(sz, g_arena_prefault);
+        for (size_t o = 0; o < m; o += 4096) v[o] = 0;
+        prefaulted = true;
+      }
+#endif
     }
     void* p = cur;
     cur += n;
