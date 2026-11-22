@@ -1272,7 +1272,7 @@ struct D16 {  // event line, partitioned by event index
   u64 w0;  // bits 0..30: ts in ms since the window start, plus 1 (0: not a valid event); bit 31: bits 32..63
            // are not the user number but thread << 24 | index of a side entry (XEv); bits 32..63: user number
   u64 w1;  // bits 0..23: 2^24 - ingest_ts code (so 0, an empty slot, is below every record and the
-           // earliest copy is the largest); bits 24..45: purchase, category << 17 | price; bits 46..59: slot
+           // earliest copy is the largest); bits 24..45: purchase, category << 17 | price; bits 46..60: slot
 };
 struct C16 {  // valid click, partitioned by person index
   u64 w0;  // bits 0..31: ts in ms since the window start - 7 days; bits 32..63: user number

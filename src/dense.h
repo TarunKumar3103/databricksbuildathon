@@ -159,7 +159,7 @@ static NOINLINE void fail(const char* why) {
 static u64 g_ukey = 0, g_ekey = 0;
 static u64 g_ne_cap = 0;  // regular event indexes are below this
 static u32 g_nu_cap = 0;  // regular person indexes are below this (at most 2^23, so a user number fits 32 bits)
-static constexpr u32 KE = 14, KC = 8;  // event indexes per event partition, person indexes per click partition
+static constexpr u32 KE = 15, KC = 8;  // event indexes per event partition, person indexes per click partition
 static constexpr u32 ESLOTS = 1u << KE, ELOM = ESLOTS - 1;
 static u32 g_PE = 0, g_PC = 0;
 static i64 g_ing_base = 0;  // ingest_ts is kept as whole seconds since this, plus 1, in 24 bits
@@ -1602,18 +1602,15 @@ static NOINLINE bool place(u32 j, D16* T, DS& S) {
       if (b.second) S.blk.push_back({b.first, b.second});
   const size_t nblk = S.blk.size();
   if (!nblk) return false;
-  S.blk.push_back(S.blk[0]);  // (something harmless to prefetch after the last block)
+  // (No prefetch of the next block: on the scorer the scan takes 3 to 6% less CPU time without one, bench 10.
+  // A block is read front to back, which the processor's own prefetcher follows.)
   for (size_t bi = 0; bi < nblk; bi++) {
-    // (the blocks were written long ago: the whole next one is asked for while this one is placed)
-    const char* const nx = (const char*)S.blk[bi + 1].first;
-    const u32 nxb = S.blk[bi + 1].second * (u32)sizeof(D16);
-    for (u32 o = 0; o < nxb; o += 64) _mm_prefetch(nx + o, _MM_HINT_T0);
     const D16* r = S.blk[bi].first;
     const D16* const re = r + S.blk[bi].second;
     u8* const Tb = (u8*)T;
     auto put = [Tb](const D16* q) __attribute__((always_inline)) {
       const u64 w0 = q->w0, w1 = q->w1;
-      D16* const s = (D16*)(Tb + ((w1 >> 42) & ((u64)ELOM << 4)));  // (the slot is bits 46 to 59)
+      D16* const s = (D16*)(Tb + ((w1 >> 42) & ((u64)ELOM << 4)));  // (the slot is bits 46 to 60)
       const u64 o0 = s->w0, o1 = s->w1;
       // (the field is 2^24 - code: the earlier ingest_ts is the larger, an empty slot 0, below them all)
       const bool take = _bzhi_u32((u32)w1, 24) > _bzhi_u32((u32)o1, 24);
@@ -1660,16 +1657,11 @@ static NOINLINE void load_clicks(CkPart& S, u32 cp, WCScatter<R2C>::Cursor& c2c,
     for (auto& b : g_tl[t].ck.blocks[cp])
       if (b.second) S.cblk.push_back({b.first, b.second});
   const size_t nblk = S.cblk.size();
-  if (nblk) S.cblk.push_back(S.cblk[0]);  // (something harmless to prefetch after the last block)
   u8 cntv[1u << KC];  // how many IDs the dense person of each index has (0: none)
   for (u32 g = 0; g < G; g++) cntv[g] = (u8)dense_cnt(g_acc[(cp << KC) | g].load(std::memory_order_relaxed));
   u32 cnt[1u << KC];  // ... and how many clicks there are with that index, the dense person's or not
   memset(cnt, 0, sizeof cnt);
   for (size_t bi = 0; bi < nblk; bi++) {
-    // the blocks were written long ago: the whole next one is asked for while this one is counted
-    const char* const nx = (const char*)S.cblk[bi + 1].first;
-    const u32 nxb = S.cblk[bi + 1].second * (u32)sizeof(C16);
-    for (u32 o = 0; o < nxb; o += 64) _mm_prefetch(nx + o, _MM_HINT_T0);
     const C16* const r = S.cblk[bi].first;
     const u32 m = S.cblk[bi].second;
     for (u32 j = 0; j < m; j++) cnt[((u32)(r[j].w0 >> 41) & (G - 1))]++;
@@ -2529,18 +2521,35 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
 }
 
 static void scan_all() {
-  // segments: runs of partitions with about the same number of records
+  // how many records every event and click partition has (the block lists of all threads are walked for it:
+  // a few hundred thousand list entries at 60M, so in parallel)
   std::vector<u64> cnt(g_PE, 0);
+  std::vector<u32> ckn(g_PC, 0);
+  {
+    const int NCH = 8 * NT;
+    parallel_for(NCH, [&](int c, int) {
+      for (u32 j = (u32)((u64)g_PE * c / NCH), je = (u32)((u64)g_PE * (c + 1) / NCH); j < je; j++) {
+        u64 n = 0;
+        for (int t = 0; t < NT; t++) n += g_tl[t].ev.size(j);
+        cnt[j] = n;
+      }
+      for (u32 cp = (u32)((u64)g_PC * c / NCH), ce = (u32)((u64)g_PC * (c + 1) / NCH); cp < ce; cp++) {
+        size_t n = 0;
+        for (int t = 0; t < NT; t++) n += g_tl[t].ck.size(cp);
+        ckn[cp] = (u32)std::min<size_t>(n, 0xFFFFFFFFu);
+      }
+    });
+  }
+  // segments: runs of partitions with about the same number of records
   u64 total = 0;
   u32 used = 0;
   for (u32 j = 0; j < g_PE; j++) {
-    for (int t = 0; t < NT; t++) cnt[j] += g_tl[t].ev.size(j);
     total += cnt[j];
     if (cnt[j]) used = j + 1;
   }
-  // (A segment costs little, one partition placed a second time, so they are small, about ten partitions:
-  // the threads then end the scan close together. SS_SEGPART sets another size, for tests.)
-  const u32 segpart = getenv("SS_SEGPART") ? (u32)std::max(1, atoi(getenv("SS_SEGPART"))) : 10;
+  // (A segment costs little, so they are small, about 160,000 event indexes: the threads then end the scan
+  // close together. SS_SEGPART sets another size, in partitions, for tests.)
+  const u32 segpart = getenv("SS_SEGPART") ? (u32)std::max(1, atoi(getenv("SS_SEGPART"))) : std::max<u32>(1, 163840u >> KE);
   const u32 nseg = std::max<u32>(1, std::min<u32>(used, std::max<u32>((u32)NT, used / segpart)));
   std::vector<u32> sb(nseg + 1, used);
   {
@@ -2575,9 +2584,7 @@ static void scan_all() {
   std::unique_ptr<std::atomic<u8>[]> big_ready(new std::atomic<u8>[g_PC]);
   for (u32 cp = 0; cp < g_PC; cp++) {
     big_ready[cp].store(0, std::memory_order_relaxed);
-    size_t n = 0;
-    for (int t = 0; t < NT; t++) n += g_tl[t].ck.size(cp);
-    if (n >= ck_big) {
+    if (ckn[cp] >= ck_big) {
       big.emplace_back(new CkPart);
       big_of[cp] = big.back().get();
       big_cp.push_back(cp);
