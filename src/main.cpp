@@ -1274,9 +1274,9 @@ struct D16 {  // event line, partitioned by event index
   u64 w1;  // bits 0..23: 2^24 - ingest_ts code (so 0, an empty slot, is below every record and the
            // earliest copy is the largest); bits 24..45: purchase, category << 17 | price; bits 46..60: slot
 };
-struct C16 {  // valid click, partitioned by person index
+struct C16 {  // valid click, partitioned by click index
   u64 w0;  // bits 0..31: ts in ms since the window start - 7 days; bits 32..63: user number
-  u64 w1;  // bits 0..39: number of the click_id; bits 40..63: campaign
+  u64 w1;  // bits 0..37: click index (bits 38 and 39 are the scan's, see place_clicks); bits 40..63: campaign
 };
 struct X1Rec {  // event line whose event_id is not regular (hashes as in R1)
   u64 eid;
@@ -3360,6 +3360,8 @@ int main(int argc, char** argv) {
   g_P2bits = P2bits_gen;
   // The dense path (dense.h), if a sample of the events gives the key of the user IDs.
   std::vector<dn::Samp> samp;
+  size_t ck_bytes = 0;
+  for (auto& f : ck) ck_bytes += f.size;
   {
     const char* e = getenv("SS_DENSE");
     dn::g_ne_cap = ((u64)(ev_bytes / 56) | (dn::ESLOTS - 1)) + 1;
@@ -3367,7 +3369,8 @@ int main(int argc, char** argv) {
     if (!(e && *e == '0') && nu <= (1u << 23)) {
       dn::g_nu_cap = (u32)nu;
       dn::g_PE = (u32)(dn::g_ne_cap >> dn::KE);
-      dn::g_PC = dn::g_nu_cap >> dn::KC;
+      dn::g_nc_cap = ((u64)(ck_bytes / 32) | dn::CLOM) + 1;
+      dn::g_PC = (u32)(dn::g_nc_cap >> dn::KCI);
       dn::sample<7>(ev, 'e', 'u', 4096, samp);
       if (dn::recover_user_key(samp)) {
         dn::g_on = true;
@@ -3383,6 +3386,7 @@ int main(int argc, char** argv) {
   std::thread setup([&] {
     load_lookups(data);
     if (dn::g_on && !dn::recover_event_key(samp)) dn::fail("no key for the event ids");
+    if (dn::g_on && !dn::g_fail.load() && !dn::recover_click_key(ck)) dn::fail("no key for the click ids");
     if (dn::g_on && (u64)(g_we - g_ws) > 0x7FFFFFF0ULL) dn::fail("window too long");
     if (dn::g_on && g_cats.size() > 255) dn::fail("too many categories");
     if (dn::g_on && g_ncamp > dn::CK_CAMP) dn::fail("too many campaigns");

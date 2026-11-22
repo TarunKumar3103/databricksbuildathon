@@ -156,11 +156,16 @@ static NOINLINE void fail(const char* why) {
   if (!g_fail.exchange(true)) g_fail_why = why;
 }
 
-static u64 g_ukey = 0, g_ekey = 0;
+static u64 g_ukey = 0, g_ekey = 0, g_ckey = 0;
 static u64 g_ne_cap = 0;  // regular event indexes are below this
+static u64 g_nc_cap = 0;  // regular click indexes are below this
 static u32 g_nu_cap = 0;  // regular person indexes are below this (at most 2^23, so a user number fits 32 bits)
-static constexpr u32 KE = 15, KC = 8;  // event indexes per event partition, person indexes per click partition
+#ifndef SS_KCI
+#define SS_KCI 12
+#endif
+static constexpr u32 KE = 15, KC = 8, KCI = SS_KCI;  // event indexes per event partition (2^KE), click indexes per click partition (2^KCI)
 static constexpr u32 ESLOTS = 1u << KE, ELOM = ESLOTS - 1;
+static constexpr u32 CSLOTS = 1u << KCI, CLOM = CSLOTS - 1;
 static u32 g_PE = 0, g_PC = 0;
 static i64 g_ing_base = 0;  // ingest_ts is kept as whole seconds since this, plus 1, in 24 bits
 static constexpr u64 ING_SPAN = 0xFFFFFEULL * 1000;
@@ -474,6 +479,43 @@ static bool recover_event_key(const std::vector<Samp>& s) {
       }
     if (all) {
       g_ekey = key;
+      return true;
+    }
+  }
+  return false;
+}
+
+// Click indexes are given out like event indexes: person index 0 has the first ones, at most 1.5% of them all
+// (and the cap is above the true number of clicks, so a 2% share of it is safe). The same search as for the
+// event key, on the sampled clicks of person index 0.
+static bool recover_click_key(const std::vector<MFile>& files) {
+  std::vector<u64> w0;
+  for (size_t lines = 4096; lines <= (1u << 18); lines *= 4) {  // (person 0 has 0.5 to 1.5% of the clicks)
+    std::vector<Samp> s;
+    sample<4>(files, 'k', 'u', lines, s);
+    w0.clear();
+    for (const Samp& x : s)
+      if ((unscramble(x.b, g_ukey) >> 9) == 0) w0.push_back(x.a);
+    std::sort(w0.begin(), w0.end());
+    w0.erase(std::unique(w0.begin(), w0.end()), w0.end());
+    if (w0.size() >= 12 || s.size() < lines / 2) break;  // enough of them, or no more lines to be had
+  }
+  if (w0.size() < 5) return false;
+  const u64 bound = g_nc_cap / 50 + 1024;
+  const u64 m = unmix(w0[0]), m1 = unmix(w0[1]);
+  const size_t nchk = std::min<size_t>(w0.size(), 12);
+  u64 x = 0;  // j * SC1 mod 2^40
+  for (u64 j = 0; j < bound; j++, x = (x + SC1) & M40) {
+    const u64 key = m ^ x;
+    if ((((m1 ^ key) * SC1I) & M40) >= bound) continue;
+    bool all = true;
+    for (size_t t = 2; t < nchk; t++)
+      if (unscramble(w0[t], key) >= bound) {
+        all = false;
+        break;
+      }
+    if (all) {
+      g_ckey = key;
       return true;
     }
   }
@@ -932,13 +974,13 @@ static NOINLINE u64 parse_event_chunk(const u8* begin, const u8* end, bool skip_
   return nl;
 }
 
-// Click lines -> C16 records by person index.
+// Click lines -> C16 records by click index.
 struct CkB : Cols<4, 64> {
   alignas(32) u64 kq[CAP + 8], uq[CAP + 8];  // the 8 bytes after the prefix of click_id / user_id
   alignas(32) u64 cq[CAP + 8];               // the 8 bytes after the "c_" of campaign_id
   alignas(32) u8 pfx[CAP + 8];               // nonzero: a prefix byte is not the expected one
   alignas(32) u8 cpx[CAP + 8];               // nonzero: campaign_id does not start with "c_"
-  alignas(32) u64 kv[CAP + 8];   // number of the click_id
+  alignas(32) u64 kv[CAP + 8];   // click index (the number of the click_id, unscrambled)
   alignas(32) u64 cv[CAP + 8];   // number of the campaign_id (when it is canonical)
   alignas(32) u32 num[CAP + 8];  // user number
   alignas(32) i32 camp[CAP + 8];  // campaign index, -1 if not a campaign
@@ -1008,18 +1050,19 @@ static NOINLINE u32 process_clicks(CkB& B, const u8* const base, WCScatter<C16>:
   u64 irr = nonzero64(B.pfx);
   u64 cslow = nonzero64(B.cpx);  // campaign IDs that are not "c_" + a canonical number: camp_of decides
   {
-    const __m256i ukey = _mm256_set1_epi64x((long long)g_ukey);
+    const __m256i ukey = _mm256_set1_epi64x((long long)g_ukey), ckey = _mm256_set1_epi64x((long long)g_ckey);
     const __m256i M = _mm256_set1_epi64x((long long)M40);
     const __m256i umax = _mm256_set1_epi64x((long long)(((u64)g_nu_cap << 9) - 1));
+    const __m256i cmax = _mm256_set1_epi64x((long long)(g_nc_cap - 1));
     for (u32 i = 0; i < n; i += 4) {
       __m256i vk, vu, vc;
       u32 bk = ids4(B.kq + i, B.ln[0] + i, vk);
       u32 bu = ids4(B.uq + i, B.ln[1] + i, vu);
       const u32 bc = dec10x4(B.cq + i, B.ln[2] + i, vc);
-      const __m256i num = unscramble4(vu, ukey);
-      bk |= gtu64x4(vk, M);
+      const __m256i num = unscramble4(vu, ukey), cix = unscramble4(vk, ckey);
+      bk |= gtu64x4(vk, M) | gtu64x4(cix, cmax);
       bu |= gtu64x4(vu, M) | gtu64x4(num, umax);
-      _mm256_store_si256((__m256i*)(B.kv + i), vk);
+      _mm256_store_si256((__m256i*)(B.kv + i), cix);
       _mm256_store_si256((__m256i*)(B.cv + i), vc);
       _mm_store_si128((__m128i*)(B.num + i), low32x4(num));
       irr |= (u64)(bk | bu) << i;
@@ -1105,7 +1148,7 @@ static NOINLINE u32 process_clicks(CkB& B, const u8* const base, WCScatter<C16>:
       const __m256i lo = _mm256_unpacklo_epi64(w0, w1), hi = _mm256_unpackhi_epi64(w0, w1);  // records 0, 2 / 1, 3
       _mm256_store_si256((__m256i*)(B.rec + i), _mm256_permute2x128_si256(lo, hi, 0x20));
       _mm256_store_si256((__m256i*)(B.rec + i + 2), _mm256_permute2x128_si256(lo, hi, 0x31));
-      _mm_store_si128((__m128i*)(B.part + i), _mm_srli_epi32(n4, 9 + KC));
+      _mm_store_si128((__m128i*)(B.part + i), low32x4(_mm256_srli_epi64(_mm256_load_si256((const __m256i*)(B.kv + i)), KCI)));
       good |= (u64)ok << i;
     }
   }
@@ -1518,25 +1561,32 @@ static FORCE_INLINE u32 ck_count_le(const u64* sk, const u32 mc, const u32 x) {
 
 // the scan: per event partition, records -> slots (dedup, order) -> persons, sessions, rows
 
-// A click partition loaded for the scan: the clicks of its dense persons as keys, grouped by person index,
-// and the number of each one's click_id in the same places (see load_clicks).
-struct CkPart {
-  u32 cp = NONE;
-  std::vector<u32> coff, cpos;
-  std::vector<u64> ckey, cclk;
-  std::vector<std::pair<const C16*, u32>> cblk;
-};
-// The few click partitions with very many clicks (a handful of persons click thousands of times) are loaded
-// once, by a task of their own at the start of the scan, and every thread reads that copy: each of their
-// persons would otherwise make the thread that closes it load the whole partition again. A thread that needs
-// one before it is ready loads its own copy, like any other partition.
-static constexpr u32 CK_BIG = 1u << 15;         // clicks from which a partition is loaded for all
-static CkPart** g_ck_big = nullptr;             // per click partition: its shared copy, or null
-static std::atomic<u8>* g_ck_big_ready = nullptr;  // ... 1 once it can be read
+// Clicks. Click indexes are dense too, and they are given out person by person in the order of the person
+// indexes, as event indexes are (but a person's clicks come in no order of time). A click partition holds
+// the clicks of 2^KCI consecutive indexes. Writing each record to the slot of its index (place_clicks) puts
+// a person's clicks side by side, the persons in index order, and the copies of a click on top of each
+// other. A segment of the scan then reads its persons' clicks off a cursor that only moves forward.
+//
+// One bit of a slot's w1 is the scan's: CK_VALID, the slot holds a click (bit 38 is kept free beside it).
+static constexpr u64 CK_VALID = 1ULL << 39, CK_IDX = (1ULL << 38) - 1;
+static constexpr u32 CK_END = 0xFFFFFFFEu;       // the cursor's person index past the last click
+static std::atomic<u8>* g_ck_emitted = nullptr;  // per click partition: it has been placed by some thread
+static std::atomic<u32>* g_ck_min = nullptr;     // ... the smallest and the largest person index of its clicks
+static std::atomic<u32>* g_ck_max = nullptr;     //     (NONE: not placed yet, or no click)
+static const u32* g_ck_any = nullptr;  // ... the person index of one of its clicks (without any: of the next partition that has one)
 
-struct DS : CkPart {
+struct DS {
   D16* T = nullptr;
   std::vector<std::pair<const D16*, u32>> blk;
+  // the click cursor (see ck_collect)
+  C16* TC = nullptr;      // the click partition at hand, by slot
+  u32 ck_k = NONE;        // ... which one it is
+  u32 ck_i = CSLOTS;      // the next slot to look at
+  u32 ck_p = CK_END;      // the person index of the click there
+  bool ck_on = false;     // the cursor has been set for the pass at hand
+  std::vector<u64> kbuf;  // a person's clicks as keys, as they are collected
+  std::vector<std::pair<const C16*, u32>> cblk;
+  u64 n_ck_placed = 0;    // (for the log)
   // the open person: its sessions so far
   std::vector<u32> sess_ts;  // the time of each session's first event
   std::vector<u32> sess_ev;  // how many events the person had before it
@@ -1566,7 +1616,6 @@ struct DS : CkPart {
   alignas(32) u16 day_sum[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
   u32 since = 0;  // persons closed (the check of day_sum is made every LINES_EVERY of them)
   std::vector<u64> xq;     // the person's extra events in time order
-  // (the click partition at hand is the CkPart this is built on)
 };
 
 // day_sum is looked at every LINES_EVERY persons, and the counters are flushed if a day's sum is above
@@ -1590,8 +1639,6 @@ static NOINLINE void flush_lines(DS& S, const u32 NC) {
   }
   _mm256_store_si256((__m256i*)S.day_sum, z);
 }
-
-static std::atomic<u8>* g_ck_emitted = nullptr;
 
 // All records of an event partition into their slots; the copy with the smallest ingest code keeps a slot.
 // False if the partition has no records.
@@ -1626,81 +1673,153 @@ static NOINLINE bool place(u32 j, D16* T, DS& S) {
   return true;
 }
 
-// The clicks of click partition cp that do not belong to a dense person -> the general person phase.
-static NOINLINE void emit_other_clicks(u32 cp, WCScatter<R2C>::Cursor& c2c, u32 p2shift) {
-  for (int t = 0; t < NT; t++)
-    for (auto& b : g_tl[t].ck.blocks[cp]) {
-      const C16* r = b.first;
-      for (u32 j = 0; j < b.second; j++) {
-        const u32 un = (u32)(r[j].w0 >> 32);
-        if (__builtin_expect((un & 511) < dense_cnt(g_acc[un >> 9].load(std::memory_order_relaxed)), 1)) continue;
-        push_r2c(c2c, p2shift, person_of(hash_id(id_key('u', scramble(un, g_ukey)))), id_key('k', r[j].w1 & M40),
-                 (u32)r[j].w0, (u32)(r[j].w1 >> 40));
-      }
-    }
-}
-
-// Click partition cp for the scan, in S: the clicks of its dense persons as keys, grouped by person index (a
-// counting sort), each person's in the order they come: those of index g are ckey[coff[g] .. cpos[g]). The
-// first thread to load a partition also hands its other clicks to the general person phase.
-static NOINLINE void load_clicks(CkPart& S, u32 cp, WCScatter<R2C>::Cursor& c2c, u32 p2shift) {
-  S.cp = cp;
-  const u32 G = 1u << KC;
-  if (S.coff.size() < G + 2) {
-    S.coff.assign(G + 2, 0);
-    S.cpos.assign(G + 2, 0);
-  }
-  u32* const coff = S.coff.data();
-  u32* const cpos = S.cpos.data();
+// All records of click partition k into their slots in TC, then one pass over the slots in index order: the
+// person indexes must not fall, and the clicks whose user ID is not one of the dense person of its index are
+// handed to the general person phase (the first time the partition is placed; ck_collect leaves them out).
+// False if the partition has no records.
+// A copy of a click must be the same click: the copies of a line are identical, so one slot keeps them all.
+static NOINLINE bool place_clicks(const u32 k, C16* const TC, DS& S, WCScatter<R2C>::Cursor& c2c, const u32 p2shift) {
   S.cblk.clear();
   for (int t = 0; t < NT; t++)
-    for (auto& b : g_tl[t].ck.blocks[cp])
+    for (auto& b : g_tl[t].ck.blocks[k])
       if (b.second) S.cblk.push_back({b.first, b.second});
-  const size_t nblk = S.cblk.size();
-  u8 cntv[1u << KC];  // how many IDs the dense person of each index has (0: none)
-  for (u32 g = 0; g < G; g++) cntv[g] = (u8)dense_cnt(g_acc[(cp << KC) | g].load(std::memory_order_relaxed));
-  u32 cnt[1u << KC];  // ... and how many clicks there are with that index, the dense person's or not
-  memset(cnt, 0, sizeof cnt);
-  for (size_t bi = 0; bi < nblk; bi++) {
-    const C16* const r = S.cblk[bi].first;
-    const u32 m = S.cblk[bi].second;
-    for (u32 j = 0; j < m; j++) cnt[((u32)(r[j].w0 >> 41) & (G - 1))]++;
-  }
-  u32 nd = 0, most = 0;
-  for (u32 g = 0; g < G; g++) {
-    coff[g] = cpos[g] = nd;
-    nd += cnt[g];
-    most |= cnt[g];
-  }
-  coff[G] = nd;
-  if (__builtin_expect(most > CK_ORD, 0)) {  // (a key has 20 bits for the click's number)
-    fail("a person with more than a million clicks");
-    for (u32 g = 0; g <= G; g++) coff[g] = cpos[g] = 0;
-    return;
-  }
-  if (S.ckey.size() < (size_t)nd + SORT_ROOM) {
-    S.ckey.resize((size_t)nd + SORT_ROOM + (nd >> 2));
-    S.cclk.resize((size_t)nd + SORT_ROOM + (nd >> 2));
-  }
-  u64* const ckey = S.ckey.data();
-  u64* const cclk = S.cclk.data();
-  const bool emit = !g_ck_emitted[cp].exchange(1, std::memory_order_relaxed);
-  for (size_t bi = 0; bi < nblk; bi++) {
-    const C16* const r = S.cblk[bi].first;
-    const u32 m = S.cblk[bi].second;
-    for (u32 j = 0; j < m; j++) {
-      const u64 w0 = r[j].w0, w1 = r[j].w1;
-      const u32 un = (u32)(w0 >> 32), g = (un >> 9) & (G - 1);
-      const u32 dense = (un & 511) < cntv[g];
-      const u32 q = cpos[g];  // (a click that is not the dense person's is overwritten by the next one, or stays past the end)
-      ckey[q] = ck_make((u32)w0, q - coff[g], (u32)(w1 >> 40));
-      cclk[q] = w1 & M40;
-      cpos[g] = q + dense;
-      if (__builtin_expect(!dense, 0) && emit)
-        push_r2c(c2c, p2shift, person_of(hash_id(id_key('u', scramble(un, g_ukey)))), id_key('k', w1 & M40), (u32)w0,
-                 (u32)(w1 >> 40));
+  if (S.cblk.empty()) return false;
+  S.n_ck_placed++;
+  memset(TC, 0, sizeof(C16) * CSLOTS);
+  u64 diff = 0;
+  for (const auto& b : S.cblk) {
+    const C16* r = b.first;
+    const C16* const re = r + b.second;
+    for (; r < re; r++) {
+      const u64 w0 = r->w0, w1 = r->w1 | CK_VALID;
+      C16* const sl = TC + (w1 & CLOM);
+      const u64 o0 = sl->w0, o1 = sl->w1;
+      diff |= (o1 != 0 ? ~0ULL : 0ULL) & ((o0 ^ w0) | (o1 ^ w1));
+      sl->w0 = w0;
+      sl->w1 = w1;
     }
   }
+  if (__builtin_expect(diff != 0, 0)) fail("two different clicks with one click index");
+  const bool emit = !g_ck_emitted[k].exchange(1, std::memory_order_relaxed);
+  const std::atomic<u64>* const acc = g_acc;
+  u32 lastp = NONE, pmin = NONE, cnt = 0, bad = 0;  // the person index of the run of clicks at hand, and its number of IDs
+  for (u32 i = 0; i < CSLOTS; i++) {
+    const u64 w1 = TC[i].w1;
+    if (__builtin_expect(w1 == 0, 0)) continue;
+    const u64 w0 = TC[i].w0;
+    const u32 un = (u32)(w0 >> 32), p = un >> 9;
+    if (p != lastp) {
+      if (lastp == NONE)
+        pmin = p;
+      else
+        bad |= (u32)(p < lastp);
+      lastp = p;
+      cnt = dense_cnt(acc[p].load(std::memory_order_relaxed));
+    }
+    if (__builtin_expect((un & 511) >= cnt, 0) && emit)
+      push_r2c(c2c, p2shift, person_of(hash_id(id_key('u', scramble(un, g_ukey)))), id_key('k', scramble(w1 & CK_IDX, g_ckey)),
+               (u32)w0, (u32)(w1 >> 40));
+  }
+  if (__builtin_expect(bad != 0, 0)) fail("click indexes are not in person order");
+  g_ck_min[k].store(pmin, std::memory_order_relaxed);
+  g_ck_max[k].store(lastp, std::memory_order_relaxed);
+  return true;
+}
+
+// The cursor to the first slot of the next click partition that has records. False after the last one.
+static NOINLINE bool ck_next_part(DS& S, WCScatter<R2C>::Cursor& c2c, const u32 p2shift) {
+  for (;;) {
+    S.ck_k++;  // (from NONE: partition 0)
+    if (S.ck_k >= g_PC) {
+      S.ck_k = g_PC;
+      S.ck_i = CSLOTS;
+      S.ck_p = CK_END;
+      return false;
+    }
+    if (place_clicks(S.ck_k, S.TC, S, c2c, p2shift)) {
+      S.ck_i = 0;
+      return true;
+    }
+  }
+}
+// The cursor forward, from where it is, to the first click of a person index of at least p.
+static NOINLINE void ck_skip_to(DS& S, const u32 p, WCScatter<R2C>::Cursor& c2c, const u32 p2shift) {
+  for (;;) {
+    const C16* const TC = S.TC;
+    u32 i = S.ck_i;
+    while (i < CSLOTS && (TC[i].w1 == 0 || (u32)(TC[i].w0 >> 41) < p)) i++;
+    S.ck_i = i;
+    if (i < CSLOTS) {
+      S.ck_p = (u32)(TC[i].w0 >> 41);
+      return;
+    }
+    if (!ck_next_part(S, c2c, p2shift)) return;
+  }
+}
+// The cursor to the first click of a person index of at least p, from anywhere. g_ck_any gives, for every
+// partition, the person index of one of its clicks; with the indexes in person order, the partitions before
+// the last one whose sample is below p hold only clicks of persons before p, so the search starts in that one.
+static NOINLINE void ck_locate(DS& S, const u32 p, WCScatter<R2C>::Cursor& c2c, const u32 p2shift) {
+  if (!S.TC) S.TC = (C16*)aligned_alloc(64, sizeof(C16) * CSLOTS);
+  const u32* const a = g_ck_any;
+  u32 lo = 0, hi = g_PC;  // the first partition whose sample is at least p
+  while (lo < hi) {
+    const u32 mid = lo + (hi - lo) / 2;
+    if (a[mid] < p)
+      lo = mid + 1;
+    else
+      hi = mid;
+  }
+  S.ck_k = (lo > 0 ? lo - 1 : 0) - 1;  // (ck_next_part goes one on; NONE before partition 0)
+  S.ck_i = CSLOTS;
+  S.ck_p = CK_END;
+  ck_skip_to(S, p, c2c, p2shift);
+}
+// The clicks of dense person p (whose IDs are the aliases below cnt of its index) as keys at S.kbuf, in index
+// order, SORT_ROOM readable words after them; returns how many. A key's number is the click's index less `first`, and all of them are below `span`. The persons
+// of a pass are asked for in rising order, so the cursor only moves forward: over the clicks of persons that
+// have no events, then through this person's run of indexes, which may go on into the next partitions.
+static NOINLINE u32 ck_collect(DS& S, const u32 p, const u32 cnt, u64& first, u32& span, WCScatter<R2C>::Cursor& c2c,
+                               const u32 p2shift) {
+  if (!S.ck_on) {
+    ck_locate(S, p, c2c, p2shift);
+    S.ck_on = true;
+  } else if (S.ck_p < p) {
+    ck_skip_to(S, p, c2c, p2shift);
+  }
+  first = ((u64)S.ck_k << KCI) | S.ck_i;
+  u32 n = 0;
+  u64 last = 0;
+  while (S.ck_p == p) {
+    if (S.kbuf.size() < (size_t)n + CSLOTS + SORT_ROOM) S.kbuf.resize(2 * ((size_t)n + CSLOTS) + SORT_ROOM);
+    u64* const kb = S.kbuf.data();
+    const C16* const TC = S.TC;
+    const u64 base = ((u64)S.ck_k << KCI) - first;  // the number of this partition's slot 0
+    u32 i = S.ck_i;
+    for (; i < CSLOTS; i++) {
+      const u64 w0 = TC[i].w0, w1 = TC[i].w1;
+      if (w1 == 0) continue;
+      if ((u32)(w0 >> 41) != p) break;
+      last = base + i;
+      kb[n] = ck_make((u32)w0, (u32)last, (u32)(w1 >> 40));
+      n += (u32)(((u32)(w0 >> 32) & 511) < cnt);
+    }
+    S.ck_i = i;
+    if (i < CSLOTS) {
+      S.ck_p = (u32)(TC[i].w0 >> 41);
+      break;
+    }
+    if (!ck_next_part(S, c2c, p2shift)) break;
+    ck_skip_to(S, 0, c2c, p2shift);  // (the first click of the new partition)
+  }
+  if (S.kbuf.size() < (size_t)n + SORT_ROOM) S.kbuf.resize((size_t)n + SORT_ROOM);
+  span = (u32)std::min<u64>(last + 1, 0xFFFFFFFFu);
+  if (__builtin_expect(last >= CK_ORD, 0)) {  // (a key has 20 bits for the click's number)
+    fail("a person with more than a million clicks");
+    n = 0;
+    span = 0;
+  }
+  return n;
 }
 
 // The lanes of eight times that lie in [lo, hi].
@@ -1864,7 +1983,7 @@ static FORCE_INLINE u32 emit_rows(const Days& D, const i64* rev, const u8* top, 
 }
 
 struct SegStat {
-  u64 n_persons = 0, n_events = 0, n_general = 0;
+  u64 n_persons = 0, n_events = 0, n_general = 0, n_clicks = 0;
 };
 
 // What a segment leaves for the pass over the segment ends (scan_all runs it once every segment is through).
@@ -1880,6 +1999,11 @@ struct SegEnd {
   std::vector<Ev> head;
   u32 head_p = NONE;      // that person; NONE: the segment has no dense person's event at all
   bool head_open = true;  // no other dense person came after it in the segment (so it may go on after it)
+  // ... and, once another dense person has come after it (head_open false), its clicks: the segment's click
+  // cursor starts with them, and the end that closes the person takes them from here (see ck_collect)
+  std::vector<u64> hk;
+  u32 hk_n = 0, hk_span = 0;
+  u64 hk_first = 0;
   // tail: the person open when the segment's partitions were through, as far as it has come
   bool has_tail = false;  // false: the segment has nothing to do at its end (no dense person in it)
   bool skipping = false;
@@ -1917,6 +2041,7 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
   if (!S.T) {
     S.T = (D16*)aligned_alloc(64, sizeof(D16) * ESLOTS);
     memset(S.T, 0, sizeof(D16) * ESLOTS);
+    if (!S.TC) S.TC = (C16*)aligned_alloc(64, sizeof(C16) * CSLOTS);
     S.sess_ts.assign((size_t)SCAP + 16, 0);
     S.sess_ev.assign((size_t)SCAP + 16, 0);
     S.catsum.assign(NCAT, 0);
@@ -1961,8 +2086,10 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
     u32 x_next = NONE;                            // time of the person's next extra event
     size_t x_i = 0;
   } ps;
-  u64 n_persons = 0, n_events = 0, n_general = 0;
+  u64 n_persons = 0, n_events = 0, n_general = 0, n_clicks = 0;
   i64 prev_p = -1;  // the dense person before the open one
+  S.ck_on = false;             // (the click cursor is set by the first person that asks for clicks)
+  const SegEnd* kh = nullptr;  // at a segment end: the segment that collected the open person's clicks, if any
 
   // An event of the open person, in terms of the state it touches. price 0: not a purchase.
 #define DN_FEED(NS, NEV, PREV, ORDER, ts, cat, price)                                   \
@@ -2035,33 +2162,42 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
     }
     vmax_s = _mm256_max_epu32(vmax_s, _mm256_max_epu32(D.n0, D.n1));
     vmax_e = _mm256_max_epu32(vmax_e, _mm256_max_epu32(D.v0, D.v1));
-    // ---- its clicks: the keys of its index in the click partition
-    const u32 cp = p >> KC;
-    const CkPart* K = &S;
-    if (__builtin_expect(g_ck_big[cp] != nullptr, 0) && g_ck_big_ready[cp].load(std::memory_order_acquire))
-      K = g_ck_big[cp];
-    else if (__builtin_expect(cp != S.cp, 0))
-      load_clicks(S, cp, c2c, p2shift);
-    const u32 c0 = K->coff[p & ((1u << KC) - 1)];
-    const u32 mc0 = K->cpos[p & ((1u << KC) - 1)] - c0;  // its clicks in the partition
-    u32 mc = mc0;                                              // ... and with its extra clicks
-    const u64* keys = K->ckey.data() + c0;
+    // ---- its clicks, as keys: off the click cursor, or (at a segment end) as the segment where the person's
+    // events ended collected them
+    u64 ck_first = 0;  // a key's number is the click's index less this ...
+    u32 ck_span = 0;   // ... and below this
+    u32 mc0;           // its clicks in the partitions
+    const u64* keys;
+    if (kh != nullptr && kh->head_p == p) {
+      keys = kh->hk.data();
+      mc0 = kh->hk_n;
+      ck_first = kh->hk_first;
+      ck_span = kh->hk_span;
+    } else if (__builtin_expect(S.ck_on && S.ck_p > p, 1)) {  // (most persons have no click)
+      mc0 = 0;
+      keys = S.kbuf.data();
+    } else {
+      mc0 = ck_collect(S, p, cnt, ck_first, ck_span, c2c, p2shift);
+      keys = S.kbuf.data();
+    }
+    u32 mc = mc0;  // ... and with its extra clicks
     const Extra* ex = nullptr;
     if (__builtin_expect((acc[p].load(std::memory_order_relaxed) & ACC_EXTRA) != 0, 0)) {
       ex = &g_extra.find(p)->second;
-      if (!ex->ck.empty()) {  // extra clicks get the numbers after those of the partition
+      if (!ex->ck.empty()) {  // extra clicks get the numbers after those of the partitions
         const size_t nx = ex->ck.size();
-        if ((size_t)mc0 + nx > CK_ORD) {
+        if ((size_t)ck_span + nx > CK_ORD) {
           fail("a person with more than a million clicks");
         } else {
           S.xk.resize((size_t)mc0 + nx + SORT_ROOM);
           memcpy(S.xk.data(), keys, (size_t)mc0 * sizeof(u64));
-          for (size_t i = 0; i < nx; i++) S.xk[mc0 + i] = ck_make((u32)ex->ck[i][0], (u32)(mc0 + i), (u32)(ex->ck[i][0] >> 32));
+          for (size_t i = 0; i < nx; i++) S.xk[mc0 + i] = ck_make((u32)ex->ck[i][0], (u32)(ck_span + i), (u32)(ex->ck[i][0] >> 32));
           keys = S.xk.data();
           mc += (u32)nx;
         }
       }
     }
+    n_clicks += mc;
     if (__builtin_expect(S.sk.size() < (size_t)mc + SORT_ROOM, 0)) S.sk.resize((size_t)mc + 2 * SORT_ROOM);
     u64* const sk = S.sk.data();
     // ---- credit and assists, click by click in time order. (Click times count from 7 days before the
@@ -2091,9 +2227,9 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
           u32 same = 1;
           for (u32 q = r0 + 1; q < r1; q++) same &= (u32)(ck_camp(sk[q]) == ck_camp(sk[r0]));
           if (same) continue;
-          auto click_of = [&](const u64 key) -> u64 {  // the click number, as click_less takes it
+          auto click_of = [&](const u64 key) -> u64 {  // the number of the click_id, as click_less takes it
             const u32 o = ck_ord(key);
-            return o >= mc0 ? (CLICK_IS_KEY | ex->ck[o - mc0][1]) : K->cclk[c0 + o];
+            return o >= ck_span ? (CLICK_IS_KEY | ex->ck[o - ck_span][1]) : scramble(ck_first + o, g_ckey);
           };
           u32 best = r0;
           u64 bc = click_of(sk[r0]);
@@ -2274,7 +2410,12 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
         return false;
       }
       skipping = false;
-      ends[seg].head_open = false;
+      SegEnd& E = ends[seg];
+      // its clicks come first on this segment's cursor: they are collected for the end that closes the person
+      E.hk_n = ck_collect(S, q_skip, dense_cnt(acc[q_skip].load(std::memory_order_relaxed)), E.hk_first, E.hk_span, c2c, p2shift);
+      E.hk.assign(S.kbuf.data(), S.kbuf.data() + E.hk_n);
+      E.hk.resize((size_t)E.hk_n + SORT_ROOM);
+      E.head_open = false;
     }
     close_person();
     open_person(p, cnt, ac);
@@ -2494,7 +2635,11 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
         }
         DN_FEED(h_ns, h_nev, h_prev, h_order, ts, cat, price);
       }
-      if (!H.head_open) break;  // another dense person follows in that segment: ours ends before it
+      if (stop) break;
+      if (!H.head_open) {  // another dense person follows in that segment: ours ends before it
+        kh = &H;           // (and that segment has collected the clicks of its first person)
+        break;
+      }
     }
     DN_OUT();
   }
@@ -2518,13 +2663,15 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
   st.n_persons = n_persons;
   st.n_events = n_events;
   st.n_general = n_general;
+  st.n_clicks = n_clicks;
 }
 
 static void scan_all() {
-  // how many records every event and click partition has (the block lists of all threads are walked for it:
-  // a few hundred thousand list entries at 60M, so in parallel)
+  // how many records every event partition has, and the person index of one click of every click partition
+  // (the block lists of all threads are walked for it: a few hundred thousand list entries at 60M, so in
+  // parallel)
   std::vector<u64> cnt(g_PE, 0);
-  std::vector<u32> ckn(g_PC, 0);
+  std::vector<u32> ck_any(g_PC, NONE);
   {
     const int NCH = 8 * NT;
     parallel_for(NCH, [&](int c, int) {
@@ -2533,13 +2680,26 @@ static void scan_all() {
         for (int t = 0; t < NT; t++) n += g_tl[t].ev.size(j);
         cnt[j] = n;
       }
-      for (u32 cp = (u32)((u64)g_PC * c / NCH), ce = (u32)((u64)g_PC * (c + 1) / NCH); cp < ce; cp++) {
-        size_t n = 0;
-        for (int t = 0; t < NT; t++) n += g_tl[t].ck.size(cp);
-        ckn[cp] = (u32)std::min<size_t>(n, 0xFFFFFFFFu);
+      for (u32 k = (u32)((u64)g_PC * c / NCH), ke = (u32)((u64)g_PC * (c + 1) / NCH); k < ke; k++) {
+        for (int t = 0; t < NT && ck_any[k] == NONE; t++)
+          for (auto& b : g_tl[t].ck.blocks[k])
+            if (b.second) {
+              ck_any[k] = (u32)(b.first[0].w0 >> 41);
+              break;
+            }
       }
     });
+    // (a partition without clicks gets the sample of the next one that has some: the partition before the
+    // first sample of at least p is then always one with clicks)
+    u32 next = NONE;
+    for (u32 k = g_PC; k-- > 0;) {
+      if (ck_any[k] == NONE)
+        ck_any[k] = next;
+      else
+        next = ck_any[k];
+    }
   }
+  g_ck_any = ck_any.data();
   // segments: runs of partitions with about the same number of records
   u64 total = 0;
   u32 used = 0;
@@ -2561,8 +2721,16 @@ static void scan_all() {
       if (run * nseg >= total * s) sb[s++] = j + 1;
     }
   }
-  g_ck_emitted = new std::atomic<u8>[g_PC];
-  for (u32 i = 0; i < g_PC; i++) g_ck_emitted[i].store(0, std::memory_order_relaxed);
+  std::unique_ptr<std::atomic<u8>[]> ck_emitted(new std::atomic<u8>[g_PC]);
+  std::unique_ptr<std::atomic<u32>[]> ck_min(new std::atomic<u32>[g_PC]), ck_max(new std::atomic<u32>[g_PC]);
+  for (u32 i = 0; i < g_PC; i++) {
+    ck_emitted[i].store(0, std::memory_order_relaxed);
+    ck_min[i].store(NONE, std::memory_order_relaxed);
+    ck_max[i].store(NONE, std::memory_order_relaxed);
+  }
+  g_ck_emitted = ck_emitted.get();
+  g_ck_min = ck_min.get();
+  g_ck_max = ck_max.get();
   const u32 NC = g_ncamp, ND = (u32)g_ndays;
   parallel_for(NT, [&](int t, int) {
     g_tl[t].c_stat.assign((size_t)(NC + 1) * ND, CStat{0, 0, 0});
@@ -2576,23 +2744,6 @@ static void scan_all() {
   // (a person with very many events fills whole segments). The thread that scans the last of those takes
   // the end as well, between two segments, so the few long ends are spread over the scan and not left for
   // after it. Whichever thread gets there first claims an end; a last round takes what a race left over.
-  // the click partitions that are loaded once for all threads (SS_CKBIG sets another size, for tests)
-  const size_t ck_big = getenv("SS_CKBIG") ? (size_t)std::max(1, atoi(getenv("SS_CKBIG"))) : (size_t)CK_BIG;
-  std::vector<std::unique_ptr<CkPart>> big;
-  std::vector<u32> big_cp;
-  std::vector<CkPart*> big_of(g_PC, nullptr);
-  std::unique_ptr<std::atomic<u8>[]> big_ready(new std::atomic<u8>[g_PC]);
-  for (u32 cp = 0; cp < g_PC; cp++) {
-    big_ready[cp].store(0, std::memory_order_relaxed);
-    if (ckn[cp] >= ck_big) {
-      big.emplace_back(new CkPart);
-      big_of[cp] = big.back().get();
-      big_cp.push_back(cp);
-    }
-  }
-  g_ck_big = big_of.data();
-  g_ck_big_ready = big_ready.get();
-  const int nbig = (int)big_cp.size();
   std::unique_ptr<std::atomic<u8>[]> seg_done(new std::atomic<u8>[nseg]), end_claim(new std::atomic<u8>[nseg]);
   for (u32 s = 0; s < nseg; s++) {
     seg_done[s].store(0, std::memory_order_relaxed);
@@ -2609,18 +2760,7 @@ static void scan_all() {
     if (end_claim[s].exchange(1)) return;
     if (ends[s].has_tail) scan_segment<true>(sb[s], sb[s + 1], tid, scr[tid], st_ends[s], ends.data(), s, nseg);
   };
-  parallel_for(nbig + (int)nseg, [&](int task, int tid) {
-    if (task < nbig) {  // (first in the queue: the threads take the segments after these)
-      const u32 cp = big_cp[task];
-      TL& tl = g_tl[tid];
-      auto c2c = tl.r2c.cursor(tl.arena);
-      load_clicks(*big_of[cp], cp, c2c, 64 - g_P2bits);
-      tl.r2c.close(c2c);
-      tl.r2c.flush(tl.arena);
-      big_ready[cp].store(1, std::memory_order_release);
-      return;
-    }
-    const int s = task - nbig;
+  parallel_for((int)nseg, [&](int s, int tid) {
     if (sb[s] < sb[s + 1]) scan_segment<false>(sb[s], sb[s + 1], tid, scr[tid], st[s], ends.data(), (u32)s, nseg);
     seg_done[s].store(1);
     // the ends this segment was the last thing missing for: its own, and those of the segments before it
@@ -2632,8 +2772,6 @@ static void scan_all() {
     }
   });
   parallel_for((int)nseg, [&](int s, int tid) { try_end((u32)s, tid); });
-  g_ck_big = nullptr;
-  g_ck_big_ready = nullptr;
   // the campaigns' lines of days -> the tables by day and campaign that the general phase and the output use
   parallel_for(NT, [&](int t, int) {
     if (!scr[t].lines) return;
@@ -2649,37 +2787,65 @@ static void scan_all() {
       }
     }
   });
-  // clicks in partitions no dense person asked for
+  // The click partitions that no segment placed (none, with the clicks of every person next to those of a
+  // person with events) are placed now: their clicks of other persons go to the general phase, and their
+  // order is checked like that of the others.
   const u32 p2shift = 64 - g_P2bits;
-  parallel_for((int)g_PC, [&](int cp, int tid) {
-    if (g_ck_emitted[cp].exchange(1, std::memory_order_relaxed)) return;
+  parallel_for((int)g_PC, [&](int k, int tid) {
+    if (g_ck_emitted[k].load(std::memory_order_relaxed) || g_fail.load(std::memory_order_relaxed)) return;
     bool any = false;
-    for (int t = 0; t < NT && !any; t++) any = !g_tl[t].ck.blocks[cp].empty();
+    for (int t = 0; t < NT && !any; t++) any = !g_tl[t].ck.blocks[k].empty();
     if (!any) return;
     TL& tl = g_tl[tid];
+    DS& S = scr[tid];
+    if (!S.TC) S.TC = (C16*)aligned_alloc(64, sizeof(C16) * CSLOTS);
     auto c2c = tl.r2c.cursor(tl.arena);
-    emit_other_clicks((u32)cp, c2c, p2shift);
+    place_clicks((u32)k, S.TC, S, c2c, p2shift);
     tl.r2c.close(c2c);
     tl.r2c.flush(tl.arena);
   });
+  // Every partition with clicks has now been placed and found in person order within itself: across the
+  // partitions the order holds if none starts below the end of the one before.
+  if (!g_fail.load()) {
+    u32 before = 0;
+    for (u32 k = 0; k < g_PC; k++) {
+      const u32 mn = g_ck_min[k].load(std::memory_order_relaxed);
+      if (mn == NONE) continue;
+      if (mn < before) {
+        fail("click indexes are not in person order");
+        break;
+      }
+      before = g_ck_max[k].load(std::memory_order_relaxed);
+    }
+  }
+  u64 nplaced = 0;
+  for (auto& d : scr) nplaced += d.n_ck_placed;
+  g_ck_any = nullptr;
+  g_ck_emitted = nullptr;
+  g_ck_min = nullptr;
+  g_ck_max = nullptr;
   parallel_for(NT, [&](int t, int) {
     TL& tl = g_tl[t];
     tl.r2.finish(tl.arena);
     tl.r2c.finish(tl.arena);
   });
-  u64 np = 0, ne = 0, ng = 0;
+  u64 np = 0, ne = 0, ng = 0, nk = 0;
   for (auto& s : st) {
     np += s.n_persons;
     ne += s.n_events;
     ng += s.n_general;
+    nk += s.n_clicks;
   }
   for (auto& s : st_ends) {
     np += s.n_persons;
     ne += s.n_events;
     ng += s.n_general;
+    nk += s.n_clicks;
   }
-  LOG("dense scan: %u partitions in %u segments, %llu persons, %llu events; %llu events to the general phase", used, nseg,
-      (unsigned long long)np, (unsigned long long)ne, (unsigned long long)ng);
+  LOG("dense scan: %u partitions in %u segments, %llu persons, %llu events, %llu clicks; %llu events to the general phase; "
+      "click partitions placed %llu times",
+      used, nseg, (unsigned long long)np, (unsigned long long)ne, (unsigned long long)nk, (unsigned long long)ng,
+      (unsigned long long)nplaced);
 }
 
 // The ID kernels against their plain versions. Returns the number of mismatches.
