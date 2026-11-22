@@ -192,3 +192,13 @@ per record. `ve2` the same binary, `ve3` ve at -O3.
 `nd` is **timing only, wrong output** (duplicates are counted): ve with the links finished before the event
 parse, each event line routed to its person at parse (as the clicks are), and no dedup pass. It is the upper
 bound of a design that removes duplicates inside the person phase.
+
+## Bench 22 (A): the PQ route
+
+Bench 20: ve = f within 1% (fewer instructions in the emit loop buy nothing: the parse is not bound by them).
+`pq` (`bench/variants/ff33593-pq.diff`, branch a-merge): every valid event line goes to its person at parse as a
+16-byte R2 record (P), and every event line to its event-id partition as a 16-byte Q record (event-id hash,
+ingest_ts in whole seconds, and where its P record is: thread, person partition, index). Dedup reads only Q and
+sends the P records that lose to their person partition as kill entries, which the person phase skips. Bytes
+per event: 64 moved instead of 96 (R1 32 written and read, R2 16 written and read). `pqoff` is the same
+binary with SS_PQ=0 (the R1 route). `nd` as in bench 21.

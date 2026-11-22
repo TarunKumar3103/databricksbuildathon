@@ -1,6 +1,7 @@
-# Bench 21 (chat A), v5 data. tag, binary in /usr/local/bench, then ENV=VALUE settings.
+# Bench 22 (chat A), v5 data. tag, binary in /usr/local/bench, then ENV=VALUE settings.
 # The first build also writes the dev output that the report rows are added to.
-f     ss-f      # ff33593 (= 415ae10, 0.5600)
-ve    ss-ve     # bench 20's ve
-nd    ss-nd     # TIMING ONLY, wrong output: ve with no dedup pass (event lines routed to persons at parse)
-nd2   ss-nd     # the same binary once more
+f     ss-f            # ff33593 (= 415ae10, 0.5600)
+pq    ss-pq           # the PQ route: 16-byte P (person) and Q (event id) records, dedup on Q, losers skipped
+pqoff ss-pq SS_PQ=0   # the same binary on the R1 route (as f)
+pq2   ss-pq           # pq once more: the noise
+nd    ss-nd           # TIMING ONLY, wrong output: no dedup pass at all (bench 21's upper bound)
