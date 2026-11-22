@@ -1898,7 +1898,7 @@ struct CkPart {
 // The few click partitions with very many clicks (a handful of persons click thousands of times) are loaded
 // once, by a task of their own at the start of the scan, and every thread reads that copy: each of their
 // persons would otherwise make the thread that closes it load the whole partition again. A thread that needs
-// one before it is ready loads its own copy, like any other partition.
+// one before it is ready waits for it.
 static constexpr u32 CK_BIG = 1u << 15;         // clicks from which a partition is loaded for all
 static CkPart** g_ck_big = nullptr;             // per click partition: its shared copy, or null
 static std::atomic<u8>* g_ck_big_ready = nullptr;  // ... 1 once it can be read
@@ -2407,10 +2407,14 @@ static void scan_segment(const u32 pb, const u32 pe, const int tid, DS& S, SegSt
     // ---- its clicks: the keys of its index in the click partition
     const u32 cp = p >> KC;
     const CkPart* K = &S;
-    if (__builtin_expect(g_ck_big[cp] != nullptr, 0) && g_ck_big_ready[cp].load(std::memory_order_acquire))
+    if (__builtin_expect(g_ck_big[cp] != nullptr, 0)) {
+      // (Its task is among the first of the scan, so it is being loaded if it is not ready: waiting for it
+      // is never slower than loading the same partition once more here, which at 60M takes 20 ms.)
+      while (!g_ck_big_ready[cp].load(std::memory_order_acquire)) _mm_pause();
       K = g_ck_big[cp];
-    else if (__builtin_expect(cp != S.cp, 0))
+    } else if (__builtin_expect(cp != S.cp, 0)) {
       load_clicks(S, cp, c2c, p2shift);
+    }
     const u32 c0 = K->coff[p & ((1u << KC) - 1)];
     const u32 mc0 = K->cpos[p & ((1u << KC) - 1)] - c0;  // its clicks in the partition
     u32 mc = mc0;                                              // ... and with its extra clicks

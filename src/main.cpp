@@ -92,6 +92,7 @@ static thread_local int tl_serial_tid = -1;  // >= 0: parallel_for runs inline o
 // per-phase CPU accounting (sum of task time over threads), reported with SS_LOG
 static std::atomic<u64> g_phase_cycles[16];  // user microseconds
 static std::atomic<u64> g_phase_sys[16];     // system microseconds
+static std::atomic<u64> g_phase_busy[16];    // microseconds of wall time inside tasks
 static inline void thread_times(u64& user_us, u64& sys_us) {
   struct rusage ru;
   getrusage(RUSAGE_THREAD, &ru);
@@ -132,8 +133,10 @@ static void pool_take(PoolJob* j, int tid) {
     if (t >= j->ntasks) break;
     if (!any && g_log) thread_times(u0, s0);
     any = true;
+    const double tb0 = g_log ? now_s() : 0;
     j->run(j->ctx, t, tid);
     if (g_log) {  // (task by task, so that the times are in before the job counts as done)
+      g_phase_busy[j->phase] += (u64)((now_s() - tb0) * 1e6);
       thread_times(u1, s1);
       g_phase_cycles[j->phase] += u1 - u0;
       g_phase_sys[j->phase] += s1 - s0;
@@ -3519,6 +3522,12 @@ int main(int argc, char** argv) {
         fprintf(stderr, "user s:");
         for (int i = 1; i < 6; i++) fprintf(stderr, " %s %.3f", g_phase_names[i], g_phase_cycles[i].load() / 1e6);
         fprintf(stderr, " | total %.3f   sys s: total %.3f (parse %.3f)\n", tot, tots, g_phase_sys[2].load() / 1e6);
+        // per phase, summed over the threads: user and system CPU and the wall time spent inside tasks, in ms
+        fprintf(stderr, "phases ms (user/sys/busy):");
+        for (int i = 1; i < 6; i++)
+          fprintf(stderr, " %s %.0f/%.0f/%.0f", g_phase_names[i], g_phase_cycles[i].load() / 1e3, g_phase_sys[i].load() / 1e3,
+                  g_phase_busy[i].load() / 1e3);
+        fprintf(stderr, "\n");
       }
       release_memory();
       if (g_log) fprintf(stderr, "ABS end %.6f\n", now_s());
