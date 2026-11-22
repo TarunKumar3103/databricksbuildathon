@@ -3475,8 +3475,95 @@ static int run_sol(std::vector<MFile>& ev, std::vector<MFile>& ck) {
     if (z > a) madvise((void*)(all[c.file].data + a), z - a, MADV_DONTNEED);
   });
   timed(4, touch);
-  fprintf(stderr, "SOL touch=%.1f read=%.1f masks=%.1f cols=%.1f retouch=%.1f bytes=%zu chunks=%d sink=%llu\n", ms[0], ms[1],
-          ms[2], ms[3], ms[4], bytes, n, (unsigned long long)(sink.load() & 1));
+  // 6 to 11 (bench 10): writing the arena. W bytes in all, about what the records of this input take (16 bytes
+  // per line of about 72), split over the threads; each thread has its own memory, as in the parse.
+  double wm[6] = {0, 0, 0, 0, 0, 0};
+  // (at most 384 MB in all, so that a 60M set's page cache is not pushed out)
+  const size_t W = (std::min((bytes / 72 * 16) / (size_t)NT, ((size_t)384 << 20) / (size_t)NT) + ((size_t)2 << 20)) &
+                   ~(((size_t)2 << 20) - 1);  // per thread
+  {
+    std::vector<u8*> r1(NT), r2(NT);
+    for (int i = 0; i < NT; i++) r1[i] = (u8*)vm_alloc(W);
+    auto tw = [&](int k, auto&& f) {
+      const double t0 = now_s();
+      parallel_for(NT, f);
+      wm[k] = (now_s() - t0) * 1000.0;
+    };
+    // zf: one byte written per 4 KB of fresh memory: the faults and the kernel's zeroing alone
+    tw(0, [&](int t, int) {
+      for (size_t o = 0; o < W; o += 4096) r1[t][o] = 1;
+    });
+    // ntw: non-temporal 64-byte lines over that memory, now faulted in
+    tw(1, [&](int t, int) {
+      const __m256i v = _mm256_set1_epi8((char)t);
+      for (size_t o = 0; o < W; o += 64) {
+        _mm256_stream_si256((__m256i*)(r1[t] + o), v);
+        _mm256_stream_si256((__m256i*)(r1[t] + o + 32), v);
+      }
+      _mm_sfence();
+    });
+    // stw: ordinary stores over the same memory
+    tw(2, [&](int t, int) {
+      const __m256i v = _mm256_set1_epi8((char)(t + 1));
+      for (size_t o = 0; o < W; o += 64) {
+        _mm256_store_si256((__m256i*)(r1[t] + o), v);
+        _mm256_store_si256((__m256i*)(r1[t] + o + 32), v);
+      }
+    });
+    for (int i = 0; i < NT; i++) {
+      munmap(r1[i], W);
+      r2[i] = (u8*)vm_alloc(W);
+    }
+    // ntf: non-temporal lines into fresh memory (faults, zeroing and the stores, in order, as the drain does)
+    tw(3, [&](int t, int) {
+      const __m256i v = _mm256_set1_epi8((char)t);
+      for (size_t o = 0; o < W; o += 64) {
+        _mm256_stream_si256((__m256i*)(r2[t] + o), v);
+        _mm256_stream_si256((__m256i*)(r2[t] + o + 32), v);
+      }
+      _mm_sfence();
+    });
+    for (int i = 0; i < NT; i++) munmap(r2[i], W);  // (given back first, so that the scatter's arena faults in like the parse's)
+    // sct / sctp: the parse's scatter itself (WCScatter<D16>, its own arena) with records of random partitions,
+    // as many partitions as the parse has; sctp prefetches each staging line 8 records ahead
+    const u32 P = std::max<u32>(16, (u32)((bytes / 72) >> 14));
+    const u64 R = W / 16;
+    for (int k = 0; k < 2; k++) {
+      tw(4 + k, [&](int t, int) {
+        WCScatter<D16> sc;
+        sc.init(P);
+        Arena a;
+        auto c = sc.cursor(a);
+        u64 x = 0x9E3779B97F4A7C15ULL * (u64)(t + 1), y = x ^ 0xD1B54A32D192ED03ULL;
+        alignas(64) u32 part[64];
+        for (u64 r = 0; r < R; r += 64) {
+          for (int j = 0; j < 64; j++) {  // xorshift128+, multiplied down to [0, P)
+            u64 s1 = x;
+            const u64 s0 = y;
+            x = s0;
+            s1 ^= s1 << 23;
+            y = s1 ^ s0 ^ (s1 >> 17) ^ (s0 >> 26);
+            part[j] = (u32)(((y + s0) >> 32) * (u64)P >> 32);
+          }
+          if (k == 1)
+            for (int j = 0; j < 8; j++) WCScatter<D16>::prefetch(c, part[j]);
+          for (int j = 0; j < 64; j++) {
+            if (k == 1) WCScatter<D16>::prefetch(c, part[(j + 8) & 63]);
+            WCScatter<D16>::push16(c, part[j], _mm_set_epi64x((long long)r, (long long)j));
+          }
+        }
+        sc.close(c);
+        sc.flush(a);
+        sink += (u64)(uintptr_t)a.cur & 1;
+        for (auto& sl : a.slabs) munmap(sl.first, sl.second);
+      });
+    }
+  }
+  fprintf(stderr,
+          "SOL touch=%.1f read=%.1f masks=%.1f cols=%.1f retouch=%.1f zf=%.1f ntw=%.1f stw=%.1f ntf=%.1f sct=%.1f sctp=%.1f MB=%zu"
+          " bytes=%zu chunks=%d sink=%llu\n",
+          ms[0], ms[1], ms[2], ms[3], ms[4], wm[0], wm[1], wm[2], wm[3], wm[4], wm[5], W * (size_t)NT >> 20, bytes, n,
+          (unsigned long long)(sink.load() & 1));
   return 0;
 }
 #endif
