@@ -1805,10 +1805,20 @@ struct LkBatch {
 static NOINLINE void process_links(LkBatch& B, const u32 n, const u8* const base) {
   const u32 hshift = 64 - g_Hbits;
   const u64 mask = (1ULL << g_Hbits) - 1;
+  __m128i hv[2 * LkBatch::CAP];  // the hex user IDs of the batch, their slots fetched first
+  u64 hexm = 0;
+  for (u32 i = 0; i < n; i++)
+    for (u32 k = 0; k < 2; k++)
+      if (B.len[i][k] == 33 && hex_user(base + B.off[i][k], 33, hv[2 * i + k])) {
+        hexm |= 1ULL << (2 * i + k);
+        hex_prefetch(hv[2 * i + k]);
+      }
+  auto key = [&](u32 i, u32 k) __attribute__((always_inline)) {
+    const u8* s = base + B.off[i][k];
+    return ((hexm >> (2 * i + k)) & 1) ? hex_key(hv[2 * i + k], s) : make_key(s, B.len[i][k]);
+  };
   for (u32 i = 0; i < n; i++) {
-    const u32* off = B.off[i];
-    const u32* len = B.len[i];
-    const u64 ha = hash_id(make_key(base + off[0], len[0])), hb = hash_id(make_key(base + off[1], len[1]));
+    const u64 ha = hash_id(key(i, 0)), hb = hash_id(key(i, 1));
     B.ha[i] = ha;
     B.hb[i] = hb;
     __builtin_prefetch(&g_H[ha >> hshift], 1, 3);
@@ -2978,6 +2988,7 @@ static void person_phase(bool keep_stats = false) {
         u32* rows[64];  // assist counters of the person's days (a window has at most 50 days)
         for (u32 j = 0; j < ndays; j++) rows[j] = c_assist + (size_t)S.days[j] * NC1;
         u32 a = 0, b = 0;  // (two pointers for a long session list)
+        u32 ja = 0;
         for (u32 k = 0; k < mc; k++) {
           const u32 t = sts[k], c = scamp[k];
           if (ns <= 32) {
@@ -2989,9 +3000,13 @@ static void person_phase(bool keep_stats = false) {
           }
           const u32 x = std::max(a, cov[c]);
           cov[c] = std::max(cov[c], b);
-          for (u32 j = 0; j < ndays; j++) {
-            const i32 n = (i32)std::min(b, dstart[j + 1]) - (i32)std::max(x, dstart[j]);
-            rows[j][c] += (u32)(n > 0 ? n : 0);
+          // only the days that hold sessions of [x, b): from the day of session x on (ja: the day of session a,
+          // which only moves forward, as a does)
+          while (ja < ndays && dstart[ja + 1] <= a) ja++;
+          if (x < b) {
+            u32 j = ja;
+            while (j < ndays && dstart[j + 1] <= x) j++;
+            for (; j < ndays && dstart[j] < b; j++) rows[j][c] += std::min(b, dstart[j + 1]) - std::max(x, dstart[j]);
           }
         }
         for (u32 k = 0; k < mc; k++) cov[scamp[k]] = 0;
@@ -3832,11 +3847,13 @@ int main(int argc, char** argv) {
   if (getenv("SS_STOP") && !strcmp(getenv("SS_STOP"), "parse")) return 0;
   g_phase = 3;
   dedup_and_route();
+  LOG("dedup done");
   drop_inputs(ev);
   LOG("dedup + routing done");
   if (getenv("SS_STOP") && !strcmp(getenv("SS_STOP"), "dedup")) return 0;
   g_phase = 4;
   person_phase();
+  LOG("person done");
   drop_inputs(ck);
   LOG("person phase done");
   g_phase = 5;
