@@ -130,3 +130,24 @@ process). Twelve builds, four rounds at both sizes, timelines of `x`, `k10`, `c1
 The knob builds are `bench/variants/2589f28-knobs/knobs.diff` on 2589f28 with `-DSS_KE=` / `-DSS_KC=`, each
 with a profile of its own (`pgobuild.sh`). Every build matches the references here (66 runs over segment sizes
 and thread counts, the 20M set at 8 threads).
+
+## Bench 15 (A, branch a-bench15): the start, the malloc heaps and the staging prefetch on the head
+
+Rows as in bench 13 (`tag=wall/parse CPU/scan CPU/system CPU`, ms, medians). Eight builds, eight rounds at 20M
+and six at 60M, timelines of `c`, `th`, `thp8`.
+
+- `c` and `c2`: v4 226ca9f (head) twice, the same binary: their difference is the noise. `t`: v4 6d5b17b (0.3641).
+- `s`: c with the serial start shortened (the user key from 512 sampled lines instead of 4,096; the event key's
+  sample is taken by the setup thread while the links are read): about 1 ms here.
+- `tp`: s with `mallopt(M_TOP_PAD, 64 MB)` at the start of main, which is bench 12's `vt` built in (4 ms at 20M
+  and 12 ms at 60M there, on 8384d32).
+- `th`: tp with `madvise(MADV_HUGEPAGE)` on each worker thread's malloc heap. The heaps hold 80 to 90 MB at
+  20M, touched 4 KB at a time and all still there at exit, where the kernel frees them on one CPU: the benches
+  have 5 to 8 ms between the in-process end and the process being gone. Here with 8 threads at 20M: exit 4.6
+  to 5.8 ms without, 3.1 to 3.8 ms with; system time 0.43 s with the top pad alone, 0.27 s with both.
+- `thp4`, `thp8`: th with B's staging-line prefetch (`SS_PFD` of b-pf2, commit 6a0c613 applied on 226ca9f) 4
+  and 8 records ahead: bench 12 measured it on 8384d32, which had twice the event staging lines.
+
+`bench/variants/226ca9f-heap/start-and-heap.diff` is the change of `s`, `tp`, `th` on 226ca9f (`-DSS_TOPPAD_MB=64`,
+`-DSS_HEAPHUGE`); each build has a profile of its own. Every build matches the references here (66 runs over
+segment sizes and thread counts, the 20M set at 8 threads).

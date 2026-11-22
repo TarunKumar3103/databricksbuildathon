@@ -1,14 +1,10 @@
-# Bench 13 (chat A). tag, binary in /usr/local/bench, then ENV=VALUE settings.
+# Bench 15 (chat A). tag, binary in /usr/local/bench, then ENV=VALUE settings.
 # The first build also writes the dev output that the report rows are added to.
-x    ss-2589f28-clang18-pgo                # v4 2589f28 (head) as its Dockerfile: cf4452a + KE = 15 + no block prefetch + parallel counts
-m    ss-cf4452a-clang18-pgo                # v4 cf4452a: scored 0.38 at 19:54 (bench 11's m)
-x14  ss-2589f28-ke14                       # x with event partitions of 2^14 indexes (256 KB slot tables), profile of its own
-x16  ss-2589f28-ke16                       # ... of 2^16 (1 MB slot tables, a quarter of bench 11's staging lines)
-k9   ss-2589f28-kc9                        # x with click partitions of 512 persons instead of 256: half the click staging lines
-k10  ss-2589f28-kc10                       # ... of 1,024 persons: a quarter
-c11  ss-ckidx-kci11                        # clicks placed by click index (bench/variants/ckidx): partitions of 2,048 indexes
-c12  ss-ckidx-kci12                        # ... of 4,096 (the branch's default)
-c13  ss-ckidx-kci13                        # ... of 8,192
-g3   ss-2589f28-clang18-pgo SS_SEGPART=3   # x with segments of 3 event partitions instead of 5
-g10  ss-2589f28-clang18-pgo SS_SEGPART=10  # ... of 10
-c12g ss-ckidx-kci12 SS_SEGPART=10          # c12 with segments of 10 (half as many click partitions placed twice)
+c    ss-226ca9f-clang18-pgo         # v4 226ca9f (head) as its Dockerfile: 6d5b17b + C's click timestamps
+c2   ss-226ca9f-clang18-pgo         # the same binary once more: the noise between two copies of one build
+t    ss-6d5b17b-clang18-pgo         # v4 6d5b17b: scored 0.3641 at 20:51
+s    ss-226ca9f-start               # c + the user key from 512 sampled lines, the event key's sample in the setup thread
+tp   ss-226ca9f-toppad              # s + malloc heaps grown 64 MB at a time (bench 12's vt, built in)
+th   ss-226ca9f-heaphuge            # tp + huge pages for the worker threads' malloc heaps
+thp4 ss-226ca9f-heaphuge-pfd4       # th + B's staging-line prefetch 4 records ahead (b-pf2's SS_PFD)
+thp8 ss-226ca9f-heaphuge-pfd8       # ... 8 records ahead

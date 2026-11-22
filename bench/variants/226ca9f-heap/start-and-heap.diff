@@ -1,0 +1,80 @@
+--- v23/src/main.cpp	2026-11-21 20:35:16.000000000 -0500
++++ v25/src/main.cpp	2026-11-21 20:56:18.060450455 -0500
+@@ -14,6 +14,7 @@
+ #include <fcntl.h>
+ #include <immintrin.h>
+ #include <linux/futex.h>
++#include <malloc.h>
+ #include <sys/mman.h>
+ #include <sys/resource.h>
+ #include <sys/stat.h>
+@@ -133,7 +134,24 @@
+     j->finished.fetch_add(1, std::memory_order_release);
+   }
+ }
++#ifdef SS_HEAPHUGE
++// This thread's malloc heap may use huge pages. glibc gives every thread but the first a heap of its own: a
++// 64 MB reservation at a multiple of 64 MB (that is how free() finds the heap of a pointer). With the top pad
++// set in main() the whole heap is writable from its first use, so the kernel can back it with 2 MB pages: a
++// thread touches 5 to 20 MB of it, one page fault per 4 KB otherwise, and all of it is still there when the
++// process exits, where the kernel frees it page by page on one CPU.
++static void heap_huge() {
++  void* const p = malloc(64);
++  if (!p) return;
++  const uintptr_t base = (uintptr_t)p & ~(((uintptr_t)64 << 20) - 1);
++  madvise((void*)base, (size_t)64 << 20, MADV_HUGEPAGE);  // (advice only: harmless whatever lies there)
++  free(p);
++}
++#endif
+ static void pool_worker(int tid) {
++#ifdef SS_HEAPHUGE
++  heap_huge();
++#endif
+   u32 seen = 0;
+   for (;;) {
+     u32 s;
+@@ -3320,6 +3338,11 @@
+ 
+ int main(int argc, char** argv) {
+   g_t0 = now_s();
++#ifdef SS_TOPPAD_MB
++  // (malloc heaps grow in steps of this size: a thread's heap is then made writable once, not a few pages at
++  // a time with an mprotect call each, which waits for the page faults of all other threads; bench 12, row vt)
++  mallopt(M_TOP_PAD, SS_TOPPAD_MB << 20);
++#endif
+   if (argc >= 2 && strcmp(argv[1], "--selftest") == 0) return selftest();
+   if (argc >= 4 && strcmp(argv[1], "--bench-parse") == 0) return bench_parse(argv[2], argv[3], argc >= 5 ? atoi(argv[4]) : 5);
+   const char* lg = getenv("SS_LOG");
+@@ -3368,8 +3391,17 @@
+       dn::g_nu_cap = (u32)nu;
+       dn::g_PE = (u32)(dn::g_ne_cap >> dn::KE);
+       dn::g_PC = dn::g_nu_cap >> dn::KC;
+-      dn::sample<7>(ev, 'e', 'u', 4096, samp);
+-      if (dn::recover_user_key(samp)) {
++      // (A few hundred lines are enough for the user key, as one line in ten or twenty is of the five busiest
++      // users. The event key wants more of them, but it is not needed before the parse: the setup thread
++      // below takes its own sample while the links are read.)
++      dn::sample<7>(ev, 'e', 'u', 512, samp);
++      bool got = dn::recover_user_key(samp);
++      if (!got) {
++        samp.clear();
++        dn::sample<7>(ev, 'e', 'u', 4096, samp);
++        got = dn::recover_user_key(samp);
++      }
++      if (got) {
+         dn::g_on = true;
+         dn::g_acc = (std::atomic<u64>*)vm_alloc(sizeof(std::atomic<u64>) * dn::g_nu_cap);
+         g_P2bits = std::min<u32>(8, std::max<u32>(4, ceil_log2(est_lines / (32768 * 16) + 1)));
+@@ -3382,7 +3414,11 @@
+   // The lookups and the per-thread state are not needed for the links: set them up on the side meanwhile.
+   std::thread setup([&] {
+     load_lookups(data);
+-    if (dn::g_on && !dn::recover_event_key(samp)) dn::fail("no key for the event ids");
++    if (dn::g_on) {
++      std::vector<dn::Samp> esamp;
++      dn::sample<7>(ev, 'e', 'u', 4096, esamp);
++      if (!dn::recover_event_key(esamp)) dn::fail("no key for the event ids");
++    }
+     if (dn::g_on && (u64)(g_we - g_ws) > 0x7FFFFFF0ULL) dn::fail("window too long");
+     if (dn::g_on && g_cats.size() > 255) dn::fail("too many categories");
+     if (dn::g_on && g_ncamp > dn::CK_CAMP) dn::fail("too many campaigns");
