@@ -32,6 +32,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -459,7 +460,7 @@ static inline u64 key_fast(const u8* s, u32 n) {
   return ((u64)s[0] << 56) | _pext_u64(__builtin_bswap64(w), KEY_M7);
 }
 
-struct Interner {
+struct OverflowIds {
   std::mutex mu;
   std::unordered_map<std::string, u64> map;
   std::vector<std::string> strs;
@@ -474,14 +475,82 @@ struct Interner {
     return k;
   }
 };
-static Interner g_intern;
+static OverflowIds g_overflow;
+
+
+// Long keys name slots in an exact byte dictionary. A published string never moves,
+// so a reader can compare bytes without a lock while other workers are inserting.
+static constexpr u64 OVERFLOW_ID = 1ULL << 55;
+struct IdEntry {
+  u32 size;
+  const char* bytes() const { return reinterpret_cast<const char*>(this + 1); }
+};
+static IdEntry** id_slots;
+static size_t id_mask;
+
+static void init_ids(size_t bytes) {
+  const u64 wanted = std::min<u64>(1ULL << 27, std::max<u64>(8192, bytes / 256));
+  const size_t count = size_t{1} << ceil_log2(wanted);
+  id_slots = static_cast<IdEntry**>(vm_alloc(count * sizeof(*id_slots)));
+  id_mask = count - 1;
+}
+
+static u32 id_hash(const u8* s, u32 n) {
+  u32 h = n;
+  for (u32 i = 0; i + 8ULL <= n; i += 8) {
+    u64 v;
+    memcpy(&v, s + i, 8);
+    h = static_cast<u32>(_mm_crc32_u64(h, v));
+  }
+  for (u32 i = n & ~7u; i < n; ++i) h = _mm_crc32_u8(h, s[i]);
+  return h;
+}
+
+static IdEntry* copy_id(const u8* s, u32 n) {
+  static thread_local u8* next;
+  static thread_local size_t left;
+  const size_t bytes = (sizeof(IdEntry) + size_t{n} + 3) & ~size_t{3};
+  if (left < bytes) {
+    left = std::max<size_t>(64 * 1024, bytes);
+    next = static_cast<u8*>(vm_alloc(left));
+  }
+  auto* entry = new (next) IdEntry{n};
+  memcpy(entry + 1, s, n);
+  next += bytes;
+  left -= bytes;
+  return entry;
+}
+
+static inline bool matches_id(const IdEntry* entry, const u8* s, u32 n) {
+  if (entry->size != n) return false;
+  if (n == 33) return memcmp(entry->bytes(), s, 33) == 0;
+  return memcmp(entry->bytes(), s, n) == 0;
+}
+
+static NOINLINE u64 intern_id(const u8* s, u32 n) {
+  if (id_slots) {
+    size_t slot = id_hash(s, n) & id_mask;
+    IdEntry* copy = nullptr;
+    for (unsigned probe = 0; probe < 48; ++probe, slot = (slot + 1) & id_mask) {
+      IdEntry* entry = __atomic_load_n(&id_slots[slot], __ATOMIC_ACQUIRE);
+      if (!entry) {
+        if (!copy) copy = copy_id(s, n);
+        if (__atomic_compare_exchange_n(&id_slots[slot], &entry, copy, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return slot + 1;
+      }
+      if (matches_id(entry, s, n)) return slot + 1;
+    }
+  }
+  // A full or heavily clustered table is still exact. Its occupied slots are immutable.
+  return OVERFLOW_ID | g_overflow.get(s, n);
+}
 
 static FORCE_INLINE u64 make_key(const u8* s, u32 n) {
   const u32 m = n - 1;
   u64 w;
   memcpy(&w, s + 1, 8);
   w = _bzhi_u64(w, 8 * m);
-  if (__builtin_expect(m > 8 || (w & KEY_HIGH) != 0 || s[0] == 0 || s[m] == 0, 0)) return g_intern.get(s, n);
+  if (__builtin_expect(m > 8 || (w & KEY_HIGH) != 0 || s[0] == 0 || s[m] == 0, 0)) return intern_id(s, n);
   return ((u64)s[0] << 56) | _pext_u64(__builtin_bswap64(w), KEY_M7);
 }
 static inline bool is_slow(u64 k) { return (k >> 56) == 0; }
@@ -494,24 +563,25 @@ static inline u32 fast_key_bytes(u64 k, u8* out) {
   return w ? 9 - ((u32)__builtin_clzll(w) >> 3) : 1;
 }
 
-static void key_str(u64 k, std::string& out) {
-  if (is_slow(k)) {
-    std::lock_guard<std::mutex> lk(g_intern.mu);
-    out = g_intern.strs[k - 1];
-    return;
+static std::string_view id_view(u64 k, u8* fast, std::string& overflow) {
+  if (!is_slow(k)) {
+    const u32 n = fast_key_bytes(k, fast);
+    return {reinterpret_cast<const char*>(fast), n};
   }
-  u8 b[9];
-  const u32 n = fast_key_bytes(k, b);
-  out.assign((const char*)b, n);
+  if (k & OVERFLOW_ID) {
+    std::lock_guard<std::mutex> lock(g_overflow.mu);
+    overflow = g_overflow.strs[(k ^ OVERFLOW_ID) - 1];
+    return overflow;
+  }
+  const IdEntry* e = __atomic_load_n(&id_slots[k - 1], __ATOMIC_ACQUIRE);
+  return {e->bytes(), e->size};
 }
 
 static inline int key_cmp(u64 a, u64 b) {
   if (!is_slow(a) && !is_slow(b)) return a < b ? -1 : (a > b ? 1 : 0);
-  std::string sa, sb;
-  key_str(a, sa);
-  key_str(b, sb);
-  int c = sa.compare(sb);
-  return c < 0 ? -1 : (c > 0 ? 1 : 0);
+  u8 ba[9], bb[9];
+  std::string oa, ob;
+  return id_view(a, ba, oa).compare(id_view(b, bb, ob));
 }
 
 // ------------------------------------------------------------------------------------------
@@ -2738,8 +2808,9 @@ static void person_phase(bool keep_stats = false) {
           memcpy(ip, kb, 16);
           out.ids.cur = ip + 4 + klen;
         } else {
-          std::string name;
-          key_str(pkey, name);
+          u8 fast[9];
+          std::string overflow;
+          const std::string_view name = id_view(pkey, fast, overflow);
           const u32 klen = (u32)name.size();
           const bool fits = 4 + (size_t)klen <= Stream<u8>::BLK;
           u8* ip = fits ? out.ids.reserve(4 + klen, tl.arena) : out.ids.big(4 + (size_t)klen, tl.arena);
@@ -3358,129 +3429,24 @@ int main(int argc, char** argv) {
   const u32 P2bits_gen = std::min<u32>(12, std::max<u32>(4, ceil_log2(est_lines / 32768 + 1)));
   g_P1bits = P1bits_gen;
   g_P2bits = P2bits_gen;
-  // The dense path (dense.h), if a sample of the events gives the key of the user IDs.
-  std::vector<dn::Samp> samp;
-  {
-    const char* e = getenv("SS_DENSE");
-    dn::g_ne_cap = ((u64)(ev_bytes / 56) | (dn::ESLOTS - 1)) + 1;
-    const u64 nu = ((dn::g_ne_cap / 30 + 1024) | ((1u << dn::KC) - 1)) + 1;
-    if (!(e && *e == '0') && nu <= (1u << 23)) {
-      dn::g_nu_cap = (u32)nu;
-      dn::g_PE = (u32)(dn::g_ne_cap >> dn::KE);
-      dn::g_PC = dn::g_nu_cap >> dn::KC;
-      dn::sample<7>(ev, 'e', 'u', 4096, samp);
-      if (dn::recover_user_key(samp)) {
-        dn::g_on = true;
-        dn::g_acc = (std::atomic<u64>*)vm_alloc(sizeof(std::atomic<u64>) * dn::g_nu_cap);
-        g_P2bits = std::min<u32>(8, std::max<u32>(4, ceil_log2(est_lines / (32768 * 16) + 1)));
-      }
-    }
-  }
-  LOG("mapped %zu event files (%zu bytes), %zu click files, %zu link files; P1=%u P2=%u threads=%d dense=%d ukey=%llx",
-      ev.size(), ev_bytes, ck.size(), lk.size(), 1u << g_P1bits, 1u << g_P2bits, NT, (int)dn::g_on,
-      (unsigned long long)dn::g_ukey);
-  // The lookups and the per-thread state are not needed for the links: set them up on the side meanwhile.
+  size_t id_input_bytes = ev_bytes;
+  for (const auto& f : ck) id_input_bytes += f.size;
+  for (const auto& f : lk) id_input_bytes += f.size;
+  init_ids(id_input_bytes);
+  LOG("mapped %zu event files (%zu bytes), %zu click files, %zu link files; P1=%u P2=%u threads=%d",
+      ev.size(), ev_bytes, ck.size(), lk.size(), 1u << g_P1bits, 1u << g_P2bits, NT);
   std::thread setup([&] {
     load_lookups(data);
-    if (dn::g_on && !dn::recover_event_key(samp)) dn::fail("no key for the event ids");
-    if (dn::g_on && (u64)(g_we - g_ws) > 0x7FFFFFF0ULL) dn::fail("window too long");
-    if (dn::g_on && g_cats.size() > 255) dn::fail("too many categories");
-    if (dn::g_on && g_ncamp > dn::CK_CAMP) dn::fail("too many campaigns");
-    if (dn::g_on && g_ndays > 16) dn::fail("more than 16 days in the window");
-    if (dn::g_on) {
-      dn::g_ing_base = g_ws - 30 * DAY;
-      dn::init_daycode();
-    }
-    g_tl.resize(NT);
-    for (auto& t : g_tl) {
-      if (dn::g_on && !dn::g_fail.load()) {
-        t.ev.init(dn::g_PE);
-        t.ck.init(dn::g_PC);
-      } else {
-        t.r1.init(1u << g_P1bits);
-      }
-      t.r2.init(1u << g_P2bits);
-      t.r2c.init(1u << g_P2bits);
-    }
-  });
-  g_phase = 1;
-  if (dn::g_on)
-    dn::build_links_dense(lk);
-  else
-    build_links(lk);
-  setup.join();
-  LOG("lookups: window %lld..%lld, %zu categories, %u campaigns, %d days", (long long)g_ws, (long long)g_we,
-      g_cats.size(), g_ncamp, g_ndays);
-
-  if (dn::g_on && !dn::g_fail.load()) {
-    g_phase = 2;
-    dn::parse(ev, ck);
-    {
-      u64 a = 0, b = 0;
-      for (auto& t : g_tl) {
-        a += t.n_event_lines;
-        b += t.n_click_lines;
-      }
-      LOG("parsed (dense): %llu event lines, %llu click lines", (unsigned long long)a, (unsigned long long)b);
-    }
-    if (const char* e = getenv("SS_DENSE_FAIL"))  // (tests of the way back to the general pipeline)
-      if (!strcmp(e, "parse")) dn::fail("test: after the parse");
-    if (!dn::g_fail.load()) {
-      g_phase = 3;
-      dn::resolve_special();
-      dn::scan_all();
-      if (const char* e = getenv("SS_DENSE_FAIL"))
-        if (!strcmp(e, "scan")) dn::fail("test: after the scan");
-    }
-    if (!dn::g_fail.load()) {
-      LOG("dense scan done");
-      g_phase = 4;
-      person_phase(true);
-      LOG("general person phase done");
-      g_phase = 5;
-      write_outputs(out);
-      LOG("output written");
-      if (g_log) {
-        double tot = 0, tots = 0;
-        for (int i = 0; i < 6; i++) {
-          tot += g_phase_cycles[i].load() / 1e6;
-          tots += g_phase_sys[i].load() / 1e6;
-        }
-        fprintf(stderr, "user s:");
-        for (int i = 1; i < 6; i++) fprintf(stderr, " %s %.3f", g_phase_names[i], g_phase_cycles[i].load() / 1e6);
-        fprintf(stderr, " | total %.3f   sys s: total %.3f (parse %.3f)\n", tot, tots, g_phase_sys[2].load() / 1e6);
-      }
-      release_memory();
-      if (g_log) fprintf(stderr, "ABS end %.6f\n", now_s());
-      fflush(nullptr);
-      exit_now();
-    }
-  }
-  if (dn::g_on) {
-    // The data does not have the shape the dense path needs: start over with the general pipeline.
-    LOG("dense path given up (%s): general pipeline", dn::g_fail_why);
-    for (auto& t : g_tl)  // (the records of the attempt)
-      for (auto& sl : t.arena.slabs) madvise(sl.first, sl.second, MADV_DONTNEED);
-    dn::g_acc = nullptr;
-    // The link table of the attempt holds only the links that the words of the dense path could not: the
-    // general pipeline needs all of them.
-    g_H = nullptr;
-    g_F = nullptr;
-    g_Fshift = 63;
-    g_Hbits = 0;
-    g_phase = 1;
-    build_links(lk);
-    g_P1bits = P1bits_gen;
-    g_P2bits = P2bits_gen;
-    g_tl.clear();
     g_tl.resize(NT);
     for (auto& t : g_tl) {
       t.r1.init(1u << g_P1bits);
       t.r2.init(1u << g_P2bits);
       t.r2c.init(1u << g_P2bits);
     }
-  }
-
+  });
+  g_phase = 1;
+  build_links(lk);
+  setup.join();
   g_phase = 2;
   parse_events_clicks(ev, ck);
   {
@@ -3525,6 +3491,7 @@ static int bench_parse(const char* data, const char* file, int reps) {
   NT = 1;
   load_lookups(data);
   std::vector<MFile> ev{map_file(file)}, ck;
+  init_ids(ev[0].size);
   g_P1bits = 11;
   g_P2bits = 10;
   g_tl.resize(1);
